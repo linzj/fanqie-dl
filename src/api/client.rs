@@ -5,7 +5,6 @@ use anyhow::Result;
 use rand::Rng;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct FanqieClient {
@@ -131,7 +130,13 @@ impl FanqieClient {
         let params = self.common_query_string();
         let full_url = format!("{}/reading/crypt/registerkey?{}", self.base_url, params);
         let ts = Self::now_secs();
-        let sign = signer::sign_request(&params, Some(&body_str), ts);
+        let sign = signer::sign_request(
+            &params,
+            Some(&body_str),
+            ts,
+            &self.config.device_id,
+            "7.1.3.32",
+        );
 
         let mut req = self.client.post(&full_url).body(body_str);
         req = req.header("Content-Type", "application/json");
@@ -197,7 +202,7 @@ impl FanqieClient {
 
         let full_url = format!("{}{}?{}", self.base_url, path, qs);
         let ts = Self::now_secs();
-        let sign = signer::sign_request(&qs, None, ts);
+        let sign = signer::sign_request(&qs, None, ts, &self.config.device_id, "7.1.3.32");
 
         let mut last_err = None;
         for attempt in 0..3u32 {

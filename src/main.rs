@@ -8,7 +8,6 @@ use anyhow::Result;
 use api::book;
 use api::client::FanqieClient;
 use api::reader;
-use api::search;
 use dialoguer::{Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
