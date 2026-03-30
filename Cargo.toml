@@ -1,0 +1,25 @@
+[package]
+name = "fanqie-dl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+base64 = "0.22"
+hex = "0.4"
+dialoguer = "0.11"
+indicatif = "0.17"
+flate2 = "1"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+sanitize-filename = "0.6"
+regex = "1"
+md5 = "0.7"
+dirs = "6"
+urlencoding = "2"
