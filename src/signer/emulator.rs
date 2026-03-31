@@ -31,8 +31,57 @@ struct EmuState {
 
 fn load_so_memdump() -> Vec<u8> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    std::fs::read(format!("{}/lib/so_memdump.bin", manifest_dir))
-        .expect("failed to read so_memdump.bin")
+    let mut data = std::fs::read(format!("{}/lib/so_memdump.bin", manifest_dir))
+        .expect("failed to read so_memdump.bin");
+
+    // NOP all stack guard checks in the SO code BEFORE loading into Unicorn
+    // Pattern: LDR x?, [x?, #0x28]; LDUR x?, [x29, #-8]; CMP x?, x?; B.NE
+    let nop = 0xD503201Fu32.to_le_bytes();
+    let mut nop_count = 0u32;
+    let len = data.len();
+    for off in (0..len.saturating_sub(16)).step_by(4) {
+        let w0 = u32::from_le_bytes(data[off..off+4].try_into().unwrap());
+        // LDR (unsigned offset) with imm12=5 → offset #0x28
+        if (w0 & 0xFFC00000) == 0xF9400000 && ((w0 >> 10) & 0xFFF) == 5 {
+            let w1 = u32::from_le_bytes(data[off+4..off+8].try_into().unwrap());
+            let w2 = u32::from_le_bytes(data[off+8..off+12].try_into().unwrap());
+            let w3 = u32::from_le_bytes(data[off+12..off+16].try_into().unwrap());
+            // LDUR x?, [x29, #-8]: check opcode, simm9=-8, Rn=29
+            let is_ldur = (w1 >> 21) == 0x7C2
+                && ((w1 >> 12) & 0x1FF) == 0x1F8
+                && ((w1 >> 5) & 0x1F) == 29;
+            let is_cmp = (w2 & 0xFFE0FC1F) == 0xEB00001F;
+            let is_bne = (w3 & 0xFF00001F) == 0x54000001;
+            if is_ldur && is_cmp && is_bne {
+                for i in 0..4 {
+                    data[off + i * 4..off + i * 4 + 4].copy_from_slice(&nop);
+                }
+                nop_count += 4;
+            }
+        }
+    }
+    eprintln!("[emu] NOP'd {} stack guard instructions in SO data", nop_count);
+
+    // Also NOP all ADRP+BR x16 trampolines that jump outside SO
+    // These are PLT-like stubs to external functions (__cxa_guard, etc.)
+    // Pattern: ADRP x16, #page; BR x16
+    let mut tramp_count = 0u32;
+    for off in (0..len.saturating_sub(8)).step_by(4) {
+        let w0 = u32::from_le_bytes(data[off..off+4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(data[off+4..off+8].try_into().unwrap());
+        // ADRP x16: bit[31]=1, bits[28:24]=10000, Rd=16(10000)
+        let is_adrp_x16 = (w0 & 0x9F00001F) == 0x90000010;
+        // BR x16: 0xD61F0200
+        let is_br_x16 = w1 == 0xD61F0200;
+        if is_adrp_x16 && is_br_x16 {
+            data[off..off+4].copy_from_slice(&nop);
+            data[off+4..off+8].copy_from_slice(&nop);
+            tramp_count += 1;
+        }
+    }
+    eprintln!("[emu] NOP'd {} ADRP+BR x16 trampolines", tramp_count);
+
+    data
 }
 
 /// Patch GOT: redirect external pointers to unique stubs
@@ -90,10 +139,15 @@ fn load_emu_state(emu: &mut Unicorn<EmuState>, so_base: u64) -> HashMap<String, 
         let size = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize; pos += 4;
         let region_data = &data[pos..pos+size]; pos += size;
 
-        // Write into pages
+        // Write into pages (skip SO range — SO was already loaded with patches)
+        let so_end = so_base + SO_SIZE;
         let mut off = 0usize;
         while off < size {
             let cur_addr = addr + off as u64;
+            if cur_addr >= so_base && cur_addr < so_end {
+                off += 1;
+                continue;
+            }
             let page = cur_addr & !0xFFF;
             let page_off = (cur_addr - page) as usize;
             let chunk_len = (0x1000 - page_off).min(size - off);
@@ -348,13 +402,31 @@ pub fn test_orchestrator() -> String {
         false
     }).unwrap();
 
-    // Pre-map known external targets with RET stubs
-    for ext_addr in [0x7600001000u64] {
-        let page = ext_addr & !0xFFF;
-        if emu.mem_map(page, 0x1000, Prot::ALL).is_ok() {
-            let ret_page: Vec<u8> = (0..0x1000/4).flat_map(|_| 0xD65F03C0u32.to_le_bytes().to_vec()).collect();
-            emu.mem_write(page, &ret_page).unwrap();
+    // Write external stub at 0x7600001000 (the __cxa_guard_acquire trampoline target)
+    // Must return to SO+0x17B974 after the trampoline
+    {
+        let ret_addr = so_base + 0x17B974;
+        let stub_code: [u32; 5] = [
+            0xF94007E9, // LDR x9, [sp, #8]  (restore saved value)
+            0x910043FF, // ADD sp, sp, #0x10  (pop CFF's saved frame)
+            0xD2800000 | (((ret_addr & 0xFFFF) as u32) << 5) | 30, // MOVZ x30, #lo16
+            0xF2A00000 | ((((ret_addr >> 16) & 0xFFFF) as u32) << 5) | 30, // MOVK x30, #mid16, LSL#16
+            0xF2C00000 | ((((ret_addr >> 32) & 0xFFFF) as u32) << 5) | 30, // MOVK x30, #hi16, LSL#32
+        ];
+        let page = 0x7600001000u64 & !0xFFF;
+        let _ = emu.mem_map(page, 0x1000, Prot::ALL); // may already be mapped
+        // Fill with RET then overwrite stub location
+        let mut page_data = vec![0u8; 0x1000];
+        for i in (0..0x1000).step_by(4) { page_data[i..i+4].copy_from_slice(&0xD65F03C0u32.to_le_bytes()); }
+        let stub_off = (0x7600001000u64 - page) as usize;
+        for (i, insn) in stub_code.iter().enumerate() {
+            page_data[stub_off + i*4..stub_off + i*4+4].copy_from_slice(&insn.to_le_bytes());
         }
+        // Add RET after stub
+        page_data[stub_off + stub_code.len()*4..stub_off + stub_code.len()*4+4]
+            .copy_from_slice(&0xD65F03C0u32.to_le_bytes());
+        emu.mem_write(page, &page_data).unwrap();
+        eprintln!("[emu] External stub at 0x7600001000 → returns to SO+0x17B974");
     }
 
     match emu.emu_start(orch_addr, HALT_ADDR, 60_000_000, 0) {
