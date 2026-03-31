@@ -572,11 +572,85 @@ SHA-1 输出 = `1509be656b6620abd6cc6c48e8156dbe5927c8f8` (固定，因为输入
 **结论**: MD5 wrapper (0x258530) **不变换输出**。
 IDA 追踪完整流程: MD5 → malloc → 复制到堆 → 存入对象 → 返回。原样传递。
 
+### IDA 深度分析结果 (2026-03-31, 第三轮)
+
+#### AES 加密分发系统（两个并行实现）
+
+IDA 确认存在**两个**加密分发函数:
+- `sub_259CF0`: 使用标准入口 `sub_2422EC` (从 [ctx+0x00] 读 round key)
+- `sub_25AB1C`: 使用替代入口 `sub_242640` (从 [ctx+0xF0] 读 round key) — **实际被调用的版本**
+
+`sub_25AB1C` 的完整反编译（未被 CFF 混淆!）:
+```c
+int64 sub_25AB1C(int **a1, int64 a2, int64 a3, int64 a4, uint a5) {
+    switch (**a1) {
+        case 0: // ECB
+            for (uint i = 0; i < a5; i += 16)
+                sub_242640(a2, a3 + i, a4 + i);  // AES block encrypt
+            return 0;
+        case 1: return sub_242B18(a2, a3, a4, a5);  // CBC
+        case 2: sub_242C98(a2, a3, a4, a5); return 0; // CTR
+        case 3: sub_242EB8(a2, a3, a4, a5); return 0; // CFB
+    }
+}
+```
+
+Frida 确认 mode=0 (ECB)，17 次循环每次加密 16 字节。
+
+#### sub_259DBC (AES setup, 0xBB4 字节 CFF) 加密调用流程
+
+从反汇编追踪:
+```
+0x25A3E0: arg0 = mode_context (栈上)
+0x25A3E4: LDR X8, [vtable]         ; 加载 key expansion 函数指针
+0x25A3F0: BLR X9                    ; 调用 key expansion
+
+0x25A3FC: LDRSW X24, [struct+0xC]   ; data_len = struct.len
+0x25A404: BL malloc(data_len)        ; 分配输出缓冲区
+0x25A408: LDR X1, [struct+0x10]      ; src_data = struct.data_ptr
+0x25A414: BL memcpy(out, src, len)   ; 复制明文到输出缓冲区
+0x25A444: BLR X8                     ; AES_ECB_encrypt(ctx, key, data, data, len) — in-place!
+```
+
+**关键**: AES 加密是 **in-place** 操作，输入=输出缓冲区 (X2==X3)。
+明文长度来自 `[struct+0xC]`，明文数据来自 `[struct+0x10]`。
+
+#### Base64 编码链
+
+- `sub_2456AC` — 标准 base64 编码器，字符表在 `0x95C80` (标准 A-Za-z0-9+/)
+- `sub_258C84` — wrapper: 先算大小，malloc，再编码
+- `sub_258C14` — 高层入口，被 CFF 代码块调用
+- 输入: 对象 `[obj+0x10]` = data ptr, `[obj+0xC]` = data len
+
+#### 签名编排函数
+
+- `sub_17B96C` (348字节): 顶层编排函数
+  1. 调用 `sub_26FE2C` — 某种初始化
+  2. 调用 `sub_26FC94` — 键值对构建器 (遍历签名请求的参数对)
+  3. 通过 vtable[4] 调用签名核心 (arg=312)
+  4. 调用 `sub_271384` — 最终结果处理
+
+- `sub_26FC94` (408字节): 参数对处理
+  1. 通过 vtable 获取参数数量和每对参数
+  2. 对每对参数调用 `sub_26FE2C` 转换
+  3. 创建缓冲区并通过 `sub_25BF3C` 添加到 map
+  4. 最后调用 `sub_270020` 初始化
+
+#### D-810 反混淆结果: 对此 CFF 无效
+
+已安装 D-810 (OLLVM unflattening 配置, 177 条指令规则 + 2 条块规则)。
+**结论**: D-810 的 Unflattener 无法处理此 CFF 变种。
+
+此二进制的 CFF 特征:
+- 使用 **计算型分支跳转** (ADRP+ADD+arithmetic+BR), 不是标准 switch-variable
+- 多层间接寻址 + 常量混淆
+- IDA 无法解析 BR 目标，导致 JUMPOUT
+
 ### 下一步 (优先级排序)
 
-1. **IDA 分析 0x25AB84 周围代码** — 理解 AES-CTR counter block 生成和 XOR 逻辑
+1. **★★★★★ 运行 `hook_correlate.js`** — 全面关联分析: 同时捕获 AES+MD5+SHA1+Helios, 测试 AES output 与 Helios 的所有组合 (之前的 Helios 测试从未包含 AES 数据!)
 2. **IDA 分析 Medusa 936 bytes 的组装** — 272 AES bytes + 剩余 664 bytes 的来源
-3. **IDA 逆向 Helios part1/part2** — CFF 内联逻辑，目前所有已知算法组合都不匹配
+3. 如果 hook_correlate.js 仍无法找到 Helios 算法，使用 Stalker 追踪 MD5[1] 返回后到 Helios 写入之间的每条指令
 
 ### 验证方法
 
@@ -629,8 +703,9 @@ x-reading-request: {timestamp_ms}-{random_hex}  (推荐)
 - `gen_curl.js` — 生成签名输出 shell 变量
 
 ### Crypto Hook (核心)
+- **`hook_correlate.js`** — ★★★★★ 全面关联分析: 同时捕获 MD5+AES(0x242640)+SHA1+Helios+Medusa, 自动测试所有已知组合
 - **`hook_aes_alt_entry.js`** — ★★★★ Hook AES 替代入口 0x242640! 捕获 17 次 AES-ECB
-- **`hook_helios_v3.js`** — ★★ Helios 多样本 + 更多组合测试 (含 H3/SHA1)
+- **`hook_helios_v3.js`** — ★★ Helios 多样本 + 更多组合测试 (含 H3/SHA1, 但缺少 AES 关联!)
 - `hook_crypto_v4.js` — ⚠ hook 0x2422EC 但 CFF 代码调用 0x242640 绕过！实际抓不到 AES
 - `hook_crypto_v3.js` — ⚠ 有错误: 把 SHA-1 当成 AES，漏掉真正的 AES
 - **`hook_helios_multi.js`** — 固定 URL 多次签名收集 (R, H1, part1, part2) 样本
@@ -666,15 +741,15 @@ x-reading-request: {timestamp_ms}-{random_hex}  (推荐)
 ```bash
 PID=$(adb shell "ps -A" | grep com.dragon.read | awk '{print $2}' | head -1)
 
+# ★★★★★ 全面关联分析 (同时捕获 AES+MD5+SHA1+Helios, 测试所有组合!)
+timeout 60 frida -U -p $PID -l scripts/hook_correlate.js
+
 # 生成签名
 timeout 10 frida -U -p $PID -l scripts/gen_sigs.js 2>&1 | grep "^SIGS_JSON:"
 
 # ★★★★ AES 替代入口 hook (捕获 17 次 AES-ECB!)
 timeout 30 frida -U -p $PID -l scripts/hook_aes_alt_entry.js
 
-# ★★ Helios 多样本分析 (含更多组合测试)
+# ★★ Helios 多样本分析 (含更多组合测试, 但缺少 AES 关联)
 timeout 45 frida -U -p $PID -l scripts/hook_helios_v3.js
-
-# 调用链追踪
-timeout 30 frida -U -p $PID -l scripts/hook_lr_only.js
 ```
