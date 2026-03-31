@@ -318,6 +318,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynarmic-sys"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90dc637ba2e858f4070a417480b9039f138fd23a4afdfd7400019beda177f54b"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cmake",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -364,6 +377,7 @@ dependencies = [
  "cbc",
  "dialoguer",
  "dirs",
+ "dynarmic-sys",
  "flate2",
  "hex",
  "indicatif",
