@@ -17,7 +17,10 @@ const TJ: [u32; 64] = [
 
 fn rotate_left(a: u32, k: u32) -> u32 {
     let k = k % 32;
-    ((a << k) & 0xFFFFFFFF) | ((a & 0xFFFFFFFF) >> (32 - k))
+    if k == 0 {
+        return a;
+    }
+    (a << k) | (a >> (32 - k))
 }
 
 fn ff(x: u32, y: u32, z: u32, j: usize) -> u32 {

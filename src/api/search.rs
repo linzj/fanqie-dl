@@ -14,11 +14,18 @@ pub async fn search(
 
     let resp: ApiResponse<SearchData> = client
         .get(
-            "/reading/bookapi/search/tab/v1/",
+            "/reading/bookapi/search/tab/v",
             &[
                 ("query", query),
                 ("offset", &offset_str),
                 ("count", &count_str),
+                ("search_source", "1"),
+                ("is_first_enter_search", "true"),
+                ("use_correct", "false"),
+                ("from_rs", "false"),
+                ("only_feed", "false"),
+                ("only_large_card", "false"),
+                ("from_half_screen", "false"),
             ],
         )
         .await?;

@@ -8,6 +8,7 @@ use anyhow::Result;
 use api::book;
 use api::client::FanqieClient;
 use api::reader;
+use api::search;
 use dialoguer::{Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
@@ -20,7 +21,6 @@ async fn main() -> Result<()> {
         Ok(c) => c,
         Err(e) => {
             eprintln!("初始化失败: {}", e);
-            eprintln!("请确保 sign_proxy_simple.py <PID> 已启动");
             return Ok(());
         }
     };
@@ -36,12 +36,44 @@ async fn main() -> Result<()> {
         }
 
         // Extract book_id from input (supports raw ID, URL, or search)
-        let book_id = extract_book_id(&query).unwrap_or_else(|| {
-            // Try search (may not work due to API restrictions)
-            println!("提示: 搜索 API 可能不可用，建议直接输入 book_id");
-            println!("  从 fanqienovel.com 搜索后复制 URL 中的数字 ID");
-            query.clone()
-        });
+        let book_id = match extract_book_id(&query) {
+            Some(id) => id,
+            None => {
+                // Try keyword search
+                println!("搜索 \"{}\"...", query);
+                match search::search(&client, &query, 0, 20).await {
+                    Ok(books) if !books.is_empty() => {
+                        let items: Vec<String> = books
+                            .iter()
+                            .enumerate()
+                            .map(|(i, b)| {
+                                format!(
+                                    "[{}] {} - {} ({}字)",
+                                    i + 1,
+                                    b.book_name,
+                                    b.author,
+                                    b.word_count_str()
+                                )
+                            })
+                            .collect();
+                        let sel = Select::new()
+                            .with_prompt("选择")
+                            .items(&items)
+                            .default(0)
+                            .interact()?;
+                        books[sel].book_id_str()
+                    }
+                    Ok(_) => {
+                        println!("未找到结果\n");
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("搜索失败: {}\n", e);
+                        continue;
+                    }
+                }
+            }
+        };
 
         if book_id.is_empty() || !book_id.chars().all(|c| c.is_ascii_digit()) {
             println!("无效的 book_id\n");
@@ -150,4 +182,88 @@ fn extract_book_id(input: &str) -> Option<String> {
     // Any long number in the string
     let re = regex::Regex::new(r"\d{15,}").ok()?;
     re.find(input).map(|m| m.as_str().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_book_id() {
+        assert_eq!(
+            extract_book_id("7143038691944959011"),
+            Some("7143038691944959011".into())
+        );
+        assert_eq!(
+            extract_book_id("https://fanqienovel.com/page/7143038691944959011"),
+            Some("7143038691944959011".into())
+        );
+        assert_eq!(
+            extract_book_id("page/7143038691944959011"),
+            Some("7143038691944959011".into())
+        );
+        assert_eq!(extract_book_id("hello"), None);
+    }
+
+    #[tokio::test]
+    async fn test_search_api() {
+        let client = match FanqieClient::new().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("跳过: 初始化失败 {}", e);
+                return;
+            }
+        };
+        println!("device_id: {}", client.config.device_id);
+
+        let results = search::search(&client, "停尸房兼职", 0, 10).await;
+        match results {
+            Ok(books) => {
+                println!("搜索到 {} 本书:", books.len());
+                for b in &books {
+                    println!(
+                        "  {} - {} (id={}, {}字)",
+                        b.book_name,
+                        b.author,
+                        b.book_id_str(),
+                        b.word_count_str()
+                    );
+                }
+                assert!(!books.is_empty(), "搜索结果不应为空");
+            }
+            Err(e) => {
+                eprintln!("搜索失败: {}", e);
+                // 不 panic，可能是网络问题
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_book_detail_and_chapters() {
+        let client = match FanqieClient::new().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("跳过: {}", e);
+                return;
+            }
+        };
+
+        // 使用一本已知的书
+        let book_id = "7258325096933100578";
+        match book::get_book_detail(&client, book_id).await {
+            Ok(d) => println!("书名: 《{}》 作者: {}", d.book_name, d.author),
+            Err(e) => eprintln!("详情失败: {}", e),
+        }
+
+        match book::get_chapter_list(&client, book_id).await {
+            Ok(chapters) => {
+                println!("共 {} 章", chapters.len());
+                if let Some(ch) = chapters.first() {
+                    println!("  第一章: {} (id={})", ch.title, ch.item_id_str());
+                }
+                assert!(!chapters.is_empty(), "章节列表不应为空");
+            }
+            Err(e) => eprintln!("章节失败: {}", e),
+        }
+    }
 }

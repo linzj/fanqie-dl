@@ -16,7 +16,7 @@ pub struct FanqieClient {
 impl FanqieClient {
     pub async fn new() -> Result<Self> {
         let client = Client::builder()
-            .user_agent("com.dragon.read/71332 (Linux; U; Android 9; zh_CN; Pixel 4)")
+            .user_agent("com.dragon.read/71332 (Linux; U; Android 9; zh_CN; Pixel 4; Build/PQ3B.190801.002;tt-ok/3.12.13.20)")
             .gzip(true)
             .timeout(Duration::from_secs(30))
             .build()?;
@@ -144,7 +144,14 @@ impl FanqieClient {
             req = req.header(k.as_str(), v.as_str());
         }
 
-        let resp: serde_json::Value = req.send().await?.json().await?;
+        let raw_resp = req.send().await?;
+        let text = raw_resp.text().await?;
+        if text.is_empty() {
+            anyhow::bail!("registerkey 返回空响应");
+        }
+        let resp: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("JSON parse: {} body={}", e, &text[..text.len().min(200)])
+        })?;
         let code = resp["code"].as_i64().unwrap_or(-1);
         if code != 0 {
             anyhow::bail!(
@@ -214,12 +221,23 @@ impl FanqieClient {
             for (k, v) in &sign {
                 req = req.header(k.as_str(), v.as_str());
             }
+            req = req
+                .header(
+                    "Accept",
+                    "application/json; charset=utf-8,application/x-protobuf",
+                )
+                .header("lc", "101")
+                .header("sdk-version", "2")
+                .header("passport-sdk-version", "5051451")
+                .header("x-tt-store-region", "cn-gd")
+                .header("x-tt-store-region-src", "did");
 
             match req.send().await {
                 Ok(resp) => {
+                    let status = resp.status();
                     let text = resp.text().await?;
                     if text.is_empty() {
-                        last_err = Some(anyhow::anyhow!("空响应"));
+                        last_err = Some(anyhow::anyhow!("空响应 (status={})", status));
                         continue;
                     }
                     match serde_json::from_str::<T>(&text) {
