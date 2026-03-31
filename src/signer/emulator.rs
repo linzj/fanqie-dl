@@ -298,7 +298,9 @@ pub fn test_signing() -> Vec<(String, String)> {
         },
     ).unwrap();
 
-    // Comprehensive probes — trace the full signing flow
+    // PRODUCTION MODE: minimal hooks for performance
+    // Only MAP_SET hook + interrupt handler, no probes or instruction counters
+    /*
     let probes: Vec<(u64, &str)> = vec![
         (0x258530, "MD5_WRAP_PLT"),
         (0x258540, "MD5_WRAP_BODY"),
@@ -357,16 +359,7 @@ pub fn test_signing() -> Vec<(String, String)> {
         }).unwrap();
     }
 
-    // Only count instructions, no verbose trace
-    {
-        let cnt = std::cell::Cell::new(0u64);
-        emu.add_code_hook(so_base, so_base + 0x3E4000, move |_: &mut Unicorn<EmuState>, _: u64, _: u32| {
-            cnt.set(cnt.get() + 1);
-            if cnt.get() % 5_000_000 == 0 {
-                eprintln!("[INSN] {}M in SO", cnt.get() / 1_000_000);
-            }
-        }).unwrap();
-    }
+    */ // end of disabled probes
 
     // Hook CFF dispatch at end of MD5 wrapper
     emu.add_code_hook(so_base + 0x2585D8, so_base + 0x2585DC, |emu: &mut Unicorn<EmuState>, _, _| {
