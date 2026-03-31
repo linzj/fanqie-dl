@@ -207,17 +207,107 @@ JNI_OnLoad (0x2873F4)
 - HMAC-MD5(各种key, 各种data)
 - 可能是随机生成后服务端注册的密钥，或SO内部派生密钥
 
-## Frida Crypto Hook 结果 (2026-03-31)
+## IDA 深度分析修正 (2026-03-31, 第二轮)
+
+### 重大发现：之前的 Frida hook 识别了错误的函数！
+
+通过 IDA 反编译确认：
+- **sub_243F10 = SHA-1 transform**（之前误认为 AES block encrypt）
+  - 证据: 常量 `0x5A827999` (SHA-1 K0), ROTL5 (`EXTR W, W, #0x1B`), Ch 函数
+- **sub_243E50 = SHA-1 update**（之前误认为 AES wrapper）
+  - 处理 64 字节 block，内部调用 sub_243F10
+- **sub_2422EC = 真正的 AES block encrypt**（之前从未被 hook！）
+  - 使用 S-box 表 qword_93B78, qword_93698, qword_93EF0, qword_94320
+- **sub_241E9C = AES key expansion**（这个是对的）
+
+### MD5 Wrapper (0x258530) 分析完成 — 不变换输出
+
+IDA 追踪 MD5 wrapper 的完整流程:
+1. `sub_25BED4(16)` — 分配缓冲区
+2. `sub_243C34(data, len, fp-0x18)` — 调用原始 MD5，输出到栈
+3. `sub_32A1F0(24)` — malloc(24)
+4. `sub_2481FC(ptr, fp-0x18, 16)` — 复制 16 字节 MD5 结果到堆
+5. `sub_162944(obj, ptr)` — 存入对象
+6. 返回
+
+**结论: MD5 wrapper 不变换 MD5 输出，原样传递。** 任务3 完成。
+
+### 完整的 Crypto 函数映射（IDA 确认）
+
+| 地址 | 真实函数 | 之前误认为 | 说明 |
+|------|---------|-----------|------|
+| sub_243C34 | **MD5** | MD5 ✓ | `md5(data, len, out16)` |
+| sub_242FAC | **MD5 update** | - | 调用 sub_24307C (MD5 transform) |
+| sub_24307C | **MD5 transform** | - | MD5 核心压缩 |
+| sub_243F10 | **SHA-1 transform** | ~~AES block~~ ❌ | 常量 0x5A827999, ROTL5 |
+| sub_243E50 | **SHA-1 update** | ~~AES wrapper~~ ❌ | 64字节 block，调用 sub_243F10 |
+| sub_2450AC | **SHA-1 finalize** | - | padding + 20字节输出 |
+| sub_2451FC | **SHA-1 full** | - | init+update+finalize |
+| sub_241E9C | **AES key expansion** | AES key expand ✓ | 支持 16/24/32 字节密钥 |
+| sub_2422EC | **AES block encrypt** | **从未被 hook!** | 真正的 AES-128 加密 |
+| sub_2429F8 | **AES keygen+encrypt** | - | key expand + block encrypt 一步完成 |
+| sub_242A70 | **AES-CBC encrypt** | - | CBC 模式加密 |
+| sub_242C98 | **AES-CTR encrypt** | - | CTR 模式: nonce(8)+counter(8) |
+| sub_242DE0 | **XOR** | - | `out[i] = a[i] ^ b[i]`，CTR 模式用 |
+| sub_259C1C | **AES setup** | - | 模式选择: 0=ECB, 1=CBC, 2=CTR, 3=CFB |
+| sub_259CF0 | **AES dispatch** | - | 根据模式调用对应加密函数 |
+| sub_258530 | **MD5 wrapper** | MD5 wrapper ✓ | 不变换输出，原样封装 |
+| sub_258780 | **SHA-1 wrapper** | SHA-1 wrapper ✓ | |
+
+### AES 加密系统（IDA 完整逆向）
+
+```
+sub_259C1C (setup) — 模式分发:
+  case 0: ECB — 仅 key expansion (sub_241E9C)
+  case 1: CBC — key expansion + IV setup (sub_2429F8)
+  case 2: CTR — key expansion + nonce setup (sub_242C20)
+  case 3: CFB — key expansion + IV setup (sub_242E40)
+
+sub_259CF0 (encrypt) — 加密分发:
+  case 0: ECB — 每 16 字节调用 sub_2422EC
+  case 1: CBC — sub_242A70 (XOR前块 + encrypt)
+  case 2: CTR — sub_242C98 (encrypt counter + XOR plaintext)
+  case 3: CFB — sub_242EB8
+
+sub_242C98 (AES-CTR) 算法:
+  for each 16-byte block:
+    counter_block = nonce(8 bytes) || bswap64(counter++)
+    keystream = AES_ECB(key, counter_block)
+    ciphertext = plaintext XOR keystream
+```
+
+### 修正后的签名操作顺序
+
+```
+[0]  sub_270020 (初始化)
+[1]  MD5[0] (URL参数) → H0
+[2]  MD5[1] (R+"1967") → H1
+[3]  MD5[2] (session UUID) → H2
+[4]  MD5[3] (AES key derivation) → H3 = AES key
+[5]  AES key expansion (sub_241E9C)
+[6]  SHA-1 (sub_258780/sub_2451FC)
+[7-52] SHA-1 update × 46 (sub_243E50) — ★ 不是 AES！是 SHA-1！
+[53] SHA-1 transform × 1 (sub_243F10) — ★ 不是 AES！是 SHA-1！
+[??] AES block encrypt × N (sub_2422EC) — ★ 从未被 hook！Medusa 加密在这里
+[54] MD5[4] (常量)
+[55] MD5[5] (常量)
+```
+
+**关键**: 之前的 hook 完全漏掉了 AES 加密 (sub_2422EC)，并将 SHA-1 误认为 AES。
+需要运行 `hook_crypto_v4.js` 来捕获真正的 AES 操作。
+
+## Frida Crypto Hook 结果 (2026-03-31, 第一轮 — 部分错误)
 
 ### 核心发现：SHA-256 未被使用，签名用 MD5 + SHA-1 + AES-128
 
 运行 native hook 后发现 IDA 静态分析的假设是错误的：
 - **SHA-256 从未被调用** — 0次
 - **MD5 被调用 6 次**（标准 MD5，已通过 Java MessageDigest 验证）
-- **SHA-1 被调用 1 次**
-- **AES-128 密钥扩展 1 次**
-- **AES block 加密 1 次**
-- **AES wrapper (sub_243E50) 46 次**（用于 Medusa 加密体）
+- **SHA-1 被调用 1 次** (通过 sub_258780 wrapper)
+- **SHA-1 update × 46** (sub_243E50, ~~之前误认为 AES wrapper~~)
+- **SHA-1 transform × 1** (sub_243F10, ~~之前误认为 AES block~~)
+- **AES-128 密钥扩展 1 次** (sub_241E9C, 正确)
+- **AES block encrypt × ?** (sub_2422EC, **从未被 hook!**)
 - **XOR 解密 (sub_167E54) 0 次** — 说明 IDA 中 sub_283748 并非实际签名路径
 
 ### MD5 调用详情（完整输入输出）
@@ -284,22 +374,20 @@ IDA 静态分析推测的路径 (部分不准确):
   ↑ 这些函数在运行时从未被 hook 触发
 ```
 
-### 关键函数地址（Frida 确认的运行时函数）
+### 关键函数地址（修正版）
 
-| 地址 | 函数类型 | 说明 |
-|------|---------|------|
-| 0x258530 | MD5 wrapper | 所有 MD5 调用都经过此函数 `md5_wrap(data, len)` |
-| 0x243C34 | MD5 | 标准 MD5 `md5(data, len, out16)` |
-| 0x241E9C | AES key expand | AES-128 密钥扩展 |
-| 0x243F10 | AES encrypt | 完整 AES 加密 (4508字节, 非单 block) |
-| 0x243E50 | AES wrapper | 被调用 46 次 (Medusa body) |
-| 0x258780 | SHA-1 wrapper | SHA-1 计算 |
-| 0x259dbc | AES setup | 调用 AES key expand (1592字节) |
-| 0x263444 | SHA-1 区域 | 包含 SHA-1 调用和 AES 密钥派生 |
+见上方 "完整的 Crypto 函数映射" 表。
+
+运行时调用点（Frida LR 确认）:
+| 地址 | 调用点 | 说明 |
+|------|--------|------|
+| 0x258530 | MD5 wrapper | 所有 MD5 调用都经过此函数 |
+| 0x286df8 | MD5(URL) 返回点 | 在函数 0x286b58 内 |
+| 0x288bd4 | MD5(R+"1967") 返回点 | 在 thunk 0x288bbc 内 |
+| 0x2887e8 | MD5(uuid/const) 返回点 | 在 thunk 0x2887d0 内 |
+| 0x26351c | AES key + SHA-1 | 在 thunk 0x263504 内 |
+| 0x25a3f4 | AES key expansion | 在函数 0x259dbc 内 |
 | 0x26fc98 | 初始化 | 调用 sub_270020, 从 0x17ba0c 调用 |
-| 0x286df8 | URL hash 调用点 | 签名主逻辑区域 |
-| 0x288bd4 | Random hash 调用点 | 签名主逻辑区域 |
-| 0x2887e8 | UUID/常量 hash 调用点 | 签名主逻辑区域 |
 
 ### X-Helios 未解之谜
 
@@ -326,7 +414,7 @@ Helios = R(4 bytes) + part1(16 bytes) + part2(16 bytes)
 ### X-Medusa 部分解析
 
 ```
-结构: 24 bytes header + ~936 bytes AES-128 encrypted body
+结构: 24 bytes header + ~936 bytes encrypted body
 
 Header:
   bytes 0-3:   timestamp-derived (非直接 LE, 有 XOR/偏移)
@@ -334,10 +422,16 @@ Header:
   bytes 20-21: random/counter (每次调用不同)
   bytes 22-23: 0x0001 (常量)
 
-Body:
-  AES-128 加密 (key = 059874c397db2a6594024f0aa1c288c4)
-  46 次 AES wrapper 调用
-  明文内容未知
+Body 加密 (IDA 确认):
+  AES-128 key = 059874c397db2a6594024f0aa1c288c4
+  模式: ECB/CBC/CTR 之一 (通过 sub_259CF0 分发，需要运行 hook_crypto_v4.js 确认)
+  可能是 AES-CTR (sub_242C98): nonce(8 bytes) || counter_be64
+  明文内容: 可能包含 SHA-1 hash 结果 (46 次 SHA-1 update 处理的数据)
+
+关联的 SHA-1:
+  46 次 SHA-1 update (sub_243E50) + 1 次 SHA-1 transform (sub_243F10)
+  这些之前被误认为 AES 操作
+  SHA-1 可能用于: Medusa 明文的完整性校验，或构建 Medusa 明文内容
 ```
 
 ## IDA 逆向任务
@@ -368,37 +462,50 @@ Body:
 
 **目标**: 搞清楚 AES-128 加密前的明文是什么
 
-**已知**:
+**已知** (IDA 第二轮更新):
 - AES-128 key = `059874c397db2a6594024f0aa1c288c4`
-- 24 bytes header (timestamp+session+counter+0001) + ~936 bytes AES 密文
-- 46 次 AES wrapper 调用
+- AES 加密通过 sub_259CF0 分发，支持 ECB/CBC/CTR/CFB 四种模式
+- 之前认为的 "46 次 AES" 实际是 SHA-1 update
+- 真正的 AES encrypt (sub_2422EC) 从未被 hook
 
-**IDA 分析入口**:
-1. 去 **0x259dbc** (AES setup 函数, 1592 字节)
-2. 追踪 AES 加密前的数据准备
-3. 或者直接用已知 key 在 Frida 中解密 Medusa body（用 `hook_crypto_v3.js` 捕获完整 Medusa hex，然后 AES-128-CBC/ECB 解密 body 部分）
+**Frida 验证** (最高优先):
+1. 运行 **`hook_crypto_v4.js`** — 会 hook 真正的 AES block encrypt (sub_2422EC)
+2. 观察 AES_DISPATCH 的 mode 值确认加密模式 (0=ECB, 1=CBC, 2=CTR, 3=CFB)
+3. 如果是 CTR: 捕获 nonce 和 counter 初始值
+4. 捕获 XOR 操作 (sub_242DE0) 来获取明文
 
-### 任务3: 确认 MD5 wrapper (0x258530) 是否变换输出
+**也可以用已知 key 解密**:
+- 捕获完整 Medusa hex
+- 根据确认的模式 + IV/nonce 解密 body 部分 (跳过前 24 字节 header)
 
-**目标**: 确认 0x258530 是否在调用 MD5 后对结果做变换
+### 任务3: ~~确认 MD5 wrapper 是否变换输出~~ ✅ 已完成
 
-**已知**:
-- 0x258530 内部调用 MD5 后: `mov w8, #0xe14; b <CFF dispatcher>` — CFF 跳转
-- 函数有 CFF 混淆，可能在 MD5 后有后处理
-- Frida 测试显示: MD5 raw 输出不是 Helios 的直接组成部分 → 可能 wrapper 做了变换
+**结论**: MD5 wrapper (0x258530) **不变换输出**。
+IDA 追踪完整流程: MD5 → malloc → 复制到堆 → 存入对象 → 返回。原样传递。
 
-**IDA 分析**:
-1. 在 IDA 中打开 **0x258530**
-2. 用 CFF 解混淆插件 (如 d810, HexRaysDeob) 恢复控制流
-3. 看 MD5 调用后是否有 XOR/置换/额外 hash
+### 下一步 (优先级排序)
+
+1. **运行 `hook_crypto_v4.js`** — 最高优先！这会揭示:
+   - Medusa 用的 AES 模式 (ECB/CBC/CTR?)
+   - AES block encrypt 的真实调用次数
+   - CTR 的 nonce/counter (如果是 CTR 模式)
+   - XOR 操作中的 Medusa 明文
+
+2. **运行 `hook_helios_v3.js`** — 测试更多 Helios 组合:
+   - 包括 H3 (AES key) 作为 XOR key
+   - SHA-1 输出作为组件
+   - 8 个样本的统计分析
+
+3. 根据 v4 输出, 在 Rust 中实现 Medusa
 
 ### 验证方法
 
-完成逆向后，把算法写到这里，可以用 Frida 验证:
 ```bash
 PID=$(adb shell "ps -A" | grep com.dragon.read | awk '{print $2}' | head -1)
-timeout 30 frida -U -p $PID -l scripts/hook_crypto_v3.js
-# 对比输出的 Helios hex 和你的算法计算结果
+timeout 30 frida -U -p $PID -l scripts/hook_crypto_v4.js
+# 对比输出的 AES 操作和 Medusa 结构
+timeout 45 frida -U -p $PID -l scripts/hook_helios_v3.js
+# 分析 Helios 样本
 ```
 
 ## App 设备信息（模拟器，用于测试）
@@ -436,7 +543,9 @@ x-reading-request: {timestamp_ms}-{random_hex}  (推荐)
 - `gen_curl.js` — 生成签名输出 shell 变量
 
 ### Crypto Hook (核心)
-- **`hook_crypto_v3.js`** — ★ 完整 crypto dump: MD5 输入/输出 + SHA1 + AES + 返回地址
+- **`hook_crypto_v4.js`** — ★★★ 修正版! Hook 真正的 AES (sub_2422EC) + 正确标识 SHA-1
+- **`hook_helios_v3.js`** — ★★ Helios 多样本 + 更多组合测试 (含 H3/SHA1)
+- `hook_crypto_v3.js` — ⚠ 有错误: 把 SHA-1 当成 AES，漏掉真正的 AES
 - **`hook_helios_multi.js`** — 固定 URL 多次签名收集 (R, H1, part1, part2) 样本
 - **`hook_helios_verify.js`** — 用 Java MD5 测试 Helios 算法假设
 - **`hook_helios_verify2.js`** — 用 Java AES 测试 Helios 算法假设
@@ -463,11 +572,14 @@ PID=$(adb shell "ps -A" | grep com.dragon.read | awk '{print $2}' | head -1)
 # 生成签名
 timeout 10 frida -U -p $PID -l scripts/gen_sigs.js 2>&1 | grep "^SIGS_JSON:"
 
-# ★ 完整 crypto 分析
-timeout 30 frida -U -p $PID -l scripts/hook_crypto_v3.js
+# ★★★ 修正版 crypto 分析 (hook 真正的 AES!)
+timeout 30 frida -U -p $PID -l scripts/hook_crypto_v4.js
 
-# ★ 多样本收集 + Helios 分析
-timeout 45 frida -U -p $PID -l scripts/hook_helios_multi.js
+# ★★ Helios 多样本分析 (含更多组合测试)
+timeout 45 frida -U -p $PID -l scripts/hook_helios_v3.js
+
+# 旧版 (有错误，仅供参考)
+# timeout 30 frida -U -p $PID -l scripts/hook_crypto_v3.js
 
 # 调用链追踪
 timeout 30 frida -U -p $PID -l scripts/hook_lr_only.js
