@@ -397,7 +397,8 @@ pub fn test_signing() -> Vec<(String, String)> {
     let start = so_base + OFF_SIGN_START;
     eprintln!("[emu] Starting at SO+0x{:x}", OFF_SIGN_START);
 
-    match emu.emu_start(start, HALT_ADDR, 60_000_000, 0) {
+    // 10 minutes timeout for full signing
+    match emu.emu_start(start, HALT_ADDR, 600_000_000, 0) {
         Ok(()) => {
             let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
             eprintln!("[emu] Completed at PC=0x{:x} (SO+0x{:x})", pc, pc.wrapping_sub(so_base));
