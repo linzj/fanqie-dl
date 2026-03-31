@@ -9,7 +9,7 @@ var libBase = null;
 var cryptoLog = [];
 var capturing = false;
 
-function hexdump(ptr, len) {
+function hexBytes(ptr, len) {
     var bytes = [];
     for (var i = 0; i < len; i++) {
         bytes.push(('0' + ptr.add(i).readU8().toString(16)).slice(-2));
@@ -35,7 +35,7 @@ function setupNativeHooks() {
             this.len = args[1].toInt32();
             this.out = args[2];
             if (capturing) {
-                var input = hexdump(this.data, Math.min(this.len, 512));
+                var input = hexBytes(this.data, Math.min(this.len, 512));
                 cryptoLog.push({
                     op: "SHA256",
                     phase: "enter",
@@ -47,7 +47,7 @@ function setupNativeHooks() {
         },
         onLeave: function(ret) {
             if (capturing) {
-                var output = hexdump(this.out, 32);
+                var output = hexBytes(this.out, 32);
                 cryptoLog.push({
                     op: "SHA256",
                     phase: "leave",
@@ -68,7 +68,7 @@ function setupNativeHooks() {
                 var a1 = args[0];
                 var len = a1.add(12).readU32();
                 var dataPtr = a1.add(16).readPointer();
-                var input = hexdump(dataPtr, Math.min(len, 512));
+                var input = hexBytes(dataPtr, Math.min(len, 512));
                 cryptoLog.push({
                     op: "SHA256_WRAP",
                     phase: "enter",
@@ -88,7 +88,7 @@ function setupNativeHooks() {
                 var a1 = args[0];
                 var len = a1.add(12).readU32();
                 var dataPtr = a1.add(16).readPointer();
-                var input = hexdump(dataPtr, Math.min(len, 512));
+                var input = hexBytes(dataPtr, Math.min(len, 512));
                 cryptoLog.push({
                     op: "SHA1_WRAP",
                     phase: "enter",
@@ -111,7 +111,7 @@ function setupNativeHooks() {
                 cryptoLog.push({
                     op: "AES_KEY_EXPAND",
                     keyLen: keyLen,
-                    key: hexdump(key, keyLen)
+                    key: hexBytes(key, keyLen)
                 });
             }
         }

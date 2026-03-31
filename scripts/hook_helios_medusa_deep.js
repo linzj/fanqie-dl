@@ -302,7 +302,7 @@ function runAnalysis() {
 }
 
 // Setup and run
-setupNativeHooks();
+setupHooks();
 setTimeout(function() {
     runAnalysis();
 }, 2000);

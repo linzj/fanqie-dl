@@ -207,74 +207,199 @@ JNI_OnLoad (0x2873F4)
 - HMAC-MD5(各种key, 各种data)
 - 可能是随机生成后服务端注册的密钥，或SO内部派生密钥
 
-## 下一步：运行 Frida native crypto hook
+## Frida Crypto Hook 结果 (2026-03-31)
 
-### 目的
+### 核心发现：SHA-256 未被使用，签名用 MD5 + SHA-1 + AES-128
 
-通过 hook SO内部的 SHA-256、AES、MD5 函数，在运行时捕获：
-1. **X-Helios**: SHA-256 的输入数据 → 看hash的是什么（nonce+URL+key? HMAC?）
-2. **X-Medusa**: AES 密钥 + 加密前的明文 → 看加密的是什么
-3. **XOR解密字符串**: 确认所有被混淆的header名
+运行 native hook 后发现 IDA 静态分析的假设是错误的：
+- **SHA-256 从未被调用** — 0次
+- **MD5 被调用 6 次**（标准 MD5，已通过 Java MessageDigest 验证）
+- **SHA-1 被调用 1 次**
+- **AES-128 密钥扩展 1 次**
+- **AES block 加密 1 次**
+- **AES wrapper (sub_243E50) 46 次**（用于 Medusa 加密体）
+- **XOR 解密 (sub_167E54) 0 次** — 说明 IDA 中 sub_283748 并非实际签名路径
 
-### 运行方法
+### MD5 调用详情（完整输入输出）
 
+| # | 输入 | 长度 | 输出 | 说明 |
+|---|------|------|------|------|
+| 0 | URL query string (从 `ac=wifi&aid=1967&...` 开始) | 380 | H0 (每次不同) | URL 参数哈希 |
+| 1 | `R + "1967"` (R = Helios前4字节随机) | 8 | H1 (每次不同) | 随机数+aid 哈希 |
+| 2 | `{session_uuid}0` (如 `7e8f14d8-3cc8-4350-bc26-2b9d48e98ebf0`) | 37 | H2 (每session不同) | 会话UUID哈希 |
+| 3 | `"1967" + ab7cfe85 + "1967"` | 12 | `059874c397db2a6594024f0aa1c288c4` | **= AES-128 密钥！** |
+| 4 | `abd3c178a46d39ad4fb312d3d23941c3` (固定16字节) | 16 | `7916c9e4604cf3e707159c25532f6fd3` | 固定常量 |
+| 5 | `447c28b7a74153a038708f7aa92f9575` (固定16字节) | 16 | `d9c02b7a8cb156054008b36571298df6` | 固定常量 |
+
+### AES-128 密钥
+
+```
+密钥 = MD5("1967" + 0xab7cfe85 + "1967") = 059874c397db2a6594024f0aa1c288c4
+密钥来源: MD5(aid_str + magic_4bytes + aid_str)
+magic_4bytes = ab 7c fe 85 (固定常量，嵌入 SO 中)
+```
+
+### SHA-1 调用
+
+```
+输入 (12 bytes): ad 9f 20 ff 31 39 36 37 ab 7c fe 85
+               = magic_4bytes_2 + "1967" + magic_4bytes
+输出: 未成功捕获 (outPtr 为 NULL)
+```
+
+### 签名操作顺序
+
+```
+[0]  sub_270020 (初始化)        ← 调用自 0x26fde0 (函数 0x26fc98)
+[1]  MD5[0] (URL参数)           ← 调用自 0x286df8 → 0x258530(MD5 wrapper)
+[2]  MD5[1] (R+"1967")         ← 调用自 0x288bd4 → 0x258530
+[3]  MD5[2] (session UUID)     ← 调用自 0x2887e8 → 0x258530
+[4]  MD5[3] (AES key)          ← 调用自 0x26351c → 0x258530
+[5]  AES key expansion         ← 调用自 0x25a3f4 (函数 0x259dbc)
+[6]  SHA-1                     ← 调用自 0x26351c
+[7-51] AES_WRAP × 46           ← Medusa body 加密
+[52] AES_BLOCK × 1             ← 单次 AES block 加密
+[53] MD5[4] (常量)             ← 调用自 0x2887e8 → 0x258530
+[54] MD5[5] (常量)             ← 调用自 0x2887e8 → 0x258530
+```
+
+### 函数调用链（Frida 发现 vs IDA 分析）
+
+```
+实际运行时路径 (Frida hook):
+  JNI → r4.onCallToAddSecurityFactor()
+    → y2.a(tag=0x3000001, ...)
+      → [某 native 入口]
+        → 0x26fc98 (初始化, 调用 sub_270020)         ← 调用自 0x17ba0c
+        → 0x286df8 (调用 MD5 wrapper 哈希 URL)
+        → 0x288bd4 (调用 MD5 wrapper 哈希 random+aid)
+        → 0x2887e8 (调用 MD5 wrapper 哈希 UUID/常量)
+        → 0x26351c (AES 密钥派生 + SHA-1)
+          → 0x259dbc (AES 初始化)
+        → [AES 加密 Medusa body]
+        → 0x2887e8 (调用 MD5 wrapper 哈希固定常量)
+
+IDA 静态分析推测的路径 (部分不准确):
+  sub_29CCD4 → sub_29CF58 → sub_283748
+  ↑ 这些函数在运行时从未被 hook 触发
+```
+
+### 关键函数地址（Frida 确认的运行时函数）
+
+| 地址 | 函数类型 | 说明 |
+|------|---------|------|
+| 0x258530 | MD5 wrapper | 所有 MD5 调用都经过此函数 `md5_wrap(data, len)` |
+| 0x243C34 | MD5 | 标准 MD5 `md5(data, len, out16)` |
+| 0x241E9C | AES key expand | AES-128 密钥扩展 |
+| 0x243F10 | AES encrypt | 完整 AES 加密 (4508字节, 非单 block) |
+| 0x243E50 | AES wrapper | 被调用 46 次 (Medusa body) |
+| 0x258780 | SHA-1 wrapper | SHA-1 计算 |
+| 0x259dbc | AES setup | 调用 AES key expand (1592字节) |
+| 0x263444 | SHA-1 区域 | 包含 SHA-1 调用和 AES 密钥派生 |
+| 0x26fc98 | 初始化 | 调用 sub_270020, 从 0x17ba0c 调用 |
+| 0x286df8 | URL hash 调用点 | 签名主逻辑区域 |
+| 0x288bd4 | Random hash 调用点 | 签名主逻辑区域 |
+| 0x2887e8 | UUID/常量 hash 调用点 | 签名主逻辑区域 |
+
+### X-Helios 未解之谜
+
+**已排除的假设** (用 Java MessageDigest/Cipher 在 Frida 中验证):
+
+Helios = R(4 bytes) + part1(16 bytes) + part2(16 bytes)
+
+以下都**不匹配** part1 或 part2:
+- `MD5(H0 + H1)`, `MD5(H1 + H0)`, `MD5(H0 + R)`, `MD5(R + H0)`
+- `H0 XOR H1`, `H0 XOR H4`, `H0 XOR H5`, `H1 XOR H4`, `H1 XOR H5`
+- `AES_ECB(key, H0)`, `AES_ECB(key, H1)`
+- `AES_ECB(key, H0) XOR H1`, `AES_ECB(key, H1) XOR H0`
+- `AES_CBC(IV=0, H0||H1)`, `AES_CBC(IV=H2, H0||H1)`, etc.
+- `AES_DEC(part1)`, `AES_DEC(part2)` 的结果也不匹配已知值
+- `MD5(H0+H2+H1)`, `MD5(H1+H0+H2)`, `MD5(part1+H0)`, etc.
+- HMAC-like: `MD5(H5 || MD5(H4 || H0))` etc.
+
+**结论**: Helios 的 32 字节 hash 部分由 CFF 混淆的内联代码生成，不直接调用标准 crypto 函数。可能涉及:
+1. 自定义字节变换/置换
+2. 查表操作
+3. 多步 XOR + rotate + add 组合
+4. 或完全不同的算法路径
+
+### X-Medusa 部分解析
+
+```
+结构: 24 bytes header + ~936 bytes AES-128 encrypted body
+
+Header:
+  bytes 0-3:   timestamp-derived (非直接 LE, 有 XOR/偏移)
+  bytes 4-19:  与 session/device 相关 (同一 session 内固定)
+  bytes 20-21: random/counter (每次调用不同)
+  bytes 22-23: 0x0001 (常量)
+
+Body:
+  AES-128 加密 (key = 059874c397db2a6594024f0aa1c288c4)
+  46 次 AES wrapper 调用
+  明文内容未知
+```
+
+## IDA 逆向任务
+
+### 任务1: 逆向 X-Helios 的 32 字节 hash 构造 (最高优先)
+
+**目标**: 搞清楚 Helios = R(4) + part1(16) + part2(16) 中 part1/part2 的生成算法
+
+**已知**:
+- 输入: H0=MD5(url_params), H1=MD5(R+"1967"), H2=MD5(session_uuid), H4/H5=固定常量
+- 输出: part1(16 bytes) + part2(16 bytes)
+- 不是 MD5/AES/SHA 的简单组合（已在 Frida 中穷举排除）
+- 生成代码在 CFF 混淆的内联逻辑中
+
+**IDA 分析入口**:
+1. 去 **0x288bd0** (BL 到 MD5 wrapper 0x258530 的指令)
+2. 这是一个 thunk: `str x30,[sp,#-0x10]!; bl md5_wrap; ldr x30,[sp],#0x10; ret`
+3. 找到**调用这个 thunk 的父函数** — 那就是签名主函数
+4. 在父函数中追踪: MD5 wrapper 返回后（x0=NULL），H1 结果从哪里取出、如何变成 part1/part2
+5. 注意: 父函数使用 CFF 混淆，switch 变量驱动所有分支
+
+**也可以从另一个方向**:
+- 0x286df8 是 MD5(url_params) 的返回点
+- 往上找调用 0x286df4 (BL指令) 的函数 — 同一个签名主函数
+- 这个函数应该在 0x286xxx-0x288xxx 范围内
+
+### 任务2: 逆向 X-Medusa 的明文结构
+
+**目标**: 搞清楚 AES-128 加密前的明文是什么
+
+**已知**:
+- AES-128 key = `059874c397db2a6594024f0aa1c288c4`
+- 24 bytes header (timestamp+session+counter+0001) + ~936 bytes AES 密文
+- 46 次 AES wrapper 调用
+
+**IDA 分析入口**:
+1. 去 **0x259dbc** (AES setup 函数, 1592 字节)
+2. 追踪 AES 加密前的数据准备
+3. 或者直接用已知 key 在 Frida 中解密 Medusa body（用 `hook_crypto_v3.js` 捕获完整 Medusa hex，然后 AES-128-CBC/ECB 解密 body 部分）
+
+### 任务3: 确认 MD5 wrapper (0x258530) 是否变换输出
+
+**目标**: 确认 0x258530 是否在调用 MD5 后对结果做变换
+
+**已知**:
+- 0x258530 内部调用 MD5 后: `mov w8, #0xe14; b <CFF dispatcher>` — CFF 跳转
+- 函数有 CFF 混淆，可能在 MD5 后有后处理
+- Frida 测试显示: MD5 raw 输出不是 Helios 的直接组成部分 → 可能 wrapper 做了变换
+
+**IDA 分析**:
+1. 在 IDA 中打开 **0x258530**
+2. 用 CFF 解混淆插件 (如 d810, HexRaysDeob) 恢复控制流
+3. 看 MD5 调用后是否有 XOR/置换/额外 hash
+
+### 验证方法
+
+完成逆向后，把算法写到这里，可以用 Frida 验证:
 ```bash
-# 在有 Android 模拟器的机器上执行：
 PID=$(adb shell "ps -A" | grep com.dragon.read | awk '{print $2}' | head -1)
-
-# 方案1: 全面 crypto dump
-timeout 30 frida -U -p $PID -l scripts/hook_crypto_native.js 2>&1 | tee crypto_dump.txt
-
-# 方案2: 差分分析 (推荐，更清晰)
-timeout 30 frida -U -p $PID -l scripts/hook_helios_medusa_deep.js 2>&1 | tee crypto_deep.txt
+timeout 30 frida -U -p $PID -l scripts/hook_crypto_v3.js
+# 对比输出的 Helios hex 和你的算法计算结果
 ```
-
-### hook 的 native 函数
-
-| 函数地址 | 说明 | 捕获内容 |
-|----------|------|----------|
-| 0x245630 | SHA-256 hash | 输入数据(hex) + 输出hash |
-| 0x258A48 | SHA-256 wrapper | struct解析后的输入 |
-| 0x258780 | SHA-1 wrapper | 输入数据 |
-| 0x241E9C | AES key expansion | 密钥(hex) + 密钥长度 |
-| 0x243F10 | AES block encrypt | 加密计数 |
-| 0x243C34 | MD5 | 调用标记 |
-| 0x167E54 | XOR string decrypt | 解密后的明文字符串 |
-| 0x283748 | 签名主函数 | 进入/退出标记 |
-| 0x29CF58 | 签名分发器 | URL参数 |
-| 0x26732C | SHA-256前的处理 | 参数 |
-
-### hook 脚本输出格式
-
-```
-======== SIGNATURES ========
-  X-Helios = AX82SNTs... (36 bytes)
-    hex: 017f3618...
-  X-Medusa = ....(966 bytes)
-    first 48 bytes: 7264cb69...
-
-======== CRYPTO OPERATIONS ========
-  [0] XOR_DEC: "X-Helios"          ← header名解密
-  [1] SHA256(len=XX): abcdef...     ← hash输入
-      => 4694cb86a4e82a02...        ← hash输出(应该出现在Helios中)
-  [2] AES_KEYGEN(keyLen=16): key=xx ← AES密钥
-  ...
-
-======== DIFFERENTIAL ANALYSIS ========
-  SHA256[0]: DIFFERENT              ← URL相关
-  AES[0]: SAME                     ← URL无关(固定key)
-```
-
-### 输出后的处理
-
-把 `crypto_dump.txt` 或 `crypto_deep.txt` 的完整输出提交到 repo，或直接贴给 Claude。
-
-从输出中可以提取：
-1. **X-Helios 算法**: SHA-256 输入格式 (大概率是 `SHA256(random_4bytes + url_bytes + secret_key)`)
-2. **X-Medusa 算法**: AES 密钥 + 加密格式 + 明文结构
-3. **所有固定密钥**: 直接从 AES_KEYGEN 输出中获取
-
-有了这些信息就可以在 Rust 中纯实现签名。
 
 ## App 设备信息（模拟器，用于测试）
 
@@ -304,12 +429,32 @@ x-reading-request: {timestamp_ms}-{random_hex}  (推荐)
 ## Frida 测试脚本
 
 测试用的脚本在 `scripts/` 目录：
+
+### 签名生成
 - `gen_sigs.js` — 生成签名并输出 JSON
-- `investigate_algo.js` — 分析签名算法
-- `analyze_helios_medusa.js` — 深入分析 Helios/Medusa 结构
+- `gen_and_write.js` — 生成签名写入设备文件
+- `gen_curl.js` — 生成签名输出 shell 变量
+
+### Crypto Hook (核心)
+- **`hook_crypto_v3.js`** — ★ 完整 crypto dump: MD5 输入/输出 + SHA1 + AES + 返回地址
+- **`hook_helios_multi.js`** — 固定 URL 多次签名收集 (R, H1, part1, part2) 样本
+- **`hook_helios_verify.js`** — 用 Java MD5 测试 Helios 算法假设
+- **`hook_helios_verify2.js`** — 用 Java AES 测试 Helios 算法假设
+- `hook_crypto_v2.js` — crypto dump v2 (带差分分析)
+- `hook_lr_only.js` — 捕获所有 crypto 函数的 LR (返回地址/调用者)
+- `hook_find_parent.js` — 从 LR 找上层调用函数
+- `hook_md5_wrapper.js` — 分析 0x258530 MD5 wrapper 的参数和返回值
+
+### 分析工具
+- `hook_disasm.js` — 反汇编 MD5 wrapper 和调用点代码
+- `hook_find_crypto2.js` — 搜索 SO 中的 crypto 常量位置 + JNI 入口
+- `investigate_algo.js` — 签名算法基本分析
+- `analyze_helios_medusa.js` — Helios/Medusa 结构分析
+
+### 测试
 - `capture_and_test.js` — 生成 curl 命令
-- **`hook_crypto_native.js`** — ★ hook native crypto函数，dump所有SHA-256/AES操作
-- **`hook_helios_medusa_deep.js`** — ★ 差分分析版，用两个不同URL对比crypto操作
+- `hook_crypto_native.js` — 原始 crypto hook (已被 v3 替代)
+- `hook_helios_medusa_deep.js` — 差分分析版 (已被 v3 替代)
 
 用法（只能用 frida CLI）:
 ```bash
@@ -318,6 +463,12 @@ PID=$(adb shell "ps -A" | grep com.dragon.read | awk '{print $2}' | head -1)
 # 生成签名
 timeout 10 frida -U -p $PID -l scripts/gen_sigs.js 2>&1 | grep "^SIGS_JSON:"
 
-# ★ 深度crypto分析 (推荐)
-timeout 30 frida -U -p $PID -l scripts/hook_helios_medusa_deep.js 2>&1 | tee crypto_deep.txt
+# ★ 完整 crypto 分析
+timeout 30 frida -U -p $PID -l scripts/hook_crypto_v3.js
+
+# ★ 多样本收集 + Helios 分析
+timeout 45 frida -U -p $PID -l scripts/hook_helios_multi.js
+
+# 调用链追踪
+timeout 30 frida -U -p $PID -l scripts/hook_lr_only.js
 ```
