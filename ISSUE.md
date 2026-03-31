@@ -646,11 +646,60 @@ Frida 确认 mode=0 (ECB)，17 次循环每次加密 16 字节。
 - 多层间接寻址 + 常量混淆
 - IDA 无法解析 BR 目标，导致 JUMPOUT
 
+## hook_correlate.js 结果 (2026-03-31, 第四轮)
+
+### 关联分析结论：所有已知组合均不匹配 Helios
+
+运行 5 个样本的全面关联分析，测试了以下所有组合，**无一匹配** part1 或 part2：
+
+| 测试类型 | 测试内容 | 结果 |
+|---------|---------|------|
+| 直接匹配 | AES[0..16].output == part1/part2 | ❌ |
+| 直接匹配 | AES[0..16].input == part1/part2 | ❌ |
+| XOR | AES[j].out XOR H0/H1/H2/H3/H4/H5/SHA1 == part1/part2 | ❌ |
+| XOR | AES[j].in XOR H0/H1/H2/H3/H4/H5/SHA1 == part1/part2 | ❌ |
+| AES-ECB | AES(H0^H1), AES(H0^H2), AES(H1^H2), etc. == part1/part2 | ❌ |
+| AES-ECB+XOR | AES(combo) XOR Hx == part1/part2 | ❌ |
+| MD5 | MD5(H1+AES0out), MD5(AES0out+H1), MD5(H0+AES0out), etc. == part1/part2 | ❌ |
+
+### 重要发现：AES 块在相同 URL 下完全恒定
+
+```
+Cross-sample analysis:
+  AES[0..16] same_input = true (全部)
+  All AES inputs constant: true
+```
+
+**所有 17 个 AES-ECB 块输入输出完全相同**（因为是相同 URL → 相同 Medusa 明文 → 相同 AES 加密结果）。
+这意味着 AES 输出不参与 Helios 生成（Helios 每次都变，但 AES 输出是常量）。
+
+### 确认的数据
+
+```
+5 samples, each: 17 AES blocks, 6 MD5 calls
+Constants: H0, H2, H3, H4, H5, SHA1 (不变)
+Variable:  R (random 4 bytes), H1=MD5(R+"1967"), part1, part2
+Medusa body: 960 bytes total, 272 from AES, 664 unaccounted
+```
+
+### Helios 算法排除总结
+
+至此，已系统排除的所有假设：
+1. ❌ 标准 crypto 函数输出的简单组合（MD5/AES/SHA1/XOR）
+2. ❌ AES 块输出与 Helios 无关（AES 是常量，Helios 是变量）
+3. ❌ 任何两个 hash 的 XOR
+4. ❌ AES-ECB 加密任何 hash 组合
+5. ❌ AES-ECB 加密后再 XOR 任何 hash
+6. ❌ MD5 链（concat 后再 hash）
+
+**结论**：Helios part1/part2 由 CFF 内联代码生成，不经过任何已 hook 的标准 crypto 函数。
+需要 IDA 逆向 CFF 混淆代码才能找到算法。
+
 ### 下一步 (优先级排序)
 
-1. **★★★★★ 运行 `hook_correlate.js`** — 全面关联分析: 同时捕获 AES+MD5+SHA1+Helios, 测试 AES output 与 Helios 的所有组合 (之前的 Helios 测试从未包含 AES 数据!)
+1. **★★★★★ IDA 逆向 Helios part1/part2 生成算法** — 追踪 MD5(R+"1967") 返回后到 Helios 写入之间的 CFF 内联逻辑
 2. **IDA 分析 Medusa 936 bytes 的组装** — 272 AES bytes + 剩余 664 bytes 的来源
-3. 如果 hook_correlate.js 仍无法找到 Helios 算法，使用 Stalker 追踪 MD5[1] 返回后到 Helios 写入之间的每条指令
+3. 如果 IDA 分析困难，考虑 **hook_memory_trace**: 在 MD5[1] 返回后设置内存断点追踪 H1 的去向
 
 ### 验证方法
 
