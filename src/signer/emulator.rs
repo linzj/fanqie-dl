@@ -1,220 +1,369 @@
 //! ARM64 emulator for libmetasec_ml.so signing functions.
-//! Uses Unicorn Engine to execute native code from the dumped SO.
+//! Loads the SO memory dump + captured heap state, then executes the orchestrator.
 
 use std::collections::HashMap;
 use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterARM64, Unicorn};
 
-// Use the same base as the Frida dump to preserve ADRP calculations
-const SO_BASE: u64 = 0x7623e02000;
 const SO_SIZE: u64 = 0x3E4000;
-const SO_END: u64 = SO_BASE + SO_SIZE;
 
-const STACK_BASE: u64 = 0x7F000000;
+fn read_so_base() -> u64 {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let data = std::fs::read(format!("{}/lib/emu_state.bin", manifest_dir))
+        .expect("failed to read emu_state.bin");
+    u64::from_le_bytes(data[0..8].try_into().unwrap())
+}
+
 const STACK_SIZE: u64 = 0x100000;
 const HEAP_BASE: u64 = 0x80000000;
 const HEAP_SIZE: u64 = 0x1000000;
-const DATA_BASE: u64 = 0x90000000;
-const DATA_SIZE: u64 = 0x100000;
 const HALT_ADDR: u64 = 0xDEAD0000;
 const STUB_BASE: u64 = 0xA0000000;
-const STUB_SIZE: u64 = 0x10000;
+const STUB_SIZE: u64 = 0x100000; // 1MB for stubs
 
-// Function offsets (past PLT stubs — actual function body addresses)
 const OFF_MD5: u64 = 0x243C44;
-#[allow(dead_code)]
-const OFF_AES_KEY_EXPAND: u64 = 0x241E9C;
-#[allow(dead_code)]
-const OFF_AES_ECB_ALT: u64 = 0x242640;
-#[allow(dead_code)]
-const OFF_ORCHESTRATOR: u64 = 0x17B96C;
+const OFF_ORCHESTRATOR: u64 = 0x17B8F8; // real function body (not the PLT trampoline at 0x17B96C)
 
 struct EmuState {
     heap_next: u64,
+    so_base: u64,
 }
 
 fn load_so_memdump() -> Vec<u8> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dump_path = format!("{}/lib/so_memdump.bin", manifest_dir);
-    std::fs::read(&dump_path).expect("failed to read so_memdump.bin")
+    std::fs::read(format!("{}/lib/so_memdump.bin", manifest_dir))
+        .expect("failed to read so_memdump.bin")
 }
 
-/// Patch GOT entries that point outside the SO to redirect to unique stubs
-/// Returns a map: stub_offset → (original_addr, got_offset)
-fn patch_external_got(so_data: &mut [u8]) -> HashMap<u64, (u64, usize)> {
-    let mut stub_map: HashMap<u64, (u64, usize)> = HashMap::new();
-    // Map original external address → stub offset (dedup)
+/// Patch GOT: redirect external pointers to unique stubs
+fn patch_external_got(so_data: &mut [u8], so_base: u64) -> u32 {
+    let so_end = so_base + SO_SIZE;
     let mut addr_to_stub: HashMap<u64, u64> = HashMap::new();
     let mut next_stub: u64 = 0;
-
     let scan_ranges: &[(usize, usize)] = &[
-        (0x17b000, 0x17c000),
-        (0x241000, 0x246000),
-        (0x24b000, 0x24c000),
-        (0x25b000, 0x25d000),
-        (0x347000, 0x349000),
-        (0x34c000, 0x376000),
+        (0x17b000, 0x17c000), (0x241000, 0x246000), (0x24b000, 0x24c000),
+        (0x25b000, 0x25d000), (0x347000, 0x349000), (0x34c000, 0x376000),
         (0x379000, 0x3D2000),
     ];
-
     for (start, end) in scan_ranges {
         let s = (*start).min(so_data.len());
         let e = (*end).min(so_data.len());
         let mut off = s;
         while off + 8 <= e {
             let val = u64::from_le_bytes(so_data[off..off + 8].try_into().unwrap());
-            if val > 0x10000 && (val < SO_BASE || val >= SO_END) {
-                if val > 0x7000000000 && val < 0x8000000000 {
-                    let stub_off = *addr_to_stub.entry(val).or_insert_with(|| {
-                        let s = next_stub;
-                        next_stub += 4; // one RET per stub
-                        s
-                    });
-                    let stub_addr = STUB_BASE + stub_off;
-                    so_data[off..off + 8].copy_from_slice(&stub_addr.to_le_bytes());
-                    stub_map.entry(stub_off).or_insert((val, off));
-                }
+            if val > 0x10000 && (val < so_base || val >= so_end) && val > 0x7000000000 && val < 0x8000000000 {
+                let stub_off = *addr_to_stub.entry(val).or_insert_with(|| { let s = next_stub; next_stub += 4; s });
+                so_data[off..off + 8].copy_from_slice(&(STUB_BASE + stub_off).to_le_bytes());
             }
             off += 8;
         }
     }
-
-    eprintln!("[emu] Patched {} GOT entries, {} unique external functions",
-        addr_to_stub.len(), stub_map.len());
-    stub_map
+    addr_to_stub.len() as u32
 }
 
-pub fn test_md5() -> String {
-    let mut so_data = load_so_memdump();
+/// Parse emu_state.bin and load all memory regions into the emulator
+/// Returns (registers, so_base)
+fn load_emu_state(emu: &mut Unicorn<EmuState>, so_base: u64) -> HashMap<String, u64> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let data = std::fs::read(format!("{}/lib/emu_state.bin", manifest_dir))
+        .expect("failed to read emu_state.bin");
 
-    // Patch external GOT entries
-    let _stub_map = patch_external_got(&mut so_data);
+    let mut pos = 0usize;
+    // Read SO_BASE from header
+    let _saved_so_base = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
+    let num_regs = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize; pos += 4;
+    let num_regions = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize; pos += 4;
+
+    // Read registers
+    let mut regs = HashMap::new();
+    for _ in 0..num_regs {
+        let name = std::str::from_utf8(&data[pos..pos+16]).unwrap().trim_end_matches('\0').to_string();
+        pos += 16;
+        let val = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
+        regs.insert(name, val);
+    }
+
+    // Collect all pages needed
+    let mut pages: HashMap<u64, Vec<u8>> = HashMap::new();
+    for _ in 0..num_regions {
+        let addr = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
+        let size = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize; pos += 4;
+        let region_data = &data[pos..pos+size]; pos += size;
+
+        // Write into pages
+        let mut off = 0usize;
+        while off < size {
+            let cur_addr = addr + off as u64;
+            let page = cur_addr & !0xFFF;
+            let page_off = (cur_addr - page) as usize;
+            let chunk_len = (0x1000 - page_off).min(size - off);
+
+            let page_data = pages.entry(page).or_insert_with(|| vec![0u8; 0x1000]);
+            page_data[page_off..page_off + chunk_len].copy_from_slice(&region_data[off..off + chunk_len]);
+            off += chunk_len;
+        }
+    }
+
+    // Map and write pages (group contiguous ranges)
+    let mut sorted_pages: Vec<u64> = pages.keys().copied().collect();
+    sorted_pages.sort();
+
+    let mut mapped = 0u32;
+    let mut i = 0;
+    while i < sorted_pages.len() {
+        let start = sorted_pages[i];
+        let mut end = start + 0x1000;
+        // Extend to contiguous pages
+        while i + 1 < sorted_pages.len() && sorted_pages[i + 1] == end {
+            end += 0x1000;
+            i += 1;
+        }
+
+        // Skip if overlaps with SO (already mapped)
+        if start >= so_base && start < so_base + SO_SIZE {
+            // Write data into existing SO mapping
+            for p in (start..end).step_by(0x1000) {
+                if let Some(page_data) = pages.get(&p) {
+                    let _ = emu.mem_write(p, page_data);
+                }
+            }
+        } else {
+            let size = end - start;
+            if emu.mem_map(start, size, Prot::ALL).is_ok() {
+                for p in (start..end).step_by(0x1000) {
+                    if let Some(page_data) = pages.get(&p) {
+                        let _ = emu.mem_write(p, page_data);
+                    }
+                }
+                mapped += (size / 0x1000) as u32;
+            }
+        }
+        i += 1;
+    }
+    eprintln!("[emu] Loaded {} heap pages from emu_state", mapped);
+
+    regs
+}
+
+fn name_to_reg(name: &str) -> Option<RegisterARM64> {
+    match name {
+        "x0" => Some(RegisterARM64::X0), "x1" => Some(RegisterARM64::X1),
+        "x2" => Some(RegisterARM64::X2), "x3" => Some(RegisterARM64::X3),
+        "x4" => Some(RegisterARM64::X4), "x5" => Some(RegisterARM64::X5),
+        "x6" => Some(RegisterARM64::X6), "x7" => Some(RegisterARM64::X7),
+        "x8" => Some(RegisterARM64::X8), "x9" => Some(RegisterARM64::X9),
+        "x10" => Some(RegisterARM64::X10), "x11" => Some(RegisterARM64::X11),
+        "x12" => Some(RegisterARM64::X12), "x13" => Some(RegisterARM64::X13),
+        "x14" => Some(RegisterARM64::X14), "x15" => Some(RegisterARM64::X15),
+        "x16" => Some(RegisterARM64::X16), "x17" => Some(RegisterARM64::X17),
+        "x19" => Some(RegisterARM64::X19), "x20" => Some(RegisterARM64::X20),
+        "x21" => Some(RegisterARM64::X21), "x22" => Some(RegisterARM64::X22),
+        "x23" => Some(RegisterARM64::X23), "x24" => Some(RegisterARM64::X24),
+        "x25" => Some(RegisterARM64::X25), "x26" => Some(RegisterARM64::X26),
+        "x27" => Some(RegisterARM64::X27), "x28" => Some(RegisterARM64::X28),
+        "fp" => Some(RegisterARM64::X29), "lr" => Some(RegisterARM64::LR),
+        "sp" => Some(RegisterARM64::SP),
+        _ => None,
+    }
+}
+
+fn setup_emu<'a>() -> (Unicorn<'a, EmuState>, u64) {
+    let so_base = read_so_base();
+    let so_end = so_base + SO_SIZE;
+    eprintln!("[emu] SO_BASE=0x{:x}", so_base);
+
+    let mut so_data = load_so_memdump();
+    let ext_count = patch_external_got(&mut so_data, so_base);
+    eprintln!("[emu] Patched {} external GOT entries", ext_count);
 
     let mut emu = Unicorn::new_with_data(Arch::ARM64, Mode::LITTLE_ENDIAN, EmuState {
         heap_next: HEAP_BASE,
-    })
-    .expect("failed to create unicorn");
+        so_base,
+    }).expect("failed to create unicorn");
 
     // Map SO
     let so_aligned = (so_data.len() as u64 + 0xFFF) & !0xFFF;
-    emu.mem_map(SO_BASE, so_aligned, Prot::ALL).unwrap();
-    emu.mem_write(SO_BASE, &so_data).unwrap();
+    emu.mem_map(so_base, so_aligned, Prot::ALL).unwrap();
+    emu.mem_write(so_base, &so_data).unwrap();
 
-    // Map other regions
-    emu.mem_map(STACK_BASE, STACK_SIZE, Prot::ALL).unwrap();
+    // Map heap, halt, stubs
     emu.mem_map(HEAP_BASE, HEAP_SIZE, Prot::ALL).unwrap();
-    emu.mem_map(DATA_BASE, DATA_SIZE, Prot::ALL).unwrap();
     emu.mem_map(HALT_ADDR & !0xFFF, 0x1000, Prot::ALL).unwrap();
     emu.mem_map(STUB_BASE, STUB_SIZE, Prot::ALL).unwrap();
 
-    // Write RET at halt address and all stub locations
+    // Fill stubs with RET
     let ret_insn = 0xD65F03C0u32.to_le_bytes();
-    emu.mem_write(HALT_ADDR, &ret_insn).unwrap();
-    // Fill stub area with RET instructions
-    let ret_page: Vec<u8> = (0..STUB_SIZE / 4)
-        .flat_map(|_| ret_insn.to_vec())
-        .collect();
+    let ret_page: Vec<u8> = (0..STUB_SIZE / 4).flat_map(|_| ret_insn.to_vec()).collect();
     emu.mem_write(STUB_BASE, &ret_page).unwrap();
+    emu.mem_write(HALT_ADDR, &ret_insn).unwrap();
 
-    // Set up TLS
-    let tls_base = DATA_BASE + 0x80000;
-    let stack_guard: u64 = 0xDEADBEEFCAFEBABE;
-    emu.mem_write(tls_base + 0x28, &stack_guard.to_le_bytes())
-        .unwrap();
+    // TLS setup
+    let tls_base = HEAP_BASE + HEAP_SIZE - 0x10000;
+    emu.mem_write(tls_base + 0x28, &0xDEADBEEFCAFEBABEu64.to_le_bytes()).unwrap();
     emu.reg_write(RegisterARM64::TPIDR_EL0, tls_base).unwrap();
 
-    // Write test input
-    let input: &[u8] = &[
-        0x31, 0x39, 0x36, 0x37, 0xab, 0x7c, 0xfe, 0x85, 0x31, 0x39, 0x36, 0x37,
-    ];
-    emu.mem_write(DATA_BASE, input).unwrap();
-    let out_addr = DATA_BASE + 0x1000;
+    // Load captured heap state
+    let regs = load_emu_state(&mut emu, so_base);
 
-    // Set registers
-    let sp = STACK_BASE + STACK_SIZE - 0x10000;
-    emu.reg_write(RegisterARM64::SP, sp).unwrap();
-    emu.reg_write(RegisterARM64::X29, sp).unwrap();
-    emu.reg_write(RegisterARM64::X0, DATA_BASE).unwrap();
-    emu.reg_write(RegisterARM64::X1, input.len() as u64).unwrap();
-    emu.reg_write(RegisterARM64::X2, out_addr).unwrap();
+    // Set registers from captured state
+    for (name, val) in &regs {
+        if let Some(reg) = name_to_reg(name) {
+            emu.reg_write(reg, *val).unwrap();
+        }
+    }
+    // Override LR to halt after orchestrator returns
     emu.reg_write(RegisterARM64::LR, HALT_ADDR).unwrap();
 
-    // Hook stub calls - implement malloc/memcpy/etc.
+    // Also patch the saved LR on the stack (orchestrator saves LR at [SP+offset])
+    // The function prologue does: sub sp, #0xB0; stp x29, x30, [sp, #0x70]
+    // So saved LR is at SP + 0x78 (after sp adjustment)
+    // But SP hasn't been adjusted yet at entry. Let's compute:
+    // At entry, SP = regs["sp"]. After sub sp, #0xB0: new_sp = sp - 0xB0
+    // STP x29, x30, [sp, #0x70] → stores LR at new_sp + 0x78 = sp - 0xB0 + 0x78 = sp - 0x38
+    if let (Some(&sp_val), Some(&lr_orig)) = (regs.get("sp"), regs.get("lr")) {
+        // Write HALT_ADDR where LR will be saved by the prologue
+        let saved_lr_addr = sp_val - 0x38;
+        let _ = emu.mem_write(saved_lr_addr, &HALT_ADDR.to_le_bytes());
+        eprintln!("[emu] Patched saved LR at stack 0x{:x}", saved_lr_addr);
+    }
+
+    // Hook stubs for external calls
     emu.add_code_hook(STUB_BASE, STUB_BASE + STUB_SIZE, |emu: &mut Unicorn<EmuState>, addr: u64, _size: u32| {
-        let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
         let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0);
         let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0);
         let x2 = emu.reg_read(RegisterARM64::X2).unwrap_or(0);
 
-        let stub_off = addr - STUB_BASE;
-
-        // Identify by argument patterns:
         if x2 > 0 && x2 < 0x100000 && x0 >= 0x10000 && x1 >= 0x10000 {
-            // memcpy(dst, src, len) or memmove
-            let len = x2 as usize;
-            if let Ok(buf) = emu.mem_read_as_vec(x1, len) {
-                let _ = emu.mem_write(x0, &buf);
-            }
-            // return dst (x0 unchanged)
+            // memcpy
+            if let Ok(buf) = emu.mem_read_as_vec(x1, x2 as usize) { let _ = emu.mem_write(x0, &buf); }
         } else if x2 > 0 && x2 < 0x100000 && x0 >= 0x10000 && x1 < 256 {
-            // memset(dst, val, len)
+            // memset
             let buf = vec![x1 as u8; x2 as usize];
             let _ = emu.mem_write(x0, &buf);
         } else if x0 > 0 && x0 < 0x1000000 {
-            // malloc(size) or similar allocator
+            // malloc
             let state = emu.get_data_mut();
             let ptr = state.heap_next;
             state.heap_next += (x0 + 15) & !15;
             emu.reg_write(RegisterARM64::X0, ptr).unwrap();
         } else if x0 >= HEAP_BASE && x0 < HEAP_BASE + HEAP_SIZE {
-            // free(ptr) - no-op
+            // free
             emu.reg_write(RegisterARM64::X0, 0).unwrap();
         } else {
-            // Unknown function - allocate a small buffer and return it
-            // Many functions return a pointer to something
             let state = emu.get_data_mut();
             let ptr = state.heap_next;
             state.heap_next += 256;
             emu.reg_write(RegisterARM64::X0, ptr).unwrap();
-            eprintln!(
-                "[STUB#{}] LR=SO+0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x} → heap 0x{:x}",
-                stub_off/4, lr.wrapping_sub(SO_BASE), x0, x1, x2, ptr,
-            );
         }
     }).unwrap();
 
-    // Hook unmapped data access for debugging
+    // Hook unmapped memory — auto-map pages and write RET for code fetch
     emu.add_mem_hook(
-        HookType::MEM_READ_UNMAPPED | HookType::MEM_WRITE_UNMAPPED,
-        0,
-        u64::MAX,
+        HookType::MEM_UNMAPPED,
+        0, u64::MAX,
         |emu: &mut Unicorn<EmuState>, mem_type: MemType, addr: u64, size: usize, _value: i64| -> bool {
             let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
-            eprintln!(
-                "[UNMAPPED] {:?} addr=0x{:x} size={} PC=SO+0x{:x}",
-                mem_type, addr, size, pc.wrapping_sub(SO_BASE),
-            );
+            let page = addr & !0xFFF;
+            if emu.mem_map(page, 0x1000, Prot::ALL).is_ok() {
+                // For code fetch: fill page with RET instructions so any jump into it returns
+                if matches!(mem_type, MemType::FETCH_UNMAPPED) {
+                    let ret_insn = 0xD65F03C0u32.to_le_bytes();
+                    let ret_page: Vec<u8> = (0..0x1000/4).flat_map(|_| ret_insn.to_vec()).collect();
+                    let _ = emu.mem_write(page, &ret_page);
+                    eprintln!("[AUTO_STUB] code fetch at 0x{:x} → RET page", addr);
+                }
+                return true;
+            }
+            let sb = emu.get_data().so_base;
+                    eprintln!("[UNMAPPED] {:?} addr=0x{:x} size={} PC=SO+0x{:x}", mem_type, addr, size, pc.wrapping_sub(sb));
             false
         },
     ).unwrap();
 
-    // Execute MD5
-    let md5_addr = SO_BASE + OFF_MD5;
+    (emu, so_base)
+}
+
+pub fn test_md5() -> String {
+    let (mut emu, so_base) = setup_emu();
+
+    let input: &[u8] = &[0x31, 0x39, 0x36, 0x37, 0xab, 0x7c, 0xfe, 0x85, 0x31, 0x39, 0x36, 0x37];
+    let data_addr = HEAP_BASE + HEAP_SIZE - 0x20000;
+    let out_addr = data_addr + 0x1000;
+
+    emu.mem_write(data_addr, input).unwrap();
+    emu.reg_write(RegisterARM64::X0, data_addr).unwrap();
+    emu.reg_write(RegisterARM64::X1, input.len() as u64).unwrap();
+    emu.reg_write(RegisterARM64::X2, out_addr).unwrap();
+    emu.reg_write(RegisterARM64::LR, HALT_ADDR).unwrap();
+    let sp = emu.reg_read(RegisterARM64::SP).unwrap();
+    emu.reg_write(RegisterARM64::X29, sp).unwrap();
+
+    let md5_addr = so_base + OFF_MD5;
     match emu.emu_start(md5_addr, HALT_ADDR, 10_000_000, 0) {
         Ok(()) => {}
         Err(e) => {
             let pc = emu.reg_read(RegisterARM64::PC).unwrap();
-            eprintln!(
-                "MD5 error: {:?} at PC=0x{:x} (SO+0x{:x})",
-                e, pc, pc.wrapping_sub(SO_BASE)
-            );
-            return format!("error: {:?}", e);
+            return format!("error: {:?} PC=SO+0x{:x}", e, pc.wrapping_sub(so_base));
+        }
+    }
+    let mut out = [0u8; 16];
+    emu.mem_read(out_addr, &mut out).unwrap();
+    hex::encode(out)
+}
+
+pub fn test_orchestrator() -> String {
+    let (mut emu, so_base) = setup_emu();
+    let so_end = so_base + SO_SIZE;
+
+    let orch_addr = so_base + OFF_ORCHESTRATOR;
+    eprintln!("[emu] Starting orchestrator at SO+0x{:x}", OFF_ORCHESTRATOR);
+
+    // Trace instructions
+    {
+        let count = std::cell::Cell::new(0u32);
+        emu.add_code_hook(so_base, so_end, move |emu: &mut Unicorn<EmuState>, addr: u64, _size: u32| {
+            let n = count.get();
+            let sb = emu.get_data().so_base;
+            if n < 500 || n % 10000 == 0 {
+                eprintln!("[T{:6}] SO+0x{:x}", n, addr.wrapping_sub(sb));
+            }
+            count.set(n + 1);
+        }).unwrap();
+    }
+
+    // Skip PAC instructions
+    emu.add_insn_invalid_hook(|emu: &mut Unicorn<EmuState>| -> bool {
+        let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+        if let Ok(insn_bytes) = emu.mem_read_as_vec(pc, 4) {
+            let w = u32::from_le_bytes(insn_bytes.try_into().unwrap());
+            if w == 0xd503233f || w == 0xd50323bf
+                || (w & 0xFFFFFC00) == 0xDAC10000 || (w & 0xFFFFFC00) == 0xDAC10800
+                || (w & 0xFFFFFC00) == 0xDAC11000 || (w & 0xFFFFFC00) == 0xDAC11800 {
+                emu.reg_write(RegisterARM64::PC, pc + 4).unwrap();
+                return true;
+            }
+            let sb = emu.get_data().so_base;
+            eprintln!("[INVALID_INSN] PC=SO+0x{:x} insn=0x{:08x}", pc.wrapping_sub(sb), w);
+        }
+        false
+    }).unwrap();
+
+    // Pre-map known external targets with RET stubs
+    for ext_addr in [0x7600001000u64] {
+        let page = ext_addr & !0xFFF;
+        if emu.mem_map(page, 0x1000, Prot::ALL).is_ok() {
+            let ret_page: Vec<u8> = (0..0x1000/4).flat_map(|_| 0xD65F03C0u32.to_le_bytes().to_vec()).collect();
+            emu.mem_write(page, &ret_page).unwrap();
         }
     }
 
-    let mut md5_out = [0u8; 16];
-    emu.mem_read(out_addr, &mut md5_out).unwrap();
-    hex::encode(md5_out)
+    match emu.emu_start(orch_addr, HALT_ADDR, 60_000_000, 0) {
+        Ok(()) => "orchestrator completed".to_string(),
+        Err(e) => {
+            let pc = emu.reg_read(RegisterARM64::PC).unwrap();
+            format!("error: {:?} PC=SO+0x{:x}", e, pc.wrapping_sub(so_base))
+        }
+    }
 }
 
 pub fn sign(_url: &str) -> HashMap<String, String> {
@@ -230,5 +379,12 @@ mod tests {
         let result = test_md5();
         println!("Emulated MD5: {}", result);
         assert_eq!(result, "059874c397db2a6594024f0aa1c288c4");
+    }
+
+    #[test]
+    fn test_emulated_orchestrator() {
+        let result = test_orchestrator();
+        println!("Orchestrator result: {}", result);
+        assert!(result.contains("completed"), "Orchestrator failed: {}", result);
     }
 }

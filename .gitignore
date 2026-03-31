@@ -2,3 +2,5 @@
 /downloads/
 __pycache__/
 *.pyc
+lib/
+.DS_Store
