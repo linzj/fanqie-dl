@@ -1,11 +1,27 @@
-//! Native signing via ARM64 emulation of libmetasec_ml.so
-//! Uses Unicorn Engine to execute the signing code from the dumped SO.
+//! Signing implementation: Rust for known crypto, Unicorn only for Helios CFF code.
+//!
+//! Known parts (pure Rust):
+//! - MD5(URL params) → H0
+//! - Random R, MD5(R+"1967") → H1
+//! - MD5(session_uuid+"0") → H2
+//! - MD5("1967"+magic+"1967") → H3 = AES key
+//! - AES-128 key expand + ECB×17 → Medusa keystream
+//! - SHA-1(AES_out[0:4] + "1967" + magic)
+//! - MD5(constant1) → H4, MD5(constant2) → H5
+//! - Medusa header + body assembly
+//! - Base64 encoding
+//!
+//! Unknown part (Unicorn emulation):
+//! - Helios part1/part2 generation (CFF inline code)
 
 mod emulator;
+mod native_exec;
 
 use std::collections::HashMap;
 
-/// Sign a request URL, returns headers (X-Helios, X-Medusa, etc.)
 pub fn sign_request(url: &str) -> HashMap<String, String> {
-    emulator::sign(url)
+    // TODO: implement hybrid signing
+    // For now, return empty
+    let _ = url;
+    HashMap::new()
 }
