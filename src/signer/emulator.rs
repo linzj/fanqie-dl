@@ -6,7 +6,9 @@ use unicorn_engine::{RegisterARM64, Unicorn};
 
 const HALT_ADDR: u64 = 0xDEAD0000;
 const OFF_MAP_SET: u64 = 0x25BF3C;
-const OFF_ORCHESTRATOR: u64 = 0x17B8F8;
+// Start at the BL instruction that calls MD5 wrapper for URL hashing
+// This is INSIDE the CFF signing function, right before the first MD5 call
+const OFF_SIGN_START: u64 = 0x286DF4;
 
 struct EmuState {
     so_base: u64,
@@ -279,26 +281,20 @@ pub fn test_signing() -> Vec<(String, String)> {
         }
     }).unwrap();
 
-    // Auto-map unmapped data accesses (return zeros)
-    emu.add_mem_hook(HookType::MEM_READ_UNMAPPED | HookType::MEM_WRITE_UNMAPPED, 0, u64::MAX,
-        |emu: &mut Unicorn<EmuState>, _mt: MemType, addr: u64, _size: usize, _v: i64| -> bool {
-            let page = addr & !0xFFF;
-            if page == 0 { return false; }
-            emu.mem_map(page, 0x1000, Prot::ALL).is_ok()
-        },
-    ).unwrap();
-
-    // Auto-map unmapped code fetches with RET
-    emu.add_mem_hook(HookType::MEM_FETCH_UNMAPPED, 0, u64::MAX,
-        |emu: &mut Unicorn<EmuState>, _mt: MemType, addr: u64, _size: usize, _v: i64| -> bool {
-            let page = addr & !0xFFF;
-            if page == 0 { return false; }
-            if emu.mem_map(page, 0x1000, Prot::ALL).is_ok() {
+    // Auto-map unmapped accesses: try 1MB, fallback to 4KB
+    emu.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX,
+        |emu: &mut Unicorn<EmuState>, mt: MemType, addr: u64, _size: usize, _v: i64| -> bool {
+            if addr < 0x10000 { return false; }
+            // Try 1MB first
+            let mega = addr & !0xFFFFF;
+            let mapped = emu.mem_map(mega, 0x100000, Prot::ALL).is_ok()
+                || emu.mem_map(addr & !0xFFF, 0x1000, Prot::ALL).is_ok(); // fallback 4KB
+            if mapped && matches!(mt, MemType::FETCH_UNMAPPED) {
+                let page = addr & !0xFFF;
                 let ret: Vec<u8> = (0..0x1000/4).flat_map(|_| 0xD65F03C0u32.to_le_bytes().to_vec()).collect();
                 let _ = emu.mem_write(page, &ret);
-                return true;
             }
-            false
+            mapped
         },
     ).unwrap();
 
@@ -398,8 +394,8 @@ pub fn test_signing() -> Vec<(String, String)> {
         }).unwrap();
     }
 
-    let start = so_base + OFF_ORCHESTRATOR;
-    eprintln!("[emu] Starting at SO+0x{:x}", OFF_ORCHESTRATOR);
+    let start = so_base + OFF_SIGN_START;
+    eprintln!("[emu] Starting at SO+0x{:x}", OFF_SIGN_START);
 
     match emu.emu_start(start, HALT_ADDR, 60_000_000, 0) {
         Ok(()) => {
