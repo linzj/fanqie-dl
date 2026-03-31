@@ -695,11 +695,39 @@ Medusa body: 960 bytes total, 272 from AES, 664 unaccounted
 **结论**：Helios part1/part2 由 CFF 内联代码生成，不经过任何已 hook 的标准 crypto 函数。
 需要 IDA 逆向 CFF 混淆代码才能找到算法。
 
-### 下一步 (优先级排序)
+## Unicorn ARM64 模拟器方案 (2026-03-31)
 
-1. **★★★★★ IDA 逆向 Helios part1/part2 生成算法** — 追踪 MD5(R+"1967") 返回后到 Helios 写入之间的 CFF 内联逻辑
-2. **IDA 分析 Medusa 936 bytes 的组装** — 272 AES bytes + 剩余 664 bytes 的来源
-3. 如果 IDA 分析困难，考虑 **hook_memory_trace**: 在 MD5[1] 返回后设置内存断点追踪 H1 的去向
+### 核心突破：SO 代码可以在 Unicorn 中正确执行
+
+使用 Frida dump SO 运行时内存（GOT 已填充），加载到 Unicorn ARM64 模拟器中，成功执行 MD5 函数：
+
+```
+输入: "1967" + 0xab7cfe85 + "1967" (12 bytes)
+期望: 059874c397db2a6594024f0aa1c288c4
+实际: 059874c397db2a6594024f0aa1c288c4  ✅ 完全匹配
+```
+
+### 技术方案
+
+1. **SO 内存 dump**: 用 Frida 从运行进程中 dump 完整 SO（GOT/PLT 已解析）
+2. **ADRP 保持**: 加载到与 dump 相同的 base 地址 (0x7623e02000)，避免 PC-relative 地址计算问题
+3. **外部函数 stub**: 扫描 GOT，将所有外部指针替换为 stub 区域的 RET 指令
+4. **Stub 实现**: 通过 code hook 在 stub 区域拦截调用，根据参数模式实现 memcpy/memset/malloc/free
+5. **TLS 模拟**: 设置 TPIDR_EL0 寄存器，提供 stack guard 值
+6. **缺失页修补**: dump 中不可读的页从原始 SO 文件补充
+
+### 文件
+
+- `lib/so_memdump.bin` — 运行时 SO 内存 dump (4MB)
+- `lib/so_rw_segment.bin` — RW 段数据
+- `lib/so_patch_*.bin` — RWX 段 patch 数据
+- `src/signer/emulator.rs` — Unicorn 模拟器实现
+
+### 下一步
+
+1. **★★★★★ 扩展模拟器执行完整签名流程** — 从 sub_17B96C (orchestrator) 开始，需要设置正确的输入数据结构
+2. 需要 Frida dump orchestrator 函数的输入数据结构（vtable、参数对象等）
+3. 需要 mock JNI 函数（GetStringUTFChars 等）或找到绕过 JNI 的更低层入口点
 
 ### 验证方法
 

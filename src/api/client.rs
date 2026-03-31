@@ -1,11 +1,13 @@
 use crate::crypto;
 use crate::device::DeviceConfig;
-use crate::signer;
 use anyhow::Result;
 use rand::Rng;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// User-Agent per ISSUE.md (matches emulator app)
+const USER_AGENT: &str = "com.dragon.read/71332 (Linux; U; Android 15; zh_CN; sdk_gphone64_arm64; Build/AP3A.241105.008;tt-ok/3.12.13.20)";
 
 pub struct FanqieClient {
     client: Client,
@@ -16,7 +18,7 @@ pub struct FanqieClient {
 impl FanqieClient {
     pub async fn new() -> Result<Self> {
         let client = Client::builder()
-            .user_agent("com.dragon.read/71332 (Linux; U; Android 9; zh_CN; Pixel 4; Build/PQ3B.190801.002;tt-ok/3.12.13.20)")
+            .user_agent(USER_AGENT)
             .gzip(true)
             .timeout(Duration::from_secs(30))
             .build()?;
@@ -37,7 +39,7 @@ impl FanqieClient {
 
         let mut me = Self {
             client,
-            base_url: "https://api5-sinfnormal.fqnovel.com".into(),
+            base_url: "https://api5-normal-sinfonlinec.fqnovel.com".into(),
             config,
         };
 
@@ -92,8 +94,8 @@ impl FanqieClient {
                 "update_version_code": 71332, "manifest_version_code": 71332,
                 "aid": 1967, "channel": "googleplay", "package": "com.dragon.read",
                 "app_name": "novelapp", "version_code": 71332, "version_name": "7.1.3.32",
-                "device_model": "Pixel 4", "device_brand": "google",
-                "device_manufacturer": "Google", "os_version": "9", "os_api": 28,
+                "device_model": "sdk_gphone64_arm64", "device_brand": "google",
+                "device_manufacturer": "Google", "os_version": "15", "os_api": 35,
                 "device_platform": "android", "language": "zh", "region": "CN",
                 "resolution": "1080x2160", "dpi": 420,
                 "rom_version": "PQ3B.190801.002",
@@ -121,7 +123,7 @@ impl FanqieClient {
         anyhow::bail!("设备注册失败")
     }
 
-    /// Register encryption key (needs signing)
+    /// Register encryption key
     async fn register_encryption_key(&self) -> Result<String> {
         let content = crypto::build_register_content(&self.config.device_id, "0");
         let body = serde_json::json!({ "content": content, "keyver": 1 });
@@ -129,25 +131,21 @@ impl FanqieClient {
 
         let params = self.common_query_string();
         let full_url = format!("{}/reading/crypt/registerkey?{}", self.base_url, params);
-        let ts = Self::now_secs();
-        let sign = signer::sign_request(
-            &params,
-            Some(&body_str),
-            ts,
-            &self.config.device_id,
-            "7.1.3.32",
-        );
+        let ts_ms = Self::now_millis();
 
         let mut req = self.client.post(&full_url).body(body_str);
-        req = req.header("Content-Type", "application/json");
-        for (k, v) in &sign {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        req = req
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("sdk-version", "2")
+            .header("lc", "101")
+            .header("X-SS-REQ-TICKET", ts_ms.to_string());
 
         let raw_resp = req.send().await?;
+        let status = raw_resp.status();
         let text = raw_resp.text().await?;
         if text.is_empty() {
-            anyhow::bail!("registerkey 返回空响应");
+            anyhow::bail!("registerkey 返回空响应 (status={})", status);
         }
         let resp: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             anyhow::anyhow!("JSON parse: {} body={}", e, &text[..text.len().min(200)])
@@ -178,10 +176,10 @@ impl FanqieClient {
             ("device_platform", "android"),
             ("os", "android"),
             ("ssmix", "a"),
-            ("device_type", "Pixel 4"),
+            ("device_type", "sdk_gphone64_arm64"),
             ("device_brand", "google"),
-            ("os_api", "28"),
-            ("os_version", "9"),
+            ("os_api", "35"),
+            ("os_version", "15"),
             ("device_id", &self.config.device_id),
             ("iid", &self.config.iid),
             ("_rticket", &ts),
@@ -195,7 +193,7 @@ impl FanqieClient {
             .join("&")
     }
 
-    /// Signed GET request
+    /// GET request with common headers (no signing yet)
     pub async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -208,8 +206,9 @@ impl FanqieClient {
         }
 
         let full_url = format!("{}{}?{}", self.base_url, path, qs);
-        let ts = Self::now_secs();
-        let sign = signer::sign_request(&qs, None, ts, &self.config.device_id, "7.1.3.32");
+        let ts_ms = Self::now_millis();
+
+        let random_hex: String = format!("{:08x}", rand::thread_rng().gen::<u32>());
 
         let mut last_err = None;
         for attempt in 0..3u32 {
@@ -217,20 +216,20 @@ impl FanqieClient {
                 tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
             }
 
-            let mut req = self.client.get(&full_url);
-            for (k, v) in &sign {
-                req = req.header(k.as_str(), v.as_str());
-            }
-            req = req
-                .header(
-                    "Accept",
-                    "application/json; charset=utf-8,application/x-protobuf",
-                )
-                .header("lc", "101")
+            let req = self
+                .client
+                .get(&full_url)
+                .header("Accept", "application/json")
                 .header("sdk-version", "2")
+                .header("lc", "101")
                 .header("passport-sdk-version", "5051451")
                 .header("x-tt-store-region", "cn-gd")
-                .header("x-tt-store-region-src", "did");
+                .header("x-tt-store-region-src", "did")
+                .header("X-SS-REQ-TICKET", ts_ms.to_string())
+                .header(
+                    "x-reading-request",
+                    format!("{}-{}", ts_ms, random_hex),
+                );
 
             match req.send().await {
                 Ok(resp) => {
@@ -246,7 +245,7 @@ impl FanqieClient {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                             return Ok(parsed);
                         }
-                        Err(e) => return Err(anyhow::anyhow!("JSON: {}", e)),
+                        Err(e) => return Err(anyhow::anyhow!("JSON: {} body={}", e, &text[..text.len().min(200)])),
                     }
                 }
                 Err(e) => last_err = Some(e.into()),
