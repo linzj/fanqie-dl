@@ -29,7 +29,7 @@ function dumpRegion(addr, size, label) {
 
 // Recursively dump pointer chains from a memory region
 function dumpPointers(addr, size, depth, label) {
-    if (depth > 3) return;
+    if (depth > 6) return;
     dumpRegion(addr, size, label);
 
     // Scan for pointers in this region
@@ -42,8 +42,7 @@ function dumpPointers(addr, size, depth, label) {
                 // Check if it's accessible
                 try {
                     val.readU8();
-                    // Dump 256 bytes at this pointer
-                    dumpPointers(val, 256, depth + 1, label + "→p" + off);
+                    dumpPointers(val, 512, depth + 1, label + "→p" + off);
                 } catch(e) {}
             }
         } catch(e) {}
@@ -67,11 +66,11 @@ Interceptor.attach(base.add(0x17B96C), {
         var sp = this.context.sp;
         dumpRegion(sp, 4096, "stack");
 
-        // Dump x1 struct and its pointer chain
-        dumpPointers(args[1], 512, 0, "x1");
+        // Dump x1 struct and its pointer chain (deeper)
+        dumpPointers(args[1], 1024, 0, "x1");
 
-        // Dump x2 struct and its pointer chain
-        dumpPointers(args[2], 512, 0, "x2");
+        // Dump x2 struct and its pointer chain (deeper)
+        dumpPointers(args[2], 1024, 0, "x2");
 
         // Dump the handle object (from x25 or stack)
         // x25 = tag = 0x3000001, the handle is somewhere in the call chain

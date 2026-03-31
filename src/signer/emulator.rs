@@ -158,43 +158,40 @@ fn load_emu_state(emu: &mut Unicorn<EmuState>, so_base: u64) -> HashMap<String, 
         }
     }
 
-    // Map and write pages (group contiguous ranges)
-    let mut sorted_pages: Vec<u64> = pages.keys().copied().collect();
-    sorted_pages.sort();
+    // Map pages in large chunks to avoid Unicorn's section limit
+    // Group all pages into mega-regions (round to 1MB boundaries)
+    let mut mega_regions: HashMap<u64, Vec<u64>> = HashMap::new();
+    for &page in pages.keys() {
+        if page >= so_base && page < so_base + SO_SIZE { continue; } // skip SO range
+        let mega = page & !0xFFFFF; // 1MB aligned
+        mega_regions.entry(mega).or_default().push(page);
+    }
 
     let mut mapped = 0u32;
-    let mut i = 0;
-    while i < sorted_pages.len() {
-        let start = sorted_pages[i];
-        let mut end = start + 0x1000;
-        // Extend to contiguous pages
-        while i + 1 < sorted_pages.len() && sorted_pages[i + 1] == end {
-            end += 0x1000;
-            i += 1;
-        }
-
-        // Skip if overlaps with SO (already mapped)
-        if start >= so_base && start < so_base + SO_SIZE {
-            // Write data into existing SO mapping
-            for p in (start..end).step_by(0x1000) {
-                if let Some(page_data) = pages.get(&p) {
-                    let _ = emu.mem_write(p, page_data);
+    for (mega_start, page_list) in &mega_regions {
+        // Find the range within this mega region
+        let min_page = *page_list.iter().min().unwrap();
+        let max_page = *page_list.iter().max().unwrap() + 0x1000;
+        // Align to page boundary
+        let start = min_page;
+        let end = max_page;
+        let size = end - start;
+        if emu.mem_map(start, size, Prot::ALL).is_ok() {
+            for &page in page_list {
+                if let Some(page_data) = pages.get(&page) {
+                    let _ = emu.mem_write(page, page_data);
                 }
             }
-        } else {
-            let size = end - start;
-            if emu.mem_map(start, size, Prot::ALL).is_ok() {
-                for p in (start..end).step_by(0x1000) {
-                    if let Some(page_data) = pages.get(&p) {
-                        let _ = emu.mem_write(p, page_data);
-                    }
-                }
-                mapped += (size / 0x1000) as u32;
-            }
+            mapped += page_list.len() as u32;
         }
-        i += 1;
     }
-    eprintln!("[emu] Loaded {} heap pages from emu_state", mapped);
+    // Also write SO-range pages directly
+    for (&page, page_data) in &pages {
+        if page >= so_base && page < so_base + SO_SIZE {
+            let _ = emu.mem_write(page, page_data);
+        }
+    }
+    eprintln!("[emu] Loaded {} heap pages in {} mega-regions", mapped, mega_regions.len());
 
     regs
 }
@@ -268,6 +265,13 @@ fn setup_emu<'a>() -> (Unicorn<'a, EmuState>, u64) {
     // Override LR to halt after orchestrator returns
     emu.reg_write(RegisterARM64::LR, HALT_ADDR).unwrap();
 
+    // Fix vtable pointer in x1 object (it's 0 in the dump, should point to SO vtable)
+    if let Some(&x1) = regs.get("x1") {
+        let vtable_addr = so_base + 0x35DC60;
+        emu.mem_write(x1, &vtable_addr.to_le_bytes()).unwrap();
+        eprintln!("[emu] Set x1 vtable to SO+0x35DC60 (0x{:x})", vtable_addr);
+    }
+
     // Also patch the saved LR on the stack (orchestrator saves LR at [SP+offset])
     // The function prologue does: sub sp, #0xB0; stp x29, x30, [sp, #0x70]
     // So saved LR is at SP + 0x78 (after sp adjustment)
@@ -311,25 +315,27 @@ fn setup_emu<'a>() -> (Unicorn<'a, EmuState>, u64) {
         }
     }).unwrap();
 
-    // Hook unmapped memory — auto-map pages and write RET for code fetch
+    // Pre-map page 0 with RETs (BLR to NULL pointers)
+    emu.mem_map(0x0, 0x10000, Prot::ALL).unwrap();
+    {
+        let ret_page: Vec<u8> = (0..0x10000/4).flat_map(|_| 0xD65F03C0u32.to_le_bytes().to_vec()).collect();
+        emu.mem_write(0x0, &ret_page).unwrap();
+    }
+
+    // Hook unmapped memory — auto-map pages with RET for code, zeros for data
     emu.add_mem_hook(
         HookType::MEM_UNMAPPED,
         0, u64::MAX,
-        |emu: &mut Unicorn<EmuState>, mem_type: MemType, addr: u64, size: usize, _value: i64| -> bool {
-            let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+        |emu: &mut Unicorn<EmuState>, mem_type: MemType, addr: u64, _size: usize, _value: i64| -> bool {
             let page = addr & !0xFFF;
+            if page == 0 { return false; } // already mapped
             if emu.mem_map(page, 0x1000, Prot::ALL).is_ok() {
-                // For code fetch: fill page with RET instructions so any jump into it returns
                 if matches!(mem_type, MemType::FETCH_UNMAPPED) {
-                    let ret_insn = 0xD65F03C0u32.to_le_bytes();
-                    let ret_page: Vec<u8> = (0..0x1000/4).flat_map(|_| ret_insn.to_vec()).collect();
+                    let ret_page: Vec<u8> = (0..0x1000/4).flat_map(|_| 0xD65F03C0u32.to_le_bytes().to_vec()).collect();
                     let _ = emu.mem_write(page, &ret_page);
-                    eprintln!("[AUTO_STUB] code fetch at 0x{:x} → RET page", addr);
                 }
                 return true;
             }
-            let sb = emu.get_data().so_base;
-                    eprintln!("[UNMAPPED] {:?} addr=0x{:x} size={} PC=SO+0x{:x}", mem_type, addr, size, pc.wrapping_sub(sb));
             false
         },
     ).unwrap();
@@ -372,18 +378,72 @@ pub fn test_orchestrator() -> String {
     let orch_addr = so_base + OFF_ORCHESTRATOR;
     eprintln!("[emu] Starting orchestrator at SO+0x{:x}", OFF_ORCHESTRATOR);
 
-    // Trace instructions
+    // Instruction counter
     {
-        let count = std::cell::Cell::new(0u32);
-        emu.add_code_hook(so_base, so_end, move |emu: &mut Unicorn<EmuState>, addr: u64, _size: u32| {
-            let n = count.get();
-            let sb = emu.get_data().so_base;
-            if n < 500 || n % 10000 == 0 {
-                eprintln!("[T{:6}] SO+0x{:x}", n, addr.wrapping_sub(sb));
+        let count = std::cell::Cell::new(0u64);
+        emu.add_code_hook(so_base, so_end, move |_emu: &mut Unicorn<EmuState>, _addr: u64, _size: u32| {
+            count.set(count.get() + 1);
+            if count.get() % 100_000_000 == 0 {
+                eprintln!("[INSN] {} million", count.get() / 1_000_000);
             }
-            count.set(n + 1);
         }).unwrap();
     }
+
+    // Also hook STUB calls to see what external functions are called
+    emu.add_code_hook(STUB_BASE, STUB_BASE + STUB_SIZE,
+        |emu: &mut Unicorn<EmuState>, addr: u64, _size: u32| {
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            let sb = emu.get_data().so_base;
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0);
+            eprintln!("[STUB] LR=SO+0x{:x} x0=0x{:x} stub_id={}", lr.wrapping_sub(sb), x0, (addr - STUB_BASE)/4);
+        },
+    ).unwrap();
+
+    // Probe key functions to see if they're reached
+    for (off, name) in [(OFF_MD5, "MD5"), (0x25BF3C, "MAP_SET"), (0x241E9C, "AES_KEY"),
+                         (0x242640, "AES_ECB"), (0x258530, "MD5_WRAP"), (0x2456AC, "B64"),
+                         (0x17B974, "ORCH_POST_GUARD")] {
+        let name = name.to_string();
+        emu.add_code_hook(so_base + off, so_base + off + 4, move |_emu: &mut Unicorn<EmuState>, _addr: u64, _size: u32| {
+            eprintln!("[PROBE] {}", name);
+        }).unwrap();
+    }
+
+    // Hook MAP_SET (sub_25BF3C) to capture signature headers
+    // MAP_SET(map, key_obj, val_obj, ...) where obj has [vtable, ?, ?, len@+0xC, data@+0x10]
+    emu.add_code_hook(so_base + 0x25BF3C, so_base + 0x25BF40,
+        |emu: &mut Unicorn<EmuState>, _addr: u64, _size: u32| {
+            let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0);
+            let x2 = emu.reg_read(RegisterARM64::X2).unwrap_or(0);
+            // Read key
+            if let (Ok(key_len_bytes), Ok(key_ptr_bytes)) = (
+                emu.mem_read_as_vec(x1 + 0xC, 4),
+                emu.mem_read_as_vec(x1 + 0x10, 8),
+            ) {
+                let key_len = u32::from_le_bytes(key_len_bytes.try_into().unwrap()) as usize;
+                let key_ptr = u64::from_le_bytes(key_ptr_bytes.try_into().unwrap());
+                if key_len > 0 && key_len < 100 {
+                    if let Ok(key_data) = emu.mem_read_as_vec(key_ptr, key_len) {
+                        let key = String::from_utf8_lossy(&key_data);
+                        // Read value
+                        if let (Ok(val_len_bytes), Ok(val_ptr_bytes)) = (
+                            emu.mem_read_as_vec(x2 + 0xC, 4),
+                            emu.mem_read_as_vec(x2 + 0x10, 8),
+                        ) {
+                            let val_len = u32::from_le_bytes(val_len_bytes.try_into().unwrap()) as usize;
+                            let val_ptr = u64::from_le_bytes(val_ptr_bytes.try_into().unwrap());
+                            if val_len > 0 && val_len < 10000 {
+                                if let Ok(val_data) = emu.mem_read_as_vec(val_ptr, val_len.min(200)) {
+                                    let val = String::from_utf8_lossy(&val_data);
+                                    eprintln!("[MAP_SET] {}={}", key, &val[..val.len().min(80)]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    ).unwrap();
 
     // Skip PAC instructions
     emu.add_insn_invalid_hook(|emu: &mut Unicorn<EmuState>| -> bool {
@@ -429,7 +489,8 @@ pub fn test_orchestrator() -> String {
         eprintln!("[emu] External stub at 0x7600001000 → returns to SO+0x17B974");
     }
 
-    match emu.emu_start(orch_addr, HALT_ADDR, 60_000_000, 0) {
+    // Limit to 10M instructions to avoid long waits
+    match emu.emu_start(orch_addr, HALT_ADDR, 60_000_000, 10_000_000) {
         Ok(()) => "orchestrator completed".to_string(),
         Err(e) => {
             let pc = emu.reg_read(RegisterARM64::PC).unwrap();
