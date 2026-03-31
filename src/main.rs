@@ -239,6 +239,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_book() {
+        let client = match FanqieClient::new().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("跳过: {}", e);
+                return;
+            }
+        };
+
+        let book_id = "7373660003258862617";
+
+        // 获取书籍详情
+        let book_name = match book::get_book_detail(&client, book_id).await {
+            Ok(d) => {
+                println!("《{}》 作者: {}", d.book_name, d.author);
+                d.book_name
+            }
+            Err(e) => {
+                eprintln!("详情失败: {}", e);
+                return;
+            }
+        };
+
+        // 获取章节列表
+        let chapters = match book::get_chapter_list(&client, book_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("章节失败: {}", e);
+                return;
+            }
+        };
+        println!("共 {} 章", chapters.len());
+
+        // 创建下载目录
+        let dir = format!("downloads/{}", sanitize_filename::sanitize(&book_name));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 下载前3章作为测试
+        let limit = chapters.len().min(3);
+        let mut ok = 0u64;
+        let mut fail = 0u64;
+        for (i, ch) in chapters.iter().take(limit).enumerate() {
+            let id = ch.item_id_str();
+            let title = if ch.title.is_empty() {
+                format!("第{}章", i + 1)
+            } else {
+                ch.title.clone()
+            };
+
+            match reader::get_chapter_content(&client, book_id, &id).await {
+                Ok(t) if !t.is_empty() => {
+                    let f = format!(
+                        "{}/{:04}_{}.txt",
+                        dir,
+                        i + 1,
+                        sanitize_filename::sanitize(&title)
+                    );
+                    std::fs::write(&f, &t).unwrap();
+                    println!("  ✓ {}", title);
+                    ok += 1;
+                }
+                Ok(_) => {
+                    println!("  ✗ {} - 空内容", title);
+                    fail += 1;
+                }
+                Err(e) => {
+                    println!("  ✗ {} - {}", title, e);
+                    fail += 1;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+        println!("\n成功:{ok} 失败:{fail} 保存:{dir}");
+        assert!(ok > 0, "至少应成功下载一章");
+    }
+
+    #[tokio::test]
     async fn test_book_detail_and_chapters() {
         let client = match FanqieClient::new().await {
             Ok(c) => c,

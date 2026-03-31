@@ -8,6 +8,7 @@ mod protobuf;
 mod simon;
 mod sm3;
 
+use rand::Rng;
 use std::collections::HashMap;
 
 /// Sign request parameters, returns headers map.
@@ -19,6 +20,7 @@ pub fn sign_request(
     version_name: &str,
 ) -> HashMap<String, String> {
     let mut headers = HashMap::new();
+    let ts_ms = timestamp * 1000;
 
     // X-Gorgon
     let data_str = body.unwrap_or("");
@@ -31,9 +33,17 @@ pub fn sign_request(
     headers.insert("X-Khronos".to_string(), timestamp.to_string());
 
     // X-SS-REQ-TICKET
+    headers.insert("X-SS-REQ-TICKET".to_string(), ts_ms.to_string());
+
+    // x-reading-request: {timestamp_ms}-{random_hex}
+    let random_hex: String = {
+        let mut rng = rand::thread_rng();
+        let r: u32 = rng.gen();
+        format!("{:08x}", r)
+    };
     headers.insert(
-        "X-SS-REQ-TICKET".to_string(),
-        (timestamp * 1000).to_string(),
+        "x-reading-request".to_string(),
+        format!("{}-{}", ts_ms, random_hex),
     );
 
     // X-SS-STUB (MD5 of body)

@@ -1,39 +1,60 @@
 //! X-Argus signature algorithm.
+//!
+//! Reverse-engineered from libmetasec_ml.so (Fanqie Novel v7.1.3.32).
+//! Key differences from TikTok community algorithm:
+//! - Uses SHA-256 instead of SM3 for hashing
+//! - Uses AES-128-ECB instead of Simon-128/256 for inner protobuf encryption
 
 use super::protobuf::{self, ProtoValue};
-use super::simon;
-use super::sm3;
 use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{BlockEncrypt, KeyInit};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::Rng;
+use sha2::{Digest, Sha256};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
 const SIGN_KEY: [u8; 32] = [
-    0xac, 0x1a, 0xda, 0xae, 0x95, 0xa7, 0xaf, 0x94, 0xa5, 0x11, 0x4a, 0xb3, 0xb3, 0xa9, 0x7d, 0xd8,
-    0x00, 0x50, 0xaa, 0x0a, 0x39, 0x31, 0x4c, 0x40, 0x52, 0x8c, 0xae, 0xc9, 0x52, 0x56, 0xc2, 0x8c,
+    0xac, 0x1a, 0xda, 0xae, 0x95, 0xa7, 0xaf, 0x94, 0xa5, 0x11, 0x4a, 0xb3, 0xb3, 0xa9, 0x7d,
+    0xd8, 0x00, 0x50, 0xaa, 0x0a, 0x39, 0x31, 0x4c, 0x40, 0x52, 0x8c, 0xae, 0xc9, 0x52, 0x56,
+    0xc2, 0x8c,
 ];
 
-// Precomputed: SM3(SIGN_KEY + b'\xf2\x81ao' + SIGN_KEY)
-const SM3_OUTPUT: [u8; 32] = [
-    0xfc, 0x78, 0xe0, 0xa9, 0x65, 0x7a, 0x0c, 0x74, 0x8c, 0xe5, 0x15, 0x59, 0x90, 0x3c, 0xcf, 0x03,
-    0x51, 0x0e, 0x51, 0xd3, 0xcf, 0xf2, 0x32, 0xd7, 0x13, 0x43, 0xe8, 0x8a, 0x32, 0x1c, 0x53, 0x04,
-];
+/// Compute SHA-256(SIGN_KEY + salt + SIGN_KEY) for AES inner encryption key derivation.
+/// This replaces the SM3-based key derivation used in the TikTok community algorithm.
+fn derive_inner_key() -> [u8; 32] {
+    let salt: [u8; 4] = [0xf2, 0x81, 0x61, 0x6f]; // b'\xf2\x81ao'
+    let mut hasher = Sha256::new();
+    hasher.update(&SIGN_KEY);
+    hasher.update(&salt);
+    hasher.update(&SIGN_KEY);
+    hasher.finalize().into()
+}
 
 fn get_bodyhash(stub: Option<&str>) -> Vec<u8> {
     match stub {
         Some(s) if !s.is_empty() => {
             let bytes = hex::decode(s).unwrap_or_else(|_| vec![0u8; 16]);
-            sm3::sm3_hash(&bytes)[..6].to_vec()
+            let hash = Sha256::digest(&bytes);
+            hash[..6].to_vec()
         }
-        _ => sm3::sm3_hash(&[0u8; 16])[..6].to_vec(),
+        _ => {
+            let hash = Sha256::digest(&[0u8; 16]);
+            hash[..6].to_vec()
+        }
     }
 }
 
 fn get_queryhash(query: Option<&str>) -> Vec<u8> {
     match query {
-        Some(s) if !s.is_empty() => sm3::sm3_hash(s.as_bytes())[..6].to_vec(),
-        _ => sm3::sm3_hash(&[0u8; 16])[..6].to_vec(),
+        Some(s) if !s.is_empty() => {
+            let hash = Sha256::digest(s.as_bytes());
+            hash[..6].to_vec()
+        }
+        _ => {
+            let hash = Sha256::digest(&[0u8; 16]);
+            hash[..6].to_vec()
+        }
     }
 }
 
@@ -59,23 +80,18 @@ fn encrypt_argus(xargus_bean: &[(u32, ProtoValue)]) -> String {
     let protobuf_padded = pkcs7_pad(&pb_bytes, 16);
     let new_len = protobuf_padded.len();
 
-    // Simon encrypt each 16-byte block
-    let key = &SM3_OUTPUT[..32];
-    let mut key_list = [0u64; 4];
-    for i in 0..2 {
-        key_list[i * 2] = u64::from_le_bytes(key[i * 16..i * 16 + 8].try_into().unwrap());
-        key_list[i * 2 + 1] = u64::from_le_bytes(key[i * 16 + 8..i * 16 + 16].try_into().unwrap());
-    }
+    // Derive the inner encryption key using SHA-256 (replaces SM3)
+    let derived_key = derive_inner_key();
+
+    // AES-128-ECB encrypt each 16-byte block (replaces Simon-128/256)
+    // Use first 16 bytes of SHA-256 output as AES-128 key
+    let aes_inner_key = aes::Aes128::new_from_slice(&derived_key[..16]).unwrap();
 
     let mut enc_pb = vec![0u8; new_len];
     for i in 0..(new_len / 16) {
-        let pt = [
-            u64::from_le_bytes(protobuf_padded[i * 16..i * 16 + 8].try_into().unwrap()),
-            u64::from_le_bytes(protobuf_padded[i * 16 + 8..i * 16 + 16].try_into().unwrap()),
-        ];
-        let ct = simon::simon_enc(pt, &key_list);
-        enc_pb[i * 16..i * 16 + 8].copy_from_slice(&ct[0].to_le_bytes());
-        enc_pb[i * 16 + 8..i * 16 + 16].copy_from_slice(&ct[1].to_le_bytes());
+        let mut block = aes::Block::clone_from_slice(&protobuf_padded[i * 16..(i + 1) * 16]);
+        aes_inner_key.encrypt_block(&mut block);
+        enc_pb[i * 16..(i + 1) * 16].copy_from_slice(&block);
     }
 
     // XOR transform
@@ -89,7 +105,7 @@ fn encrypt_argus(xargus_bean: &[(u32, ProtoValue)]) -> String {
     b_buffer.extend_from_slice(&b_buffer_inner);
     b_buffer.extend_from_slice(b"ao");
 
-    // AES-CBC encrypt with MD5-derived key and IV
+    // AES-CBC encrypt with MD5-derived key and IV (same as community)
     let aes_key = md5::compute(&SIGN_KEY[..16]);
     let aes_iv = md5::compute(&SIGN_KEY[16..]);
 
@@ -118,20 +134,26 @@ pub fn get_sign(
     let license_id: u64 = 1611921764;
 
     let fields: Vec<(u32, ProtoValue)> = vec![
-        (1, ProtoValue::Varint(0x20200929u64 << 1)),     // magic
-        (2, ProtoValue::Varint(2)),                      // version
-        (3, ProtoValue::Varint(rand_val as u64)),        // rand
-        (4, ProtoValue::Utf8(aid.to_string())),          // msAppID
-        (5, ProtoValue::Utf8(device_id.to_string())),    // deviceID
-        (6, ProtoValue::Utf8(license_id.to_string())),   // licenseID
+        (1, ProtoValue::Varint(0x20200929u64 << 1)), // magic
+        (2, ProtoValue::Varint(2)),                   // version
+        (3, ProtoValue::Varint(rand_val as u64)),     // rand
+        (4, ProtoValue::Utf8(aid.to_string())),       // msAppID
+        (5, ProtoValue::Utf8(device_id.to_string())), // deviceID
+        (6, ProtoValue::Utf8(license_id.to_string())), // licenseID
         (7, ProtoValue::Utf8(version_name.to_string())), // appVersion
-        (8, ProtoValue::Utf8("v04.04.05-ov-android".to_string())), // sdkVersionStr
-        (9, ProtoValue::Varint(134744640)),              // sdkVersion
-        (10, ProtoValue::Bytes(vec![0u8; 8])),           // envcode
-        (11, ProtoValue::Varint(0)),                     // platform (android=0)
-        (12, ProtoValue::Varint(timestamp << 1)),        // createTime
-        (13, ProtoValue::Bytes(get_bodyhash(data))),     // bodyHash
-        (14, ProtoValue::Bytes(get_queryhash(Some(queryhash)))), // queryHash
+        (
+            8,
+            ProtoValue::Utf8("v04.04.05-ov-android".to_string()),
+        ), // sdkVersionStr
+        (9, ProtoValue::Varint(134744640)),           // sdkVersion
+        (10, ProtoValue::Bytes(vec![0u8; 8])),        // envcode
+        (11, ProtoValue::Varint(0)),                  // platform (android=0)
+        (12, ProtoValue::Varint(timestamp << 1)),     // createTime
+        (13, ProtoValue::Bytes(get_bodyhash(data))),  // bodyHash (SHA-256)
+        (
+            14,
+            ProtoValue::Bytes(get_queryhash(Some(queryhash))),
+        ), // queryHash (SHA-256)
         (
             15,
             ProtoValue::Dict(vec![
