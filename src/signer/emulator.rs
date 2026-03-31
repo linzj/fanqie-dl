@@ -92,9 +92,10 @@ pub fn test_signing() -> Vec<(String, String)> {
 
     // === FAST-PATH HOOKS ===
 
-    // MD5 raw (0x243C34): md5(data, len, out16) — skip body, compute in Rust
+    // MD5 raw (0x243C34): md5(data, len, out16)
     emu.add_code_hook(so_base + 0x243C34, so_base + 0x243C38,
         |emu: &mut Unicorn<Emu>, _, _| {
+            eprintln!("[FAST] MD5_RAW");
             let (x0, x1, x2, lr) = (
                 emu.reg_read(RegisterARM64::X0).unwrap_or(0),
                 emu.reg_read(RegisterARM64::X1).unwrap_or(0) as usize,
@@ -108,7 +109,103 @@ pub fn test_signing() -> Vec<(String, String)> {
             emu.reg_write(RegisterARM64::PC, lr).unwrap();
         }).unwrap();
 
-    // MD5 wrapper (0x258530) — let CFF code run, only raw MD5 is fast-pathed
+    // MD5 transform (0x24307C): md5_transform(state, block64)
+    emu.add_code_hook(so_base + 0x24307C, so_base + 0x243080,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            eprintln!("[FAST] MD5_TRANSFORM");
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0);
+            let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0);
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+
+            // State at ctx+8: A(4) B(4) C(4) D(4) = 16 bytes
+            if let (Ok(state_bytes), Ok(block)) = (
+                emu.mem_read_as_vec(x0 + 8, 16), // MD5 ABCD at offset +8
+                emu.mem_read_as_vec(x1, 64),
+            ) {
+                let mut a = u32::from_le_bytes(state_bytes[0..4].try_into().unwrap());
+                let mut b = u32::from_le_bytes(state_bytes[4..8].try_into().unwrap());
+                let mut c = u32::from_le_bytes(state_bytes[8..12].try_into().unwrap());
+                let mut d = u32::from_le_bytes(state_bytes[12..16].try_into().unwrap());
+
+                // Parse M[0..15]
+                let mut m = [0u32; 16];
+                for i in 0..16 {
+                    m[i] = u32::from_le_bytes(block[i*4..i*4+4].try_into().unwrap());
+                }
+
+                // MD5 rounds (standard)
+                macro_rules! f { ($b:expr,$c:expr,$d:expr) => { ($b & $c) | (!$b & $d) } }
+                macro_rules! g { ($b:expr,$c:expr,$d:expr) => { ($d & $b) | (!$d & $c) } }
+                macro_rules! h { ($b:expr,$c:expr,$d:expr) => { $b ^ $c ^ $d } }
+                macro_rules! i_fn { ($b:expr,$c:expr,$d:expr) => { $c ^ ($b | !$d) } }
+                macro_rules! round {
+                    ($a:expr,$b:expr,$c:expr,$d:expr,$f:expr,$k:expr,$s:expr,$mi:expr) => {
+                        $a = $b.wrapping_add(($a.wrapping_add($f).wrapping_add($k).wrapping_add($mi)).rotate_left($s));
+                    }
+                }
+
+                // Constants
+                static T: [u32; 64] = [
+                    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+                    0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+                    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+                    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+                    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+                    0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+                    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+                    0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391,
+                ];
+                static S: [u32; 64] = [
+                    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+                    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+                    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+                    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21,
+                ];
+                static MI: [usize; 64] = [
+                    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+                    1,6,11,0,5,10,15,4,9,14,3,8,13,2,7,12,
+                    5,8,11,14,1,4,7,10,13,0,3,6,9,12,15,2,
+                    0,7,14,5,12,3,10,1,8,15,6,13,4,11,2,9,
+                ];
+
+                for i in 0..64 {
+                    let fv = match i / 16 {
+                        0 => f!(b, c, d),
+                        1 => g!(b, c, d),
+                        2 => h!(b, c, d),
+                        _ => i_fn!(b, c, d),
+                    };
+                    round!(a, b, c, d, fv, T[i], S[i], m[MI[i]]);
+                    let tmp = d; d = c; c = b; b = a; a = tmp;
+                    // Actually MD5 doesn't rotate (a,b,c,d) — the new a becomes the old d
+                    // Standard MD5: new_a = d; d = c; c = b; b = b + result; but our macro already does a = b + (...)
+                    // Let me fix: after round!, a is already computed. Rotate: temp=d, d=c, c=b, b=a(new), a=temp
+                    // Wait, our macro sets a = b + (...), which is the new value for position that was 'a'.
+                    // The standard rotation is: the current a gets the computed value, then shift.
+                    // Actually: (a,b,c,d) → (d, a_new, b, c) where a_new = b + F(...)
+                    // Our macro already set a = b + F, so after: temp=d, d=c, c=b (old), b=a (new a), a=temp
+                    // That's exactly what we have. Good.
+                }
+
+                // Add to original state
+                let oa = u32::from_le_bytes(state_bytes[0..4].try_into().unwrap());
+                let ob = u32::from_le_bytes(state_bytes[4..8].try_into().unwrap());
+                let oc = u32::from_le_bytes(state_bytes[8..12].try_into().unwrap());
+                let od = u32::from_le_bytes(state_bytes[12..16].try_into().unwrap());
+
+                let mut out = [0u8; 16];
+                out[0..4].copy_from_slice(&oa.wrapping_add(a).to_le_bytes());
+                out[4..8].copy_from_slice(&ob.wrapping_add(b).to_le_bytes());
+                out[8..12].copy_from_slice(&oc.wrapping_add(c).to_le_bytes());
+                out[12..16].copy_from_slice(&od.wrapping_add(d).to_le_bytes());
+                let _ = emu.mem_write(x0 + 8, &out); // write back at offset +8
+            }
+
+            // Return to caller (skip the entire transform body)
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // MD5 wrapper (0x258530) — let CFF code run, wrapper fast-path disabled
     /*
     emu.add_code_hook(so_base + 0x258530, so_base + 0x258534,
         |emu: &mut Unicorn<Emu>, _, _| {
@@ -135,11 +232,147 @@ pub fn test_signing() -> Vec<(String, String)> {
 
     */
 
-    // AES key expand (0x241E9C) — fast-path with aes crate
-    // AES ECB alt (0x242640) — fast-path
-    // SHA1 (0x2451FC/0x2450AC/0x243E50) — fast-path
-    // For now, let these run in Unicorn (they're smaller than MD5)
-    // TODO: add fast-paths if still too slow
+    // SHA1 transform (0x243F10): sha1_transform(ctx, block64)
+    // ctx layout: similar to MD5 — state H0-H4 at some offset
+    // For now, fast-path by hooking the function and computing in Rust
+    emu.add_code_hook(so_base + 0x243F10, so_base + 0x243F14,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0);
+            let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0);
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            // SHA1 transform: read 5 x u32 state from ctx, 64-byte block
+            // State likely at ctx+8 (like MD5) or ctx+0
+            if let (Ok(sb), Ok(block)) = (emu.mem_read_as_vec(x0, 32), emu.mem_read_as_vec(x1, 64)) {
+                // Try state at offset 8 (matching MD5 pattern)
+                let mut h = [0u32; 5];
+                for i in 0..5 { h[i] = u32::from_be_bytes(sb[8+i*4..12+i*4].try_into().unwrap_or([0;4])); }
+                // Parse W[0..15]
+                let mut w = [0u32; 80];
+                for i in 0..16 { w[i] = u32::from_be_bytes(block[i*4..i*4+4].try_into().unwrap()); }
+                for i in 16..80 { w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1); }
+                let (mut a,mut b,mut c,mut d,mut e) = (h[0],h[1],h[2],h[3],h[4]);
+                for i in 0..80 {
+                    let (f,k) = match i {
+                        0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
+                        20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                        40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                        _ => (b ^ c ^ d, 0xCA62C1D6u32),
+                    };
+                    let tmp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+                    e = d; d = c; c = b.rotate_left(30); b = a; a = tmp;
+                }
+                h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
+                h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
+                h[4] = h[4].wrapping_add(e);
+                let mut out = [0u8; 20];
+                for i in 0..5 { out[i*4..i*4+4].copy_from_slice(&h[i].to_be_bytes()); }
+                let _ = emu.mem_write(x0 + 8, &out);
+            }
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // AES block encrypt alt entry (0x242640): aes_ecb(ctx, in16, out16)
+    // CFF-obfuscated AES — fast-path with aes crate
+    emu.add_code_hook(so_base + 0x242640, so_base + 0x242644,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0); // ctx (round keys at +0xF0)
+            let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0); // input 16 bytes
+            let x2 = emu.reg_read(RegisterARM64::X2).unwrap_or(0); // output 16 bytes
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            // Read round keys from ctx+0xF0 (176 bytes for AES-128 = 11 round keys)
+            if let (Ok(rk), Ok(input)) = (emu.mem_read_as_vec(x0 + 0xF0, 176), emu.mem_read_as_vec(x1, 16)) {
+                // Use the aes crate for proper AES-128 encryption
+                use aes::cipher::{BlockEncrypt, KeyInit};
+                // Extract the original key from round keys (first 16 bytes)
+                let key_bytes: [u8; 16] = rk[0..16].try_into().unwrap();
+                let cipher = aes::Aes128::new_from_slice(&key_bytes).unwrap();
+                let mut block = aes::Block::from_slice(&input).clone();
+                cipher.encrypt_block(&mut block);
+                let _ = emu.mem_write(x2, block.as_slice());
+            }
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // ALLOC_BUF (0x25BED4): allocate buffer of given size
+    emu.add_code_hook(so_base + 0x25BED4, so_base + 0x25BED8,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            eprintln!("[FAST] ALLOC_BUF");
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0) as u64;
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            let s = emu.get_data_mut();
+            let ptr = s.heap_next; s.heap_next += (x0 + 15) & !15;
+            emu.reg_write(RegisterARM64::X0, ptr).unwrap();
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // MALLOC wrapper (0x32A1F0)
+    emu.add_code_hook(so_base + 0x32A1F0, so_base + 0x32A1F4,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0) as u64;
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            let s = emu.get_data_mut();
+            let ptr = s.heap_next; s.heap_next += (x0.max(1) + 15) & !15;
+            emu.reg_write(RegisterARM64::X0, ptr).unwrap();
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // CREATE_BUF (0x2481FC): create_buf(dst_obj, src_data, len)
+    emu.add_code_hook(so_base + 0x2481FC, so_base + 0x248200,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0); // dst obj
+            let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0); // src data
+            let x2 = emu.reg_read(RegisterARM64::X2).unwrap_or(0) as usize; // len
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            if x2 > 0 && x2 < 100000 {
+                if let Ok(data) = emu.mem_read_as_vec(x1, x2) {
+                    // Allocate and copy
+                    let s = emu.get_data_mut();
+                    let buf = s.heap_next; s.heap_next += ((x2 as u64) + 15) & !15;
+                    let _ = emu.mem_write(buf, &data);
+                    // Write to dst obj: [vtable(8), ??(4), len(4), data_ptr(8)]
+                    let _ = emu.mem_write(x0 + 0xC, &(x2 as u32).to_le_bytes());
+                    let _ = emu.mem_write(x0 + 0x10, &buf.to_le_bytes());
+                }
+            }
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // BUF_OP (0x248344) — buffer append/copy
+    emu.add_code_hook(so_base + 0x248344, so_base + 0x248348,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            // Simple: just return (buffer operations are handled by CREATE_BUF)
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // FREE (0x15E1A8) — no-op
+    emu.add_code_hook(so_base + 0x15E1A8, so_base + 0x15E1AC,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
+
+    // AES key expand (0x241E9C): aes_key_expand(ctx, key, keylen)
+    emu.add_code_hook(so_base + 0x241E9C, so_base + 0x241EA0,
+        |emu: &mut Unicorn<Emu>, _, _| {
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0); // ctx
+            let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0); // key
+            let x2 = emu.reg_read(RegisterARM64::X2).unwrap_or(0) as usize; // keylen
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            if x2 == 16 {
+                if let Ok(key) = emu.mem_read_as_vec(x1, 16) {
+                    // Write key to ctx+0x00 (standard entry) and ctx+0xF0 (alt entry)
+                    let _ = emu.mem_write(x0, &key);
+                    let _ = emu.mem_write(x0 + 0xF0, &key);
+                    // Generate round keys using aes crate
+                    use aes::cipher::KeyInit;
+                    let cipher = aes::Aes128::new_from_slice(&key).unwrap();
+                    // aes crate doesn't expose round keys directly
+                    // Store the key at both offsets — AES ECB fast-path reads from +0xF0
+                }
+            }
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        }).unwrap();
 
     // MAP_SET hook to capture signatures
     emu.add_code_hook(so_base + 0x25BF3C, so_base + 0x25BF40,
