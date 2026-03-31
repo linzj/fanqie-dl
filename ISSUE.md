@@ -244,7 +244,8 @@ IDA 追踪 MD5 wrapper 的完整流程:
 | sub_2450AC | **SHA-1 finalize** | - | padding + 20字节输出 |
 | sub_2451FC | **SHA-1 full** | - | init+update+finalize |
 | sub_241E9C | **AES key expansion** | AES key expand ✓ | 支持 16/24/32 字节密钥 |
-| sub_2422EC | **AES block encrypt** | **从未被 hook!** | 真正的 AES-128 加密 |
+| sub_2422EC | **AES block encrypt (标准入口)** | **CFF 代码不用此入口!** | 真正的 AES-128 加密 |
+| 0x242640 | **AES block encrypt (替代入口)** | **★ 实际被调用!** | CFF 代码用此入口，跳过标准序言，从 [ctx+0xF0] 读 round key |
 | sub_2429F8 | **AES keygen+encrypt** | - | key expand + block encrypt 一步完成 |
 | sub_242A70 | **AES-CBC encrypt** | - | CBC 模式加密 |
 | sub_242C98 | **AES-CTR encrypt** | - | CTR 模式: nonce(8)+counter(8) |
@@ -434,6 +435,90 @@ Body 加密 (IDA 确认):
   SHA-1 可能用于: Medusa 明文的完整性校验，或构建 Medusa 明文内容
 ```
 
+## Frida 第三轮结果 (2026-03-31) — AES 替代入口发现
+
+### 重大突破：AES block encrypt 有两个入口！
+
+通过 simpleperf 采样发现 AES block encrypt 函数内部有执行（28 个采样），但 Frida hook 入口 0x2422EC 显示 0 次调用。反汇编确认：
+
+```
+sub_2422EC (标准入口): STP x26,x25,[sp,#-0x40]!  — 从 [ctx+0x00] 读 round key
+sub_242640 (替代入口): STP x24,x23,[sp,#-0x30]!  — 从 [ctx+0xF0] 读 round key
+```
+
+CFF 混淆代码调用 **0x242640 (替代入口)**，绕过标准入口！Hook 0x242640 后成功捕获：
+
+### AES-ECB 加密：17 次调用
+
+```
+调用者: 0x25AB84 (在 sub_259DBC AES setup 函数内部)
+所有调用都是 AES-ECB (单 block 加密)
+
+#   输入 (plaintext)                      输出 (ciphertext)
+1   98b7e200553b0e2bbff78bfa31499be4      ad9f20ff6a5d228c085f342a23325a2f
+2   3ecc4dccbc9a24b6d7bbf244bdd1b763      4a97e5543ce59500f3006aa27c0bf902
+3   b09d7d3bb048971eeb65a783b352324f      efc4a33faf945825656a0b9bf59ee660
+4   3bf9396254b33fad8b90700f1952638d      8692ffd5250368320bbf22b8407d5675
+5   08bea339160da1881ca914fb71e358ff      6ddcc0e774454774bca6c049aa9637d6
+6   f6145398c1c399144e3b96f3682dd59d      76270db7cd3bbdc5336896a2c0c4d160
+7   0e209a874f668a19114465c1b0fe4ba2      47133eb87d193afbe35294a46b494cdc
+8   551d63a051ba944726aaa30397fab2e6      d40dab53e89286c72448194293c94dee
+9   1778d35426196e62800b2831ea30ebd3      83f6fa82011b7339f21531b07d9c89d3
+10  82650f33fbe7d1c7ab925cfea027bbb3      08164a6836b5a3155c00d8d03f4d07ce
+11  b4055c36e66da379766ce917c9207429      873b1dc2f453910ea2140760314dba8f
+12  be2abaac47ba9f8ebc7a6c3452e8dd6c      663ce9ab0c70862e432eb4e50006f4d8
+13  f875bead24d939c08604f7a71ddb6787      828a0e21e6e54213930cde448f9e5683
+14  0f9adac992a23304ca76d2678c33ad07      210b45ffb47fabdb6b9225d524377ebf
+15  fac430ccd1f5f522f060ddf05ae0855e      6dd1763b5a4e4146d65b0de78fda1187
+16  6b714b66a8b02da97f18e71c74493579      6ed01f2953415511b8701c8e34c4788e
+17  8bc43c46fb6c51a28af469749346b436      20a02f5565822650198ce14452775801
+```
+
+### 关键观察
+
+1. **17 blocks × 16 bytes = 272 bytes AES**，但 Medusa body = 936 bytes
+   → AES 只加密了一部分，剩下 ~664 bytes 用其他方式生成
+2. **输出 #1 前 4 字节 `ad9f20ff` = SHA-1 输入的前 4 字节！**
+   → SHA-1 的 12 字节输入 `ad9f20ff 31393637 ab7cfe85` 来自 AES 输出
+   → magic_4bytes_2 = AES_ECB(key, counter_block)[0:4] ← 不是固定常量！
+3. **输入是递增的计数器块** — 这是 AES-CTR 模式的 keystream 生成
+   → 17 个 counter blocks 经 AES-ECB 加密产生 272 bytes keystream
+   → keystream XOR 明文 = Medusa body 的前 272 bytes
+4. 操作顺序: MD5×4 → AES key expand → **AES-ECB×17** → SHA-1 → MD5×2
+5. 调用者 0x25AB84 在 sub_259DBC (AES setup) 内部 — AES-CTR 加密是在 setup 函数中完成的
+
+### AES-CTR 计数器分析
+
+```
+Counter block 1: 98b7e200 553b0e2b bff78bfa 31499be4
+Counter block 2: 3ecc4dcc bc9a24b6 d7bbf244 bdd1b763
+Counter block 3: b09d7d3b b048971e eb65a783 b352324f
+...
+```
+
+这些计数器块看起来不是简单的递增整数 — 可能是加密后的计数器或者用某种方式派生的。需要在 IDA 中分析 0x25AB84 周围的代码来确认计数器生成逻辑。
+
+### SHA-1 的 46 次 update = 手动 padding
+
+```
+Update 1: 12 bytes → ad9f20ff 31393637 ab7cfe85
+Update 2: 1 byte  → 80 (SHA-1 padding start)
+Update 3-45: 1 byte → 00 each (43 zero bytes)
+Update 46: 8 bytes → 0000000000000060 (length in bits = 96)
+Total: 64 bytes = one SHA-1 block
+```
+
+SHA-1 输入 = `AES_output[0:4] + "1967" + magic_bytes`
+SHA-1 输出 = `1509be656b6620abd6cc6c48e8156dbe5927c8f8` (固定，因为输入常量)
+
+### Helios 仍未解决
+
+8 个样本测试了所有已知组合 (XOR, MD5, SHA-1, H3 等)，无一匹配。
+- part1 XOR H1 不是常量
+- part2 XOR H1 不是常量
+- part1 XOR part2 不是常量
+- 任何 MD5(Hx+Hy) 组合都不匹配
+
 ## IDA 逆向任务
 
 ### 任务1: 逆向 X-Helios 的 32 字节 hash 构造 (最高优先)
@@ -458,25 +543,29 @@ Body 加密 (IDA 确认):
 - 往上找调用 0x286df4 (BL指令) 的函数 — 同一个签名主函数
 - 这个函数应该在 0x286xxx-0x288xxx 范围内
 
-### 任务2: 逆向 X-Medusa 的明文结构
+### 任务2: 逆向 X-Medusa 的完整加密流程
 
-**目标**: 搞清楚 AES-128 加密前的明文是什么
+**目标**: 搞清楚 Medusa 936 字节 body 的完整生成算法
 
-**已知** (IDA 第二轮更新):
+**已知** (Frida 第三轮):
 - AES-128 key = `059874c397db2a6594024f0aa1c288c4`
-- AES 加密通过 sub_259CF0 分发，支持 ECB/CBC/CTR/CFB 四种模式
-- 之前认为的 "46 次 AES" 实际是 SHA-1 update
-- 真正的 AES encrypt (sub_2422EC) 从未被 hook
+- AES block encrypt 通过**替代入口 0x242640** 调用（标准入口 0x2422EC 被绕过）
+- 调用 **17 次** AES-ECB，产生 272 bytes (17×16)
+- 调用者: 0x25AB84 (在 sub_259DBC 内部)
+- 但 Medusa body = 936 bytes，远超 272 bytes
+- SHA-1 的 46 次 update 只是手动 padding 一个 12 字节输入，不参与加密
 
-**Frida 验证** (最高优先):
-1. 运行 **`hook_crypto_v4.js`** — 会 hook 真正的 AES block encrypt (sub_2422EC)
-2. 观察 AES_DISPATCH 的 mode 值确认加密模式 (0=ECB, 1=CBC, 2=CTR, 3=CFB)
-3. 如果是 CTR: 捕获 nonce 和 counter 初始值
-4. 捕获 XOR 操作 (sub_242DE0) 来获取明文
+**IDA 分析入口**:
+1. 去 **0x25AB84** (AES block encrypt 的调用点)
+2. 往上分析: 17 个 counter block 是怎么生成的 (不是简单递增)
+3. 分析 AES 之后的代码: 272 bytes keystream 如何 XOR 明文
+4. 搞清楚剩余 ~664 bytes (936-272) 怎么生成 — 可能是明文直接拼接，或另一种加密
+5. Medusa header (24 bytes) 的构造逻辑
 
-**也可以用已知 key 解密**:
-- 捕获完整 Medusa hex
-- 根据确认的模式 + IV/nonce 解密 body 部分 (跳过前 24 字节 header)
+**关键线索**:
+- AES 输出 #1 前 4 字节 `ad9f20ff` = SHA-1 输入的前 4 字节
+- 所有 17 次 AES 调用都来自同一个 LR (0x25AB84)
+- sub_259DBC 是一个 CFF 混淆的大函数
 
 ### 任务3: ~~确认 MD5 wrapper 是否变换输出~~ ✅ 已完成
 
@@ -485,27 +574,24 @@ IDA 追踪完整流程: MD5 → malloc → 复制到堆 → 存入对象 → 返
 
 ### 下一步 (优先级排序)
 
-1. **运行 `hook_crypto_v4.js`** — 最高优先！这会揭示:
-   - Medusa 用的 AES 模式 (ECB/CBC/CTR?)
-   - AES block encrypt 的真实调用次数
-   - CTR 的 nonce/counter (如果是 CTR 模式)
-   - XOR 操作中的 Medusa 明文
-
-2. **运行 `hook_helios_v3.js`** — 测试更多 Helios 组合:
-   - 包括 H3 (AES key) 作为 XOR key
-   - SHA-1 输出作为组件
-   - 8 个样本的统计分析
-
-3. 根据 v4 输出, 在 Rust 中实现 Medusa
+1. **IDA 分析 0x25AB84 周围代码** — 理解 AES-CTR counter block 生成和 XOR 逻辑
+2. **IDA 分析 Medusa 936 bytes 的组装** — 272 AES bytes + 剩余 664 bytes 的来源
+3. **IDA 逆向 Helios part1/part2** — CFF 内联逻辑，目前所有已知算法组合都不匹配
 
 ### 验证方法
 
 ```bash
 PID=$(adb shell "ps -A" | grep com.dragon.read | awk '{print $2}' | head -1)
-timeout 30 frida -U -p $PID -l scripts/hook_crypto_v4.js
-# 对比输出的 AES 操作和 Medusa 结构
+
+# ★★★ 最重要: hook AES 替代入口 (0x242640) — 之前的 v4 hook 0x2422EC 抓不到！
+timeout 30 frida -U -p $PID -l scripts/hook_aes_alt_entry.js
+
+# Helios 多样本分析
 timeout 45 frida -U -p $PID -l scripts/hook_helios_v3.js
-# 分析 Helios 样本
+
+# simpleperf 采样 (需要大量重复)
+adb shell "simpleperf record -e cpu-clock -p $PID -o /data/local/tmp/perf.data --duration 300 -f 10000" &
+timeout 290 frida -U -p $PID -l scripts/hook_perf_loop.js
 ```
 
 ## App 设备信息（模拟器，用于测试）
@@ -543,8 +629,9 @@ x-reading-request: {timestamp_ms}-{random_hex}  (推荐)
 - `gen_curl.js` — 生成签名输出 shell 变量
 
 ### Crypto Hook (核心)
-- **`hook_crypto_v4.js`** — ★★★ 修正版! Hook 真正的 AES (sub_2422EC) + 正确标识 SHA-1
+- **`hook_aes_alt_entry.js`** — ★★★★ Hook AES 替代入口 0x242640! 捕获 17 次 AES-ECB
 - **`hook_helios_v3.js`** — ★★ Helios 多样本 + 更多组合测试 (含 H3/SHA1)
+- `hook_crypto_v4.js` — ⚠ hook 0x2422EC 但 CFF 代码调用 0x242640 绕过！实际抓不到 AES
 - `hook_crypto_v3.js` — ⚠ 有错误: 把 SHA-1 当成 AES，漏掉真正的 AES
 - **`hook_helios_multi.js`** — 固定 URL 多次签名收集 (R, H1, part1, part2) 样本
 - **`hook_helios_verify.js`** — 用 Java MD5 测试 Helios 算法假设
@@ -554,8 +641,18 @@ x-reading-request: {timestamp_ms}-{random_hex}  (推荐)
 - `hook_find_parent.js` — 从 LR 找上层调用函数
 - `hook_md5_wrapper.js` — 分析 0x258530 MD5 wrapper 的参数和返回值
 
+### Medusa 分析
+- `hook_medusa_trace.js` — 追踪 AES setup 后的函数调用序列
+- `hook_medusa_decrypt.js` — 用 Java Cipher 尝试解密 Medusa body
+- `hook_medusa_decrypt2.js` — 更多解密尝试 (RC4, XOR, CTR 变体)
+- `hook_medusa_keystream.js` — 捕获 AES 扩展密钥 + 函数调用序列
+- `hook_perf_loop.js` — 5000 次签名循环，配合 simpleperf 采样
+- `hook_func_scan.js` — 扫描函数序言批量 hook
+
 ### 分析工具
 - `hook_disasm.js` — 反汇编 MD5 wrapper 和调用点代码
+- `hook_disasm_full.js` — 反汇编签名核心函数区域
+- `hook_aes_deep.js` — 尝试 hook AES 内部地址 (会崩溃，仅参考)
 - `hook_find_crypto2.js` — 搜索 SO 中的 crypto 常量位置 + JNI 入口
 - `investigate_algo.js` — 签名算法基本分析
 - `analyze_helios_medusa.js` — Helios/Medusa 结构分析
@@ -572,14 +669,11 @@ PID=$(adb shell "ps -A" | grep com.dragon.read | awk '{print $2}' | head -1)
 # 生成签名
 timeout 10 frida -U -p $PID -l scripts/gen_sigs.js 2>&1 | grep "^SIGS_JSON:"
 
-# ★★★ 修正版 crypto 分析 (hook 真正的 AES!)
-timeout 30 frida -U -p $PID -l scripts/hook_crypto_v4.js
+# ★★★★ AES 替代入口 hook (捕获 17 次 AES-ECB!)
+timeout 30 frida -U -p $PID -l scripts/hook_aes_alt_entry.js
 
 # ★★ Helios 多样本分析 (含更多组合测试)
 timeout 45 frida -U -p $PID -l scripts/hook_helios_v3.js
-
-# 旧版 (有错误，仅供参考)
-# timeout 30 frida -U -p $PID -l scripts/hook_crypto_v3.js
 
 # 调用链追踪
 timeout 30 frida -U -p $PID -l scripts/hook_lr_only.js
