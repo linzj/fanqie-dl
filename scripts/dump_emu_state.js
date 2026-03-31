@@ -49,9 +49,13 @@ function dumpPointers(addr, size, depth, label) {
     }
 }
 
-Interceptor.attach(base.add(0x17B96C), {
+// Hook MD5 wrapper (0x258530) — first call marks signing start
+var md5w_count = 0;
+Interceptor.attach(base.add(0x258530), {
     onEnter: function(args) {
-        console.log("\n=== ORCHESTRATOR ENTRY ===");
+        md5w_count++;
+        if (md5w_count > 1) return; // only dump on first MD5 call
+        console.log("\n=== MD5 WRAPPER #1 (signing start) ===");
 
         // Dump all registers
         var regs = ['x0','x1','x2','x3','x4','x5','x6','x7','x8',
