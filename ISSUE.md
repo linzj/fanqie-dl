@@ -723,11 +723,52 @@ Medusa body: 960 bytes total, 272 from AES, 664 unaccounted
 - `lib/so_patch_*.bin` — RWX 段 patch 数据
 - `src/signer/emulator.rs` — Unicorn 模拟器实现
 
+## Helios 生成流程破解 (2026-03-31, 第五轮)
+
+### 完整的 Helios 生成链路（Frida 确认）
+
+```
+1. MD5(URL_params) → H0                              [已知]
+2. R = random 4 bytes                                 [已知]
+3. MD5(R + "1967") → H1                               [已知]
+4. CREATE_BUF(4)  at LR=0x16aa4c → R (4 bytes)       [已知]
+5. CREATE_BUF(32) at LR=0x287b44 → H1 ASCII hex       "bb7a9a17c05b0a773849723adc3bc5af"
+6. CREATE_BUF(26) at LR=0x287b80 → "{ts}-{dev_id}-1967"  "1774952267-1394812046-1967"
+7. B64_ENCODE     at LR=0x288c20 → base64(36 bytes)   [调用 sub_258C14]
+8. CREATE_BUF(48) at LR=0x258d20 → Helios base64 str  [最终结果]
+9. MAP_SET("X-Helios", base64_str) at LR=0x16aa4c
+```
+
+### 关键中间值
+
+- **H1 hex 字符串** (32 bytes): MD5(R+"1967") 的十六进制文本表示
+- **Timestamp 字符串** (26 bytes): `"{unix_ts}-{device_reg_id}-1967"`
+  - `unix_ts`: 当前 unix 时间戳（秒）
+  - `device_reg_id`: 固定值 `1394812046`（设备注册时分配的 ID，同一设备不变）
+  - `1967`: aid 常量
+
+### Helios = R(4) + part1(16) + part2(16) — 算法仍未知
+
+输入: H0(16b), H1_hex(32B ASCII), timestamp_str(26B ASCII)
+输出: part1(16b), part2(16b)
+
+**不是任何简单 MD5 组合**（已穷举测试 MD5(H0+H1), MD5(H1+ts), MD5(ts+H0) 等数十种组合）。
+part1/part2 由 CFF 内联代码在 0x287b44→0x288c20 之间生成。
+
+### 关键地址
+
+| 地址 | 操作 | 说明 |
+|------|------|------|
+| 0x287b44 | CREATE_BUF(H1_hex) | Helios 中间值: H1 的 hex 字符串 |
+| 0x287b80 | CREATE_BUF(ts_str) | Helios 中间值: timestamp 字符串 |
+| 0x288c20 | B64_ENCODE(36bytes) | Helios base64 编码 |
+| 0x258d20 | CREATE_BUF(b64_str) | Helios base64 结果 |
+
 ### 下一步
 
-1. **★★★★★ 扩展模拟器执行完整签名流程** — 从 sub_17B96C (orchestrator) 开始，需要设置正确的输入数据结构
-2. 需要 Frida dump orchestrator 函数的输入数据结构（vtable、参数对象等）
-3. 需要 mock JNI 函数（GetStringUTFChars 等）或找到绕过 JNI 的更低层入口点
+1. **★★★★★ 用 Unicorn 模拟 0x287b44→0x288c20 之间的代码** — 输入 H0/H1/ts，输出 part1/part2
+2. 或: Frida 内存写入 hook — 在 B64_ENCODE 之前对输入 buffer 设置 watchpoint，找到写入 part1/part2 的指令地址
+3. `device_reg_id` = 1394812046 — 需要确认来源（可能是设备注册返回的 ID）
 
 ### 验证方法
 
