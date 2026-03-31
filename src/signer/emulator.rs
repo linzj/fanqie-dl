@@ -152,12 +152,66 @@ pub fn test_signing() -> Vec<(String, String)> {
         },
     ).unwrap();
 
-    // Skip invalid/unsupported instructions (PAC, BTI, etc.)
+    // Skip invalid/unsupported instructions (PAC, BTI, LSE atomics)
     emu.add_insn_invalid_hook(|emu: &mut Unicorn<EmuState>| -> bool {
         let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
-        // Skip the instruction by advancing PC
         emu.reg_write(RegisterARM64::PC, pc + 4).unwrap();
         true
+    }).unwrap();
+
+    // Handle CPU exceptions — implement unsupported LSE atomic instructions
+    emu.add_intr_hook(|emu: &mut Unicorn<EmuState>, _intno: u32| {
+        let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+        if let Ok(insn_bytes) = emu.mem_read_as_vec(pc, 4) {
+            let w = u32::from_le_bytes(insn_bytes.try_into().unwrap());
+
+            // LDADDH (LSE atomic): 0x38200020 family
+            // Format: size=01 111 000 001 Rs 0 000 00 Rn Rt
+            // LDADD*: 0x38/78/B8/F8 20xxxx
+            if (w & 0x3F20FC00) == 0x38200000 {
+                let rt = (w & 0x1F) as i32;
+                let rn = ((w >> 5) & 0x1F) as i32;
+                let rs = ((w >> 16) & 0x1F) as i32;
+                let size = (w >> 30) & 3; // 0=byte, 1=half, 2=word, 3=dword
+
+                let addr_val = emu.reg_read(rn + RegisterARM64::X0 as i32).unwrap_or(0);
+                let rs_val = emu.reg_read(rs + RegisterARM64::X0 as i32).unwrap_or(0);
+
+                // Read old value
+                let old = match size {
+                    0 => { let mut b = [0u8;1]; let _ = emu.mem_read(addr_val, &mut b); b[0] as u64 }
+                    1 => { let mut b = [0u8;2]; let _ = emu.mem_read(addr_val, &mut b); u16::from_le_bytes(b) as u64 }
+                    2 => { let mut b = [0u8;4]; let _ = emu.mem_read(addr_val, &mut b); u32::from_le_bytes(b) as u64 }
+                    _ => { let mut b = [0u8;8]; let _ = emu.mem_read(addr_val, &mut b); u64::from_le_bytes(b) }
+                };
+
+                // Write new value = old + rs
+                let new_val = old.wrapping_add(rs_val);
+                match size {
+                    0 => { let _ = emu.mem_write(addr_val, &(new_val as u8).to_le_bytes()); }
+                    1 => { let _ = emu.mem_write(addr_val, &(new_val as u16).to_le_bytes()); }
+                    2 => { let _ = emu.mem_write(addr_val, &(new_val as u32).to_le_bytes()); }
+                    _ => { let _ = emu.mem_write(addr_val, &new_val.to_le_bytes()); }
+                }
+
+                // Rt = old value
+                if rt != 31 { // not xzr
+                    emu.reg_write(rt + RegisterARM64::X0 as i32, old).unwrap();
+                }
+
+                emu.reg_write(RegisterARM64::PC, pc + 4).unwrap();
+                return;
+            }
+
+            // BTI (Branch Target Identification): 0xD503241F or 0xD503245F etc.
+            if (w & 0xFFFFFF3F) == 0xD503241F {
+                emu.reg_write(RegisterARM64::PC, pc + 4).unwrap();
+                return;
+            }
+
+            // Other: just skip
+            emu.reg_write(RegisterARM64::PC, pc + 4).unwrap();
+        }
     }).unwrap();
 
     // Auto-map unmapped data accesses (return zeros)
@@ -182,6 +236,17 @@ pub fn test_signing() -> Vec<(String, String)> {
             false
         },
     ).unwrap();
+
+    // Probe trampoline + MD5
+    emu.add_code_hook(0x7a6c9dc500, 0x7a6c9dc504, |_: &mut Unicorn<EmuState>, _, _| {
+        eprintln!("[PROBE] Trampoline 0x7a6c9dc500 hit!");
+    }).unwrap();
+    emu.add_code_hook(so_base + 0x243C44, so_base + 0x243C48, |_: &mut Unicorn<EmuState>, _, _| {
+        eprintln!("[PROBE] MD5_BODY hit!");
+    }).unwrap();
+    emu.add_code_hook(so_base + 0x258540, so_base + 0x258544, |_: &mut Unicorn<EmuState>, _, _| {
+        eprintln!("[PROBE] MD5_WRAPPER_BODY hit!");
+    }).unwrap();
 
     let start = so_base + OFF_MD5_WRAPPER;
     eprintln!("[emu] Starting at SO+0x{:x}", OFF_MD5_WRAPPER);
