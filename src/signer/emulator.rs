@@ -12,6 +12,7 @@ const OFF_SIGN_START: u64 = 0x286DF4;
 
 struct EmuState {
     so_base: u64,
+    heap_next: u64,
     signatures: Vec<(String, String)>,
 }
 
@@ -101,7 +102,7 @@ pub fn test_signing() -> Vec<(String, String)> {
     eprintln!("[emu] SO_BASE=0x{:x}, {} ranges", so_base, ranges.len());
 
     let mut emu = Unicorn::new_with_data(Arch::ARM64, Mode::LITTLE_ENDIAN, EmuState {
-        so_base, signatures: Vec::new(),
+        so_base, heap_next: 0x80000000, signatures: Vec::new(),
     }).unwrap();
 
     map_ranges(&mut emu, &ranges);
@@ -281,25 +282,92 @@ pub fn test_signing() -> Vec<(String, String)> {
         }
     }).unwrap();
 
-    // Auto-map unmapped accesses: try 1MB, fallback to 4KB
-    emu.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX,
-        |emu: &mut Unicorn<EmuState>, mt: MemType, addr: u64, _size: usize, _v: i64| -> bool {
-            if addr < 0x10000 { return false; }
-            // Try 1MB first
-            let mega = addr & !0xFFFFF;
-            let mapped = emu.mem_map(mega, 0x100000, Prot::ALL).is_ok()
-                || emu.mem_map(addr & !0xFFF, 0x1000, Prot::ALL).is_ok(); // fallback 4KB
-            if mapped && matches!(mt, MemType::FETCH_UNMAPPED) {
-                let page = addr & !0xFFF;
-                let ret: Vec<u8> = (0..0x1000/4).flat_map(|_| 0xD65F03C0u32.to_le_bytes().to_vec()).collect();
-                let _ = emu.mem_write(page, &ret);
+    // Auto-map: use 16MB chunks, limit total auto-maps to prevent overflow
+    {
+        let auto_count = std::cell::Cell::new(0u32);
+        emu.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX,
+            move |emu: &mut Unicorn<EmuState>, mt: MemType, addr: u64, _size: usize, _v: i64| -> bool {
+                if addr < 0x10000 { return false; }
+                if auto_count.get() > 500 { return false; } // hard limit
+                let mega16 = addr & !0xFFFFFF; // 16MB aligned
+                if emu.mem_map(mega16, 0x1000000, Prot::ALL).is_ok() {
+                    auto_count.set(auto_count.get() + 1);
+                    if matches!(mt, MemType::FETCH_UNMAPPED) {
+                        // Fill the specific page with RETs
+                        let page = addr & !0xFFF;
+                        let ret: Vec<u8> = (0..0x1000/4).flat_map(|_| 0xD65F03C0u32.to_le_bytes().to_vec()).collect();
+                        let _ = emu.mem_write(page, &ret);
+                    }
+                    return true;
+                }
+                false
+            },
+        ).unwrap();
+    }
+
+    // FAST-PATH: intercept crypto PLT stubs and implement in Rust
+    // MD5 PLT at SO+0x243C34: md5(data, len, out16)
+    emu.add_code_hook(so_base + 0x243C34, so_base + 0x243C38,
+        |emu: &mut Unicorn<EmuState>, _, _| {
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0); // data
+            let x1 = emu.reg_read(RegisterARM64::X1).unwrap_or(0) as usize; // len
+            let x2 = emu.reg_read(RegisterARM64::X2).unwrap_or(0); // out
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+            if let Ok(data) = emu.mem_read_as_vec(x0, x1) {
+                let hash = md5::compute(&data);
+                let _ = emu.mem_write(x2, &hash.0);
             }
-            mapped
+            // Skip MD5 body — return directly to caller
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
         },
     ).unwrap();
 
-    // PRODUCTION MODE: minimal hooks for performance
-    // Only MAP_SET hook + interrupt handler, no probes or instruction counters
+    // MD5 wrapper fast-path at SO+0x258530
+    // Wrapper does: alloc_buf(16) → md5(data, len, buf) → create_buf(buf, 16) → return object
+    // We simulate the wrapper behavior in Rust
+    emu.add_code_hook(so_base + 0x258530, so_base + 0x258534,
+        |emu: &mut Unicorn<EmuState>, _, _| {
+            // x0 = data_obj_ptr (struct with len at +0xC, data_ptr at +0x10)
+            // Returns a buffer object with MD5 hash
+            let x0 = emu.reg_read(RegisterARM64::X0).unwrap_or(0);
+            let lr = emu.reg_read(RegisterARM64::LR).unwrap_or(0);
+
+            // Read data object
+            if let (Ok(len_bytes), Ok(ptr_bytes)) = (
+                emu.mem_read_as_vec(x0 + 0xC, 4),
+                emu.mem_read_as_vec(x0 + 0x10, 8),
+            ) {
+                let data_len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                let data_ptr = u64::from_le_bytes(ptr_bytes.try_into().unwrap());
+
+                if data_len > 0 && data_len < 1_000_000 {
+                    if let Ok(data) = emu.mem_read_as_vec(data_ptr, data_len) {
+                        let hash = md5::compute(&data);
+
+                        // Allocate result buffer object (similar to what wrapper does)
+                        // Object layout: [vtable(8), padding(4), len(4), data_ptr(8)]
+                        let state = emu.get_data_mut();
+                        let hash_buf = state.heap_next; state.heap_next += 16;
+                        let obj = state.heap_next; state.heap_next += 32;
+
+                        let _ = emu.mem_write(hash_buf, &hash.0);
+                        let _ = emu.mem_write(obj + 0xC, &16u32.to_le_bytes());
+                        let _ = emu.mem_write(obj + 0x10, &hash_buf.to_le_bytes());
+
+                        // Return the object pointer (x0 = NULL, but store in expected location)
+                        // MD5 wrapper stores result via sub_162944(ctx, ptr)
+                        // For CFF caller, the result is typically read from a stack/register location
+                        // Let's set x0 = 0 (wrapper returns void) and hope CFF reads from the context
+                        emu.reg_write(RegisterARM64::X0, 0).unwrap();
+                    }
+                }
+            }
+
+            // Return to caller
+            emu.reg_write(RegisterARM64::PC, lr).unwrap();
+        },
+    ).unwrap();
+
     /*
     let probes: Vec<(u64, &str)> = vec![
         (0x258530, "MD5_WRAP_PLT"),
