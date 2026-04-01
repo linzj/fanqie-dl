@@ -1,0 +1,24 @@
+[package]
+name = "dynarmic-sys"
+version = "0.1.2"
+edition = "2021"
+authors = ["wyourname <https://github.com/wyourname/dynarmic-sys>"]
+description = "A Rust wrapper for the Dynarmic ARM dynamic recompiler."
+license = "0BSD"
+repository = "https://github.com/wyourname/dynarmic-sys"
+readme = "README.md"
+keywords = ["arm", "arm64", "jit", "dynarmic", "dynarmic-sys"]
+categories = ["emulators", "external-ffi-bindings"]
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+log = "0.4"
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1.0"
+pkg-config = "0.3"

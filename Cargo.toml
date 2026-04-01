@@ -24,6 +24,8 @@ md5 = "0.7"
 sha2 = "0.10"
 dirs = "6"
 urlencoding = "2"
-unicorn-engine = "2.1"
-dynarmic-sys = "0.1"
+dynarmic-sys = { path = "dynarmic-sys-local" }
 sha1 = "0.10"
+
+[build-dependencies]
+cc = "1"

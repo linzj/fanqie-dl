@@ -695,33 +695,68 @@ Medusa body: 960 bytes total, 272 from AES, 664 unaccounted
 **结论**：Helios part1/part2 由 CFF 内联代码生成，不经过任何已 hook 的标准 crypto 函数。
 需要 IDA 逆向 CFF 混淆代码才能找到算法。
 
-## Unicorn ARM64 模拟器方案 (2026-03-31)
+## ARM64 模拟器方案
 
-### 核心突破：SO 代码可以在 Unicorn 中正确执行
+### 方案演进
 
-使用 Frida dump SO 运行时内存（GOT 已填充），加载到 Unicorn ARM64 模拟器中，成功执行 MD5 函数：
+1. **Unicorn** (2026-03-31): MD5 验证成功，但 CFF 混淆代码执行太慢（10+ 分钟），不可行
+2. **dynarmic JIT** (2026-04-01): ARM64 JIT 重编译器，10-100x 快于 Unicorn，当前方案
 
-```
-输入: "1967" + 0xab7cfe85 + "1967" (12 bytes)
-期望: 059874c397db2a6594024f0aa1c288c4
-实际: 059874c397db2a6594024f0aa1c288c4  ✅ 完全匹配
-```
+### dynarmic 模拟器进展 (2026-04-01)
 
-### 技术方案
+#### 已解决的技术问题
 
-1. **SO 内存 dump**: 用 Frida 从运行进程中 dump 完整 SO（GOT/PLT 已解析）
-2. **ADRP 保持**: 加载到与 dump 相同的 base 地址 (0x7623e02000)，避免 PC-relative 地址计算问题
-3. **外部函数 stub**: 扫描 GOT，将所有外部指针替换为 stub 区域的 RET 指令
-4. **Stub 实现**: 通过 code hook 在 stub 区域拦截调用，根据参数模式实现 memcpy/memset/malloc/free
-5. **TLS 模拟**: 设置 TPIDR_EL0 寄存器，提供 stack guard 值
-6. **缺失页修补**: dump 中不可读的页从原始 SO 文件补充
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 40-bit 地址空间 | dynarmic page table 只支持 1TB，Android 地址 >43-bit | Rust 端传 null page_table，禁用 page table 快速路径，纯 hash map |
+| macOS PROT_EXEC | `mmap(RWX)` 返回 EACCES | mem_map 用 prot=3 (RW only)，dynarmic 不需要 host EXEC 权限 |
+| LSE 原子指令 | dynarmic 不支持 CAS/LDADD/LDSET/SWP 等 LSE atomics | 扫描非 SO 范围代码，替换为 SVC #0x500，在回调中模拟全部 opc 变体 |
+| MemoryReadCode 不触发 callback | C 代码 MemoryRead32 没有 unmapped callback | 修改 dynarmic.cpp，MemoryRead32 和 MemoryReadCode 加 callback + HaltExecution |
+| ClearHalt 不完整 | emu_start 只清 UserDefined halt，不清 MemoryAbort | 在 emu_start 加 ClearHalt(MemoryAbort) + ClearHalt(CacheInvalidation) |
+| 缺页检测慢 | unmapped callback 映射零页导致死循环 | 不映射，设 miss_flag atomic，main loop 检查后立刻 break |
+| futex 死锁 | pthread_mutex_lock 在单线程中等待永远不会释放的锁 | futex WAIT 时强制写 0 到 futex 地址（解锁）+ 返回 -ETIMEDOUT |
+| range 映射重叠 | dynarmic_mmap 遇到已存在 page 返回 4 | 合并 page-aligned 范围后统一映射 |
+| SVC patch 破坏 CFF | CFF 使用指令地址作为 dispatch 常量 | **完全不 patch SO 代码**，外部函数通过 dump 的 libc 原生执行 |
 
-### 文件
+#### 迭代缺页 dump 框架
 
-- `lib/so_memdump.bin` — 运行时 SO 内存 dump (4MB)
-- `lib/so_rw_segment.bin` — RW 段数据
-- `lib/so_patch_*.bin` — RWX 段 patch 数据
-- `src/signer/emulator.rs` — Unicorn 模拟器实现
+核心思路：只 dump SO + 栈，emulator 执行时遇到缺页 → 记录 → 从设备补 dump → 重跑。
+
+1. `scripts/dump_so_only.py` — 通过 `/proc/pid/mem` dump SO + 栈（0.5 秒）
+2. `scripts/dump_pages.py` — 按缺页地址查找模块，dump 整个模块所有 range
+3. Emulator 的 unmapped callback 记录缺页，设 miss_flag 停止执行
+4. 典型 8 次迭代完成所有缺页补 dump（libc、libc++、liblog 等）
+
+#### 当前状态
+
+**emulator 框架完全工作**：
+- 加载 memdump → 设寄存器 → patch LSE → 执行 → syscall 处理 → 缺页迭代 — 全链路通
+- 0.1 秒内完成执行，0 retries，20 个 SVC（全是 LSE atomic）
+- 56 个 memory ranges，30MB mapped，1763 个 LSE 指令被 patch
+
+**当前问题：函数 0.1 秒返回，没有执行签名逻辑**
+- 20 个 SVC 全是 LSE atomic（libc 初始化），没有任何 syscall（clock_gettime/mmap）
+- MAP_SET hook 没被触发 — CFF 签名代码根本没执行
+- 可能原因：
+  1. **输入数据不完整** — x0 指向栈上的 URL 字符串对象，但该对象的 data_ptr 可能指向堆（堆内存未 dump）
+  2. **Stack canary 异常** — canary 值 0x79e89c4848 看起来像地址不像随机值，可能导致 __stack_chk_fail
+  3. **前置条件检查失败** — 函数内部某个 null/size 检查失败导致 early return
+
+#### 文件
+
+- `lib/memdump.bin` — 迭代 dump 的进程内存（~30MB）
+- `lib/regs_only.txt` — 寄存器 dump（SO+0x286DF4 入口点）
+- `src/signer/emulator.rs` — dynarmic JIT 模拟器实现
+- `dynarmic-sys-local/` — 本地 patched dynarmic（null page_table、MemoryReadCode callback、ClearHalt 修复）
+- `scripts/dump_so_only.py` — 快速 SO dump（/proc/pid/mem）
+- `scripts/dump_pages.py` — 迭代缺页 dump（按模块级别）
+- `scripts/dump_regs_and_stack.js` — Frida CLI 抓寄存器
+
+#### 下一步
+
+1. **★ 分析函数 early return 原因** — 在 SO+0x286DF4 入口处 dump x0 指向的完整数据结构，确认 URL 字符串是否可读
+2. **dump 堆内存** — x0 等寄存器指向的堆区域可能需要额外 dump
+3. **观察执行路径** — 加 PC trace 看函数走了哪些 basic block，确认是 early return 还是 crash
 
 ## Helios 生成流程破解 (2026-03-31, 第五轮)
 
