@@ -87,12 +87,38 @@ dynarmic-sys-local/         — patched dynarmic FFI
   src/ffi.rs                    — FFI 声明
 scripts/
   dump_so_only.py           — /proc/pid/mem 快速 dump SO+栈
-  dump_pages.py             — 迭代缺页 dump（按模块级别）
-  dump_regs_and_stack.js    — Frida CLI 抓寄存器
+  dump_pages.py             — 迭代缺页 dump（按模块级别，自动过滤 Frida 页面）
+  dump_regs_wait.js         — Frida hook 等待自然触发签名
+  dump_regs_deadlock.js     — Frida hook + 死锁线程用于 dump
+  hook_register_natives.js  — Hook RegisterNatives 找 JNI native 入口
 lib/
   memdump.bin               — 进程内存 dump
   regs_only.txt             — 寄存器 dump
 ```
+
+## 签名函数入口
+
+- **JNI native 入口**: `SO+0x26e684` — `y2.a(int tag, int type, long handle, String url, Object extra)`
+- tag=`0x3000001` 对应签名功能
+- 函数内部重排参数后通过 CFF obfuscated dispatch 跳转到签名逻辑
+- **SO+0x2869f0** 是实际签名 CFF 函数（包含 0x286DF4 等 basic block）
+- 之前 IDA 分析的 sub_29CCD4 → sub_283748 调用链**未被实际调用**
+
+## TPIDR_EL0 计算
+
+从 `/proc/pid/maps` 找到线程的 `[anon:stack_and_tls:TID]` rw 区域结束地址：
+```
+TPIDR_EL0 = stack_and_tls_rw_end - 0x3580
+```
+偏移 0x3580 在 Android 15 上固定（已多次验证）。
+
+## Frida 注意事项
+
+- Frida attach 后进程残留 `memfd:frida-agent-64.so` 映射，杀 frida-server 不会卸载
+- 迭代 dump 时 `dump_pages.py` 自动过滤 Frida agent 地址范围的页面
+- **不能用 Frida 触发签名**——调用链经过 Frida 代码，栈上残留 Frida 指针污染 emulator
+- 自然触发（用户操作 app）可避免调用链污染
+- lldb/ptrace 会被 app 反调试检测到，进程挂起
 
 ## 重新编译 dynarmic C 代码
 

@@ -263,18 +263,15 @@ pub fn test_signing() -> Vec<(String, String)> {
     let _ = dy.mem_write(0, &svc_bytes(SVC_TRAP_NULL));
     eprintln!("[emu] Patched {} hooks + null trap (LSE handled dynamically)", HOOK_TABLE.len());
 
-    // Set up fake TLS area for TPIDR_EL0
-    // On Android, TPIDR_EL0 points to the thread's TLS block.
-    // Without this, MRS TPIDR_EL0 returns 0 and TLS reads go to address 0
-    // (which has our SVC trap bytes, corrupting values).
-    let tls_base = 0x6000_0000u64;
-    let tls_size = 0x2000usize; // 8KB
-    let _ = dy.mem_map(tls_base, tls_size, 3);
-    let _ = dy.mem_protect(tls_base, tls_size, 7);
-    // Point TPIDR_EL0 to middle of TLS area (negative offsets are used by bionic)
-    let tpidr = tls_base + 0x1000;
+    // Set TPIDR_EL0 from register dump (real thread-local storage pointer)
+    let mut tpidr = 0u64;
+    for line in std::fs::read_to_string(format!("{}/lib/regs_only.txt", dir)).unwrap().lines() {
+        if let Some(rest) = line.strip_prefix("REG:tpidr_el0:") {
+            tpidr = u64::from_str_radix(rest.trim_start_matches("0x"), 16).unwrap_or(0);
+        }
+    }
+    assert!(tpidr != 0, "tpidr_el0 not found in regs_only.txt");
     dy.reg_write_tpidr_el0(tpidr).unwrap();
-
     eprintln!("[emu] TPIDR_EL0 = 0x{:x}", tpidr);
 
     // Load registers from dump
@@ -293,17 +290,10 @@ pub fn test_signing() -> Vec<(String, String)> {
         }
     }
 
-    // Fix stack canary: read the real canary from [FP-8] (saved by the original code
-    // using the real TPIDR_EL0) and write it to our fake TPIDR_EL0+0x28
-    let fp = dy.reg_read(29).unwrap_or(0);
-    if fp > 0x1000 {
-        if let Ok(canary_bytes) = dy.mem_read_as_vec(fp - 8, 8) {
-            let canary = u64::from_le_bytes(canary_bytes.try_into().unwrap());
-            if canary != 0 {
-                let _ = dy.mem_write(tpidr + 0x28, &canary.to_le_bytes());
-                eprintln!("[emu] Stack canary = 0x{:x} (from [FP-8]=0x{:x})", canary, fp - 8);
-            }
-        }
+    // With real TPIDR_EL0, stack canary is already in TLS — just log it
+    if let Ok(b) = dy.mem_read_as_vec(tpidr + 0x28, 8) {
+        let canary = u64::from_le_bytes(b.try_into().unwrap());
+        eprintln!("[emu] Stack canary at [TPIDR+0x28] = 0x{:x}", canary);
     }
 
     // Shared mutable state for SVC callbacks
@@ -699,14 +689,11 @@ pub fn test_signing() -> Vec<(String, String)> {
     let miss_flag_cb = miss_flag.clone();
     dy.set_unmapped_mem_callback(move |dy: &Dynarmic<()>, addr: u64, _size: usize, _value: u64| -> bool {
         let page = addr & !0xFFF;
-        if page >= 0x7000_0000 && page < 0x8000_0000_0000 {
-            let mut pages = mp.lock().unwrap();
-            let is_new = pages.insert(page);
-            if is_new {
-                eprintln!("[MISS] addr=0x{:x} page=0x{:x} (#{} missing)", addr, page, pages.len());
-            }
+        let pc = dy.reg_read_pc().unwrap_or(0);
+        eprintln!("[MISS] addr=0x{:x} page=0x{:x} pc=0x{:x}", addr, page, pc);
+        if page < 0x8000_0000_0000 {
+            mp.lock().unwrap().insert(page);
         }
-        // Signal main loop to stop — don't map, let C code return 0/halt
         miss_flag_cb.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = dy.emu_stop();
         false

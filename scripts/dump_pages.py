@@ -19,6 +19,23 @@ with open(pages_file) as f:
             if 0x1000 <= addr <= 0x800000000000:
                 pages.append(addr)
 
+# Filter out frida-agent pages
+maps_raw = subprocess.check_output(
+    ["adb", "shell", f"su 0 cat /proc/{pid}/maps"], timeout=5
+).decode()
+frida_ranges = []
+for line in maps_raw.splitlines():
+    if "frida" in line.lower():
+        parts = line.split()
+        r = parts[0].split("-")
+        frida_ranges.append((int(r[0], 16), int(r[1], 16)))
+if frida_ranges:
+    before = len(pages)
+    pages = [p for p in pages if not any(s <= p < e for s, e in frida_ranges)]
+    skipped = before - len(pages)
+    if skipped:
+        print(f"Skipped {skipped} frida-agent pages")
+
 if not pages:
     print("No missing pages")
     sys.exit(0)

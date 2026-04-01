@@ -45,6 +45,44 @@ Interceptor.attach(m.base.add(0x286DF4), {
             console.log('STACK_ERROR:' + e);
         }
 
+        // Capture TPIDR_EL0 via inline assembly
+        try {
+            var code = Memory.alloc(Process.pageSize);
+            Memory.patchCode(code, 8, function(c) {
+                c.writeByteArray([
+                    0x40, 0xD0, 0x3B, 0xD5,  // MRS X0, TPIDR_EL0
+                    0xC0, 0x03, 0x5F, 0xD6   // RET
+                ]);
+            });
+            var readTpidr = new NativeFunction(code, 'pointer', []);
+            var tpidr = readTpidr();
+            console.log('REG:tpidr_el0:' + tpidr);
+
+            // Dump TLS page (4KB around TPIDR_EL0)
+            var tlsBase = tpidr.and(ptr('0xFFFFFFFFFFFFF000'));
+            try {
+                var fd = new File('/data/local/tmp/tls_dump.bin', 'wb');
+                // Write base address first (8 bytes LE)
+                var header = Memory.alloc(8);
+                header.writeU64(uint64(tlsBase.toString()));
+                fd.write(header.readByteArray(8));
+                // Dump 16KB around TPIDR
+                for (var pg = -2; pg < 2; pg++) {
+                    try {
+                        fd.write(tlsBase.add(pg * 4096).readByteArray(4096));
+                    } catch(e) {
+                        fd.write(new ArrayBuffer(4096));
+                    }
+                }
+                fd.close();
+                console.log('TLS_DUMPED:base=' + tlsBase + ' tpidr=' + tpidr);
+            } catch(e) {
+                console.log('TLS_ERROR:' + e);
+            }
+        } catch(e) {
+            console.log('TPIDR_ERROR:' + e);
+        }
+
         console.log('REGS_CAPTURED');
     }
 });

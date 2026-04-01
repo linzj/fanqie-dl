@@ -137,19 +137,43 @@ Java 层:
 | sub_243C34 | MD5 hash | - | 标准 MD5 |
 | sub_167E54 | XOR string decrypt | - | `out[i] = enc[i] ^ key[i]` |
 
-### 签名调用链
+### 签名调用链（2026-04-02 修正）
 
 ```
-JNI_OnLoad (0x2873F4)
-  → sub_168324 (初始化/注册)
-    → callback sub_2884AC
+Java:
+  r4.onCallToAddSecurityFactor(url, headersMap)
+    → y2.a(tag=0x3000001, type=0, handle, url, headersArray)
+      → SO+0x26e684 (JNI native 入口，通过 RegisterNatives 注册)
 
-签名请求:
-  sub_29CCD4 (签名入口)
-    → sub_29CF58 (签名分发器, CFF混淆)
-      → sub_283748 (大签名函数, 5956字节, CFF混淆)
-        ↑ 在vtable 0x35DCA0
+SO 内部:
+  SO+0x26e684: JNI thunk — 重排参数 + CFF obfuscated dispatch
+    rearranges: x0=tag, x1=JNIEnv, x2=type, x3=handle, x4=url, x5=extra
+    → obfuscated dispatch (BR X0, based on tag)
+      → ... → SO+0x2869f0 (CFF 签名函数，包含 0x286DF4)
+        → 内部调用 MD5, SHA-1, AES, CREATE_BUF, MAP_SET 等
+
+返回:
+  String[] 键值对 → 包含 X-Helios, X-Medusa 等
 ```
+
+**之前 IDA 分析的调用链 (sub_29CCD4 → sub_29CF58 → sub_283748) 未被实际调用！**
+Frida hook 验证：sub_29CCD4, sub_283748, sub_29CF58 在签名过程中 0 次命中。
+
+### y2.a JNI 函数签名
+
+```java
+public static native Object y2.a(int tag, int type, long handle, String url, Object extra)
+```
+
+| 参数 | JNI 寄存器 | 重排后 | 含义 |
+|------|-----------|--------|------|
+| JNIEnv* | x0 | x1 | JNI 环境指针 |
+| jclass | x1 | (dropped) | 类引用 |
+| tag | x2 | x0 | `0x3000001` = 签名 |
+| type | x3 | x2 | `0` |
+| handle | x4 | x3 | MetaSec native handle |
+| url | x5 | x4 | 请求 URL (jstring) |
+| extra | x6 | x5 | headers 数组 (jobject) |
 
 ### sub_283748 内部调用分析
 
@@ -727,36 +751,74 @@ Medusa body: 960 bytes total, 272 from AES, 664 unaccounted
 3. Emulator 的 unmapped callback 记录缺页，设 miss_flag 停止执行
 4. 典型 8 次迭代完成所有缺页补 dump（libc、libc++、liblog 等）
 
-#### 当前状态
+#### 当前状态 (2026-04-02)
 
-**emulator 框架完全工作**：
-- 加载 memdump → 设寄存器 → patch LSE → 执行 → syscall 处理 → 缺页迭代 — 全链路通
-- 0.1 秒内完成执行，0 retries，20 个 SVC（全是 LSE atomic）
-- 56 个 memory ranges，30MB mapped，1763 个 LSE 指令被 patch
+**emulator 框架工作，但函数入口和调用上下文未正确建立。**
 
-**当前问题：函数 0.1 秒返回，没有执行签名逻辑**
-- 20 个 SVC 全是 LSE atomic（libc 初始化），没有任何 syscall（clock_gettime/mmap）
-- MAP_SET hook 没被触发 — CFF 签名代码根本没执行
-- 可能原因：
-  1. **输入数据不完整** — x0 指向栈上的 URL 字符串对象，但该对象的 data_ptr 可能指向堆（堆内存未 dump）
-  2. **Stack canary 异常** — canary 值 0x79e89c4848 看起来像地址不像随机值，可能导致 __stack_chk_fail
-  3. **前置条件检查失败** — 函数内部某个 null/size 检查失败导致 early return
+##### 已解决
+- dynarmic JIT 全链路通：加载 memdump → 设寄存器 → patch LSE → 执行 → syscall 处理 → 缺页迭代
+- TPIDR_EL0 可从 `/proc/pid/maps` 计算：`stack_and_tls_rw_end - 0x3580`（已验证偏移固定）
+- Stack canary 在真实 TPIDR 下正确
+- dump_pages.py 过滤 Frida agent 页面
+
+##### Frida 污染问题（已定位，已有方案）
+- Frida attach 后进程内残留 `memfd:frida-agent-64.so` 映射
+- Frida 触发签名（`Java.choose → onCallToAddSecurityFactor`）的调用链经过 Frida 自身代码
+- 栈/堆中的函数指针指向 Frida agent → emulator 执行到这些指针时跳入 Frida 代码 → null call
+- 自然触发（用户操作 app）可避免 Frida 调用链污染
+- 但 Frida attach 本身仍会修改进程内部分函数指针
+
+##### 方案：完全离线 emulator（不依赖 Frida 运行时状态）
+- SO 代码：从 APK 或干净进程的 `/proc/pid/mem` 读取
+- TPIDR_EL0：从 `/proc/pid/maps` 计算
+- SP：自己分配
+- libc 等系统库：从设备 `/system/lib64/` 或干净进程 dump
+- **关键待解决**：函数调用签名（x0 参数是什么？从哪个 vtable 调用？）
+
+##### 函数分析
+- **SO+0x286DF4 不是函数入口**，是 CFF 函数内部的一个 basic block
+- **SO+0x2869f0** 是包含 0x286DF4 的函数入口（STP X29,X30,[SP,#-0x60]!, CFF 混淆）
+- SO+0x2869f0 无直接 BL 调用者，无数据段指针引用 → 通过 BLR 间接调用
+- ISSUE.md 之前列的调用链 sub_29CCD4 → sub_29CF58 → sub_283748 **未被实际调用**（Frida 验证）
+- 只有 SO+0x286DF4 和 0x16aa4c（通用工具函数，765次调用）被命中
+
+##### 已完成
+- ✅ Hook RegisterNatives → 找到 `y2.a` native 入口 = **SO+0x26e684**
+- ✅ 解码 JNI thunk 参数重排逻辑
+- ✅ 确认之前 IDA 分析的调用链 (sub_29CCD4→sub_283748) 不正确
+- ✅ TPIDR_EL0 = `stack_and_tls_rw_end - 0x3580`（偏移固定，已验证）
+
+##### 当前问题
+1. **Frida 污染**：Frida attach 后进程残留 agent 映射，函数指针被修改，emulator 执行时跳入 Frida 代码
+2. **不能用 Frida 触发签名**：Frida 触发的调用链经过 Frida 自身代码，栈上残留 Frida 指针
+3. **不能用 lldb/ptrace**：app 有反调试，ptrace attach 后进程挂起
+4. **函数入口确认但调用上下文未建立**：知道 SO+0x26e684 的参数签名，但需要构造 JNIEnv、handle 等
+
+##### 目标：完全离线 emulator
+不依赖运行时进程状态，自己构造所有参数：
+1. **SO 代码**：从 APK 直接读取（或干净进程 /proc/pid/mem）
+2. **系统库**（libc 等）：从设备 /system/lib64/ 拷贝或干净进程 dump
+3. **TPIDR_EL0**：从 /proc/pid/maps 计算
+4. **JNIEnv**：构造 fake JNI 函数表（只实现签名函数用到的 JNI 方法）
+5. **handle**：从 Java 层获取 MetaSec native handle 值
+6. **url**：构造 fake jstring
+7. **extra**：构造 fake headers 数组
+
+##### 下一步
+1. **构造 fake JNIEnv** — 实现签名函数需要的 JNI 方法（NewStringUTF, GetStringUTFChars, FindClass 等）
+2. **获取 handle 值** — Frida 读取 MetaSec 实例的 native handle
+3. **从 SO+0x26e684 入口开始执行** — tag=0x3000001, type=0, 伪造的 JNIEnv+url+extra
 
 #### 文件
 
-- `lib/memdump.bin` — 迭代 dump 的进程内存（~30MB）
-- `lib/regs_only.txt` — 寄存器 dump（SO+0x286DF4 入口点）
+- `lib/memdump.bin` — 进程内存 dump
+- `lib/regs_only.txt` — 寄存器 dump
 - `src/signer/emulator.rs` — dynarmic JIT 模拟器实现
-- `dynarmic-sys-local/` — 本地 patched dynarmic（null page_table、MemoryReadCode callback、ClearHalt 修复）
-- `scripts/dump_so_only.py` — 快速 SO dump（/proc/pid/mem）
-- `scripts/dump_pages.py` — 迭代缺页 dump（按模块级别）
-- `scripts/dump_regs_and_stack.js` — Frida CLI 抓寄存器
-
-#### 下一步
-
-1. **★ 分析函数 early return 原因** — 在 SO+0x286DF4 入口处 dump x0 指向的完整数据结构，确认 URL 字符串是否可读
-2. **dump 堆内存** — x0 等寄存器指向的堆区域可能需要额外 dump
-3. **观察执行路径** — 加 PC trace 看函数走了哪些 basic block，确认是 early return 还是 crash
+- `dynarmic-sys-local/` — patched dynarmic FFI
+- `scripts/dump_so_only.py` — /proc/pid/mem dump SO+栈
+- `scripts/dump_pages.py` — 迭代缺页 dump（过滤 Frida 页面）
+- `scripts/dump_regs_wait.js` — Frida hook 等待自然触发
+- `scripts/dump_regs_deadlock.js` — Frida hook + 死锁线程用于 dump
 
 ## Helios 生成流程破解 (2026-03-31, 第五轮)
 
