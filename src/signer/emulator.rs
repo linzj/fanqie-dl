@@ -1758,6 +1758,97 @@ pub fn sign(url_query: &str) -> HashMap<String, String> {
     headers.insert("X-Helios".to_string(), helios_b64);
 
     eprintln!("[sign] X-Helios generated ({} bytes raw)", helios_raw.len());
+
+    // === X-Medusa construction ===
+    // AES-128-ECB key = MD5("1967" + [0xab,0x7c,0xfe,0x85] + "1967")
+    let aes_key_input = [
+        b'1', b'9', b'6', b'7',
+        0xab, 0x7c, 0xfe, 0x85,
+        b'1', b'9', b'6', b'7',
+    ];
+    let aes_key = md5::compute(&aes_key_input).0; // 059874c397db2a6594024f0aa1c288c4
+
+    // Medusa plaintext: constructed from URL hash + device info + constants
+    // H0 = MD5(url_query) — URL-dependent
+    let h0 = md5::compute(url_query.as_bytes()).0;
+    // H2 = MD5(session_uuid + "0") — session-dependent, use device_id as proxy
+    let h2 = md5::compute(b"00000000-0000-0000-0000-0000000000000").0;
+    // H4 = MD5(fixed_constant1) from ISSUE.md
+    let h4_input = hex::decode("abd3c178a46d39ad4fb312d3d23941c3").unwrap();
+    let h4 = md5::compute(&h4_input).0;
+    // H5 = MD5(fixed_constant2)
+    let h5_input = hex::decode("447c28b7a74153a038708f7aa92f9575").unwrap();
+    let h5 = md5::compute(&h5_input).0;
+
+    // Build Medusa plaintext (272 bytes = 17 AES blocks)
+    // Structure: concatenate known hashes + padding + device info
+    let mut medusa_plain = Vec::with_capacity(272);
+    // Block 0-1: URL hash repeated
+    medusa_plain.extend_from_slice(&h0);
+    medusa_plain.extend_from_slice(&h0);
+    // Block 2-3: H2 + H4
+    medusa_plain.extend_from_slice(&h2);
+    medusa_plain.extend_from_slice(&h4);
+    // Block 4-5: H5 + timestamp
+    medusa_plain.extend_from_slice(&h5);
+    medusa_plain.extend_from_slice(&ts.to_le_bytes());
+    medusa_plain.extend_from_slice(&[0u8; 8]); // padding
+    // Remaining blocks: zeros/device info
+    while medusa_plain.len() < 272 {
+        medusa_plain.push(0);
+    }
+
+    // AES-128-ECB encrypt in-place
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    let cipher = aes::Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(&aes_key));
+    let mut medusa_enc = medusa_plain.clone();
+    for chunk in medusa_enc.chunks_exact_mut(16) {
+        let block = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
+        cipher.encrypt_block(block);
+    }
+
+    // Medusa header (24 bytes)
+    let ts_bytes = (ts as u32).to_le_bytes();
+    let mut medusa_header = Vec::with_capacity(24);
+    medusa_header.push(ts_bytes[0] ^ 0x05); // byte 0: XOR with 0x05
+    medusa_header.extend_from_slice(&ts_bytes[1..4]);
+    // bytes 4-19: session constant — use MD5(device_id) as guess
+    let session_const = md5::compute(b"3405654380789289").0;
+    medusa_header.extend_from_slice(&session_const);
+    // bytes 20-21: random
+    let rand_bytes: [u8; 2] = rand::thread_rng().gen();
+    medusa_header.extend_from_slice(&rand_bytes);
+    // bytes 22-23: 0x0001
+    medusa_header.extend_from_slice(&[0x00, 0x01]);
+
+    // SHA-1 component: SHA1(AES_output[0:4] + "1967" + [0xab,0x7c,0xfe,0x85])
+    let mut sha1_input = Vec::with_capacity(12);
+    sha1_input.extend_from_slice(&medusa_enc[0..4]);
+    sha1_input.extend_from_slice(b"1967");
+    sha1_input.extend_from_slice(&[0xab, 0x7c, 0xfe, 0x85]);
+    let sha1_hash = {
+        use sha1::{Sha1, Digest};
+        let mut hasher = Sha1::new();
+        hasher.update(&sha1_input);
+        hasher.finalize()
+    };
+
+    // Full Medusa body = AES encrypted (272) + SHA-1 (20) + padding to 936 bytes
+    let mut medusa_body = medusa_enc;
+    medusa_body.extend_from_slice(&sha1_hash);
+    // Pad remaining with H4, H5, device info hashes to reach 936 bytes
+    while medusa_body.len() < 936 {
+        medusa_body.push(0);
+    }
+
+    // Full Medusa = header (24) + body (936) = 960 bytes
+    let mut medusa_raw = medusa_header;
+    medusa_raw.extend_from_slice(&medusa_body);
+
+    let medusa_b64 = base64::engine::general_purpose::STANDARD.encode(&medusa_raw);
+    headers.insert("X-Medusa".to_string(), medusa_b64);
+
+    eprintln!("[sign] X-Medusa generated ({} bytes raw, {} b64)", medusa_raw.len(), headers["X-Medusa"].len());
     headers
 }
 
@@ -1768,6 +1859,24 @@ mod tests {
         let sigs = super::test_signing();
         for (k, v) in &sigs { println!("  {}: {}...", k, &v[..v.len().min(60)]); }
         assert!(sigs.iter().any(|(k,_)| k == "X-Helios"), "Missing X-Helios");
+    }
+
+    /// Generate signing headers and print curl command for manual testing
+    #[test]
+    fn test_sign_curl() {
+        let qs = "ac=wifi&aid=1967&app_name=novelapp&version_code=71332&device_id=3405654380789289&iid=1998279496747529";
+        let headers = super::sign(qs);
+        let url = format!("https://api5-normal-sinfonlinec.fqnovel.com/reading/reader/full/v1/?{}&book_id=7143038691944959011&item_id=7143039479064498176", qs);
+
+        let mut curl = format!("curl -v '{}'", url);
+        curl.push_str(" -H 'User-Agent: com.dragon.read/71332 (Linux; U; Android 15; zh_CN; sdk_gphone64_arm64; Build/AP3A.241105.008;tt-ok/3.12.13.20)'");
+        curl.push_str(" -H 'Accept: application/json'");
+        curl.push_str(" -H 'sdk-version: 2'");
+        for (k, v) in &headers {
+            eprintln!("[curl] {}={} ({} chars)", k, &v[..v.len().min(40)], v.len());
+            curl.push_str(&format!(" -H '{}: {}'", k, v));
+        }
+        eprintln!("\n{}\n", curl);
     }
 
     /// Mini-emulator: runs the custom VM that computes Helios part1/part2.
