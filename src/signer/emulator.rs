@@ -1603,7 +1603,163 @@ pub fn test_signing() -> Vec<(String, String)> {
     sigs
 }
 
-pub fn sign(_url: &str) -> HashMap<String, String> { HashMap::new() }
+/// Compute Helios part1+part2 (32 bytes) using the custom VM.
+/// Input: h1_hex (32 bytes ASCII hex of MD5(R+"1967")) + ts_str ("{ts}-{dev_reg_id}-1967")
+/// Output: 32 bytes (part1 + part2)
+fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
+    use dynarmic_sys::Dynarmic;
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir)).expect("so_code.bin");
+    let so_data1 = std::fs::read(format!("{}/lib/so_data1.bin", dir)).expect("so_data1.bin");
+    let so_data2 = std::fs::read(format!("{}/lib/so_data2.bin", dir)).expect("so_data2.bin");
+
+    let so_base: u64 = 0x6d88_01b0_00;
+    let dy = Arc::new(Dynarmic::<()>::new());
+
+    // Map SO
+    let code_page = so_base & !0xFFF;
+    dy.mem_map(code_page, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3).unwrap();
+    dy.mem_write(so_base, &so_code[..0x348700]).unwrap();
+    let d1 = so_base + 0x34C700;
+    dy.mem_map(d1 & !0xFFF, ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+    dy.mem_write(d1, &so_data1[..0x28F10]).unwrap();
+    let d2 = so_base + 0x379610;
+    dy.mem_map(d2 & !0xFFF, ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+    dy.mem_write(d2, &so_data2[..0x6A460]).unwrap();
+
+    // Stack + halt + TPIDR
+    let stack_base: u64 = 0x7000_0000;
+    dy.mem_map(stack_base, 0x10_0000, 3).unwrap();
+    let sp = stack_base + 0x10_0000 - 0x1000;
+
+    let halt_addr: u64 = 0xDEAD_0000;
+    dy.mem_map(halt_addr, 0x1000, 3).unwrap();
+    for off in (0..0x1000).step_by(4) {
+        dy.mem_write(halt_addr + off, &0xD65F03C0u32.to_le_bytes()).unwrap();
+    }
+
+    let tpidr: u64 = 0x8000_0000;
+    dy.mem_map(tpidr, 0x1000, 3).unwrap();
+    dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+    dy.reg_write_tpidr_el0(tpidr).unwrap();
+
+    // PKCS#7 padding: h1_hex(32) + ts_str(26) = 58 → pad to 64
+    let mut padded = Vec::with_capacity(64);
+    padded.extend_from_slice(h1_hex);
+    padded.extend_from_slice(ts_str);
+    let pad_len = 16 - (padded.len() % 16);
+    let pad_len = if pad_len == 0 { 16 } else { pad_len };
+    padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+
+    let input_addr: u64 = stack_base + 0x200;
+    dy.mem_write(input_addr, &padded).unwrap();
+    let output_addr: u64 = stack_base + 0x400;
+    dy.mem_write(output_addr, &vec![0u8; padded.len()]).unwrap();
+    let workspace: u64 = stack_base + 0x600;
+    dy.mem_write(workspace, &[0u8; 256]).unwrap();
+
+    // Callbacks
+    let miss = Arc::new(AtomicBool::new(false));
+    {
+        let m = miss.clone();
+        dy.set_unmapped_mem_callback(move |d: &Dynarmic<()>, addr: u64, _: usize, _: u64| -> bool {
+            eprintln!("[helios] UNMAPPED 0x{:x}", addr & 0x00FF_FFFF_FFFF_FFFF);
+            m.store(true, std::sync::atomic::Ordering::SeqCst);
+            d.emu_stop().ok();
+            false
+        });
+    }
+    dy.set_svc_callback(|_: &Dynarmic<()>, n: u32, _: u64, _: u64| {
+        eprintln!("[helios] SVC #{:#x}", n);
+    });
+
+    // Run VM for each 16-byte block
+    let entry = so_base + 0x168324;
+    let bytecode = so_base + 0x118F50;
+    let callback = so_base + 0x2884AC;
+
+    for i in 0..(padded.len() / 16) {
+        let off = (i * 16) as u64;
+        let pa = sp - 0x100;
+        dy.mem_write(pa,      &workspace.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 8,  &(input_addr + off).to_le_bytes()).unwrap();
+        dy.mem_write(pa + 16, &(output_addr + off).to_le_bytes()).unwrap();
+
+        let ctx = sp - 0x200;
+        let vm_stk = sp - 0x300 - (i as u64) * 0x200;
+        dy.mem_write(ctx,      &callback.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 8,  &vm_stk.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 16, &0u64.to_le_bytes()).unwrap();
+
+        dy.reg_write_raw(0, bytecode).unwrap();
+        dy.reg_write_raw(1, pa).unwrap();
+        dy.reg_write_raw(2, 0).unwrap();
+        dy.reg_write_raw(3, 0).unwrap();
+        dy.reg_write_raw(4, ctx).unwrap();
+        dy.reg_write_sp(sp).unwrap();
+        dy.reg_write_lr(halt_addr).unwrap();
+
+        dy.reg_write_pc(entry).unwrap();
+        let mut steps = 0u64;
+        loop {
+            let pc = dy.reg_read_pc().unwrap_or(0);
+            if pc == halt_addr || pc == halt_addr + 4 { break; }
+            if miss.load(std::sync::atomic::Ordering::SeqCst) || steps >= 200_000 { break; }
+            dy.emu_step(pc).ok();
+            steps += 1;
+        }
+        miss.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    let mut result = [0u8; 32];
+    dy.mem_read(output_addr, &mut result).unwrap();
+    result
+}
+
+/// Sign a URL query string. Returns headers: X-Helios (and eventually X-Medusa).
+pub fn sign(url_query: &str) -> HashMap<String, String> {
+    use rand::Rng;
+
+    let mut headers = HashMap::new();
+
+    // H0 = MD5(url_query_params)
+    let _h0 = md5::compute(url_query.as_bytes());
+
+    // R = 4 random bytes
+    let r: [u8; 4] = rand::thread_rng().gen();
+
+    // H1 = MD5(R + "1967")
+    let mut h1_input = Vec::with_capacity(8);
+    h1_input.extend_from_slice(&r);
+    h1_input.extend_from_slice(b"1967");
+    let h1 = md5::compute(&h1_input);
+
+    // H1_hex = lowercase hex of H1 (32 bytes ASCII)
+    let h1_hex_str = hex::encode(h1.0);
+    let h1_hex: [u8; 32] = h1_hex_str.as_bytes().try_into().unwrap();
+
+    // ts_str = "{unix_ts}-{device_reg_id}-1967"
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ts_str = format!("{}-1394812046-1967", ts);
+
+    // Compute part1+part2 via VM
+    let parts = vm_compute_helios(&h1_hex, ts_str.as_bytes());
+
+    // Helios = base64(R(4) + part1(16) + part2(16))
+    let mut helios_raw = Vec::with_capacity(36);
+    helios_raw.extend_from_slice(&r);
+    helios_raw.extend_from_slice(&parts);
+
+    use base64::Engine;
+    let helios_b64 = base64::engine::general_purpose::STANDARD.encode(&helios_raw);
+    headers.insert("X-Helios".to_string(), helios_b64);
+
+    eprintln!("[sign] X-Helios generated ({} bytes raw)", helios_raw.len());
+    headers
+}
 
 #[cfg(test)]
 mod tests {

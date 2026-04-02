@@ -133,6 +133,7 @@ impl FanqieClient {
         let full_url = format!("{}/reading/crypt/registerkey?{}", self.base_url, params);
         let ts_ms = Self::now_millis();
 
+        let sig_headers = crate::signer::sign_request(&params);
         let mut req = self.client.post(&full_url).body(body_str);
         req = req
             .header("Content-Type", "application/json")
@@ -140,6 +141,9 @@ impl FanqieClient {
             .header("sdk-version", "2")
             .header("lc", "101")
             .header("X-SS-REQ-TICKET", ts_ms.to_string());
+        for (k, v) in &sig_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
 
         let raw_resp = req.send().await?;
         let status = raw_resp.status();
@@ -210,13 +214,16 @@ impl FanqieClient {
 
         let random_hex: String = format!("{:08x}", rand::thread_rng().gen::<u32>());
 
+        // Sign the URL query string
+        let sig_headers = crate::signer::sign_request(&qs);
+
         let mut last_err = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
             }
 
-            let req = self
+            let mut req = self
                 .client
                 .get(&full_url)
                 .header("Accept", "application/json")
@@ -230,6 +237,9 @@ impl FanqieClient {
                     "x-reading-request",
                     format!("{}-{}", ts_ms, random_hex),
                 );
+            for (k, v) in &sig_headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
 
             match req.send().await {
                 Ok(resp) => {

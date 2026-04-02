@@ -14,14 +14,11 @@
 //! Unknown part (Unicorn emulation):
 //! - Helios part1/part2 generation (CFF inline code)
 
-mod emulator;
+pub mod emulator;
 mod native_exec;
 
 use std::collections::HashMap;
 
-pub fn sign_request(url: &str) -> HashMap<String, String> {
-    // TODO: implement hybrid signing
-    // For now, return empty
-    let _ = url;
-    HashMap::new()
+pub fn sign_request(url_query: &str) -> HashMap<String, String> {
+    emulator::sign(url_query)
 }
