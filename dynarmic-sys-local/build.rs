@@ -83,6 +83,21 @@ fn build_with_cmake() {
         config.generator("Ninja");
     }
 
+    // Pass Boost include dir from env or try vcpkg default location
+    if let Ok(boost_root) = env::var("BOOST_ROOT") {
+        let inc = PathBuf::from(&boost_root).join("include");
+        let inc_str = if inc.exists() { inc.to_str().unwrap().to_string() } else { boost_root.clone() };
+        config.define("Boost_INCLUDE_DIR", &inc_str);
+    } else {
+        // Try vcpkg default location
+        if let Ok(home) = env::var("USERPROFILE") {
+            let vcpkg_inc = PathBuf::from(&home).join("vcpkg/installed/x64-windows/include");
+            if vcpkg_inc.exists() {
+                config.define("Boost_INCLUDE_DIR", vcpkg_inc.to_str().unwrap());
+            }
+        }
+    }
+
     let dst = config
         .no_build_target(true)
         .define("BUILD_TESTING", "OFF")
@@ -137,7 +152,14 @@ fn build_with_cmake() {
 
     // Lazymio(@wtdcode): Dynamic link may break. See: https://github.com/rust-lang/cargo/issues/5077
     println!("cargo:rustc-link-lib=static=dynarmic");
-    if !compiler.is_like_msvc() {
+    if compiler.is_like_msvc() {
+        println!("cargo:rustc-link-lib=static=fmt");
+        println!("cargo:rustc-link-lib=static=mcl");
+        if cfg!(target_arch = "x86_64") {
+            println!("cargo:rustc-link-lib=static=Zycore");
+            println!("cargo:rustc-link-lib=static=Zydis");
+        }
+    } else {
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=static=fmt");

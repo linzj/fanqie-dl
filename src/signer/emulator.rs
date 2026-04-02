@@ -1613,4 +1613,217 @@ mod tests {
         for (k, v) in &sigs { println!("  {}: {}...", k, &v[..v.len().min(60)]); }
         assert!(sigs.iter().any(|(k,_)| k == "X-Helios"), "Missing X-Helios");
     }
+
+    /// Mini-emulator: runs the custom VM that computes Helios part1/part2.
+    ///
+    /// The VM is a register-based bytecode interpreter embedded in libmetasec_ml.so.
+    /// Bytecode at SO+0x118F50, dispatch table in data section, 48 unique handlers.
+    /// Handlers are pure computation (0 external BL calls), so no libc/JNI/handle needed.
+    #[test]
+    fn test_vm_helios() {
+        use dynarmic_sys::Dynarmic;
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+
+        let dir = env!("CARGO_MANIFEST_DIR");
+
+        // --- Load SO sections from IDA-dumped files ---
+        let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir))
+            .expect("Missing lib/so_code.bin — dump from IDA");
+        let so_data1 = std::fs::read(format!("{}/lib/so_data1.bin", dir))
+            .expect("Missing lib/so_data1.bin");
+        let so_data2 = std::fs::read(format!("{}/lib/so_data2.bin", dir))
+            .expect("Missing lib/so_data2.bin");
+
+        // Runtime base address (from IDA)
+        let so_base: u64 = 0x6d88_01b0_00;
+        let code_size = 0x348700usize;
+        let data1_off: u64 = 0x34C700;
+        let data1_size = 0x28F10usize;
+        let data2_off: u64 = 0x379610;
+        let data2_size = 0x6A460usize;
+
+        eprintln!("[vm] SO base=0x{:x}, code={}KB, data={}KB",
+            so_base, code_size/1024, (data1_size+data2_size)/1024);
+
+        // --- Create dynarmic instance ---
+        let dy = Arc::new(Dynarmic::<()>::new());
+
+        // Map SO code section (R-X) — contains handler code + bytecode
+        let code_page = so_base & !0xFFF;
+        let code_map_size = ((code_size + 0xFFF) & !0xFFF) + 0x1000;
+        dy.mem_map(code_page, code_map_size, 3).expect("map code");
+        dy.mem_write(so_base, &so_code[..code_size]).expect("write code");
+        eprintln!("[vm] Mapped code: 0x{:x} +0x{:x}", code_page, code_map_size);
+
+        // Map data sections (RW-) — contains dispatch table ptr + runtime data
+        let d1_addr = so_base + data1_off;
+        let d1_page = d1_addr & !0xFFF;
+        let d1_map = ((d1_addr + data1_size as u64 + 0xFFF) & !0xFFF) - d1_page;
+        dy.mem_map(d1_page as u64, d1_map as usize, 3).expect("map data1");
+        dy.mem_write(d1_addr, &so_data1[..data1_size]).expect("write data1");
+
+        let d2_addr = so_base + data2_off;
+        let d2_page = d2_addr & !0xFFF;
+        let d2_map = ((d2_addr + data2_size as u64 + 0xFFF) & !0xFFF) - d2_page;
+        dy.mem_map(d2_page as u64, d2_map as usize, 3).expect("map data2");
+        dy.mem_write(d2_addr, &so_data2[..data2_size]).expect("write data2");
+        eprintln!("[vm] Mapped data sections");
+
+        // --- Map the external dispatch table ---
+        // off_3948D8 (at so_base + 0x3798D8) contains pointer 0x6d893d68f0
+        // The dispatch table is at 0x6d88367f68 (= off_val + cff_offset)
+        // which is INSIDE data1 — already mapped! ✓
+        // But the raw entries in the table contain absolute addresses that resolve
+        // to handler addresses via: handler = table[opcode] - 0x33DC5
+        // These addresses are already correct since we mapped code at the runtime base.
+
+        // --- Set up stack and VM state ---
+        let stack_base: u64 = 0x7000_0000;
+        let stack_size: usize = 0x10_0000; // 1MB
+        dy.mem_map(stack_base, stack_size, 3).expect("map stack");
+
+        let sp = stack_base + stack_size as u64 - 0x1000; // leave some room at top
+
+        // --- Prepare input data ---
+        // For Helios: H1_hex(32) + ts_str(26) = 58 bytes, PKCS#7 padded to 64
+        // For now, use test data (zeros) — we'll fill in real data once the VM works
+        let mut padded_input = vec![0u8; 64];
+        // Fill with recognizable pattern for debugging
+        for i in 0..64 { padded_input[i] = i as u8; }
+
+        let input_addr = stack_base + 0x200; // input data buffer
+        dy.mem_write(input_addr, &padded_input).expect("write input");
+
+        let output_addr = stack_base + 0x400; // output buffer (32 bytes)
+        dy.mem_write(output_addr, &[0u8; 64]).expect("write output");
+
+        // --- Set up sub_168324 call ---
+        // sub_168324(a1=bytecode, a2=packed_args, a3=0, a4=0, a5=callback_ctx)
+        //
+        // a1 = &bytecode (SO+0x118F50)
+        let bytecode_addr = so_base + 0x118F50;
+
+        // a2 = packed_args: [output_buf, addr, src_data]
+        // For now: [output_addr, 0, input_addr]
+        let packed_args_addr = sp - 0x100;
+        dy.mem_write(packed_args_addr, &output_addr.to_le_bytes()).unwrap();
+        dy.mem_write(packed_args_addr + 8, &0u64.to_le_bytes()).unwrap();
+        dy.mem_write(packed_args_addr + 16, &input_addr.to_le_bytes()).unwrap();
+
+        // a5 = callback context: [callback_func, stack_area_ptr, 0]
+        // callback_func = sub_2884AC (just calls a1(a2), used as exit handler)
+        let callback_func_addr = so_base + 0x2884AC;
+        // stack_area_ptr: needs enough space below for register file (0x130 bytes)
+        let vm_stack_area = sp - 0x300; // plenty of room
+        let callback_ctx_addr = sp - 0x200;
+        dy.mem_write(callback_ctx_addr, &callback_func_addr.to_le_bytes()).unwrap();
+        dy.mem_write(callback_ctx_addr + 8, &vm_stack_area.to_le_bytes()).unwrap();
+        dy.mem_write(callback_ctx_addr + 16, &0u64.to_le_bytes()).unwrap();
+
+        // --- HALT page: when VM returns, it will RET to LR ---
+        let halt_addr: u64 = 0xDEAD_0000;
+        dy.mem_map(halt_addr, 0x1000, 3).expect("map halt");
+        // Fill with RET instructions
+        let ret_insn = 0xD65F03C0u32.to_le_bytes();
+        for off in (0..0x1000).step_by(4) {
+            dy.mem_write(halt_addr + off, &ret_insn).unwrap();
+        }
+
+        // TPIDR_EL0 setup (handlers read stack canary from TPIDR_EL0+0x28)
+        let tpidr_area: u64 = 0x8000_0000;
+        dy.mem_map(tpidr_area, 0x1000, 3).expect("map tpidr");
+        dy.mem_write(tpidr_area + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+        dy.reg_write_tpidr_el0(tpidr_area).unwrap();
+
+        // --- Set ARM64 registers ---
+        dy.reg_write_raw(0, bytecode_addr).unwrap();      // X0 = a1 = bytecode
+        dy.reg_write_raw(1, packed_args_addr).unwrap();    // X1 = a2 = packed args
+        dy.reg_write_raw(2, 0).unwrap();                   // X2 = a3 = 0
+        dy.reg_write_raw(3, 0).unwrap();                   // X3 = a4 = 0
+        dy.reg_write_raw(4, callback_ctx_addr).unwrap();   // X4 = a5 = callback ctx
+        dy.reg_write_sp(sp).unwrap();
+        dy.reg_write_lr(halt_addr).unwrap();
+
+        let entry_pc = so_base + 0x168324; // sub_168324 entry
+        eprintln!("[vm] Entry PC=0x{:x}, SP=0x{:x}", entry_pc, sp);
+        eprintln!("[vm] Bytecode at 0x{:x}, input at 0x{:x}, output at 0x{:x}",
+            bytecode_addr, input_addr, output_addr);
+
+        // --- Set up SVC + unmapped memory callbacks ---
+        let miss_flag = Arc::new(AtomicBool::new(false));
+        let miss_addr = Arc::new(Mutex::new(0u64));
+        {
+            let miss_flag2 = miss_flag.clone();
+            let miss_addr2 = miss_addr.clone();
+            dy.set_unmapped_mem_callback(move |dy_ref: &Dynarmic<()>, addr: u64, _size: usize, _pc: u64| -> bool {
+                // Strip MTE tag
+                let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
+                eprintln!("[vm] UNMAPPED: 0x{:x} (clean=0x{:x})", addr, clean);
+                miss_flag2.store(true, Ordering::SeqCst);
+                *miss_addr2.lock().unwrap() = clean;
+                dy_ref.emu_stop().ok();
+                false
+            });
+        }
+
+        dy.set_svc_callback(|_dy_ref: &Dynarmic<()>, svc_num: u32, _pc: u64, _lr: u64| {
+            eprintln!("[vm] SVC #{:#x} — unexpected!", svc_num);
+        });
+
+        // --- RUN with step counting to find loop ---
+        eprintln!("[vm] Starting VM execution (step analysis)...");
+        let start = std::time::Instant::now();
+        dy.reg_write_pc(entry_pc).unwrap();
+        let mut step_count = 0u64;
+        let max_steps = 50_000u64;
+        let mut pc_hist: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        loop {
+            let pc = dy.reg_read_pc().unwrap_or(0);
+            *pc_hist.entry(pc).or_insert(0) += 1;
+            if step_count < 20 || step_count % 5000 == 0 {
+                eprintln!("[vm] step {}: PC=SO+0x{:x}", step_count, pc.wrapping_sub(so_base));
+            }
+            if pc == halt_addr || pc == halt_addr + 4 { eprintln!("[vm] HALT at step {}", step_count); break; }
+            if miss_flag.load(Ordering::SeqCst) { eprintln!("[vm] UNMAPPED at step {}", step_count); break; }
+            if step_count >= max_steps {
+                eprintln!("[vm] Max {} steps. Top visited PCs:", max_steps);
+                let mut top: Vec<_> = pc_hist.iter().collect();
+                top.sort_by(|a,b| b.1.cmp(a.1));
+                for (pc, cnt) in top.iter().take(10) {
+                    eprintln!("  SO+0x{:x}: {} times", pc.wrapping_sub(so_base), cnt);
+                }
+                break;
+            }
+            if let Err(e) = dy.emu_step(pc) { eprintln!("[vm] Error at SO+0x{:x}: {}", pc.wrapping_sub(so_base), e); break; }
+            step_count += 1;
+        }
+        let elapsed = start.elapsed();
+        let result: Result<(), anyhow::Error> = Ok(());
+
+        let final_pc = dy.reg_read_pc().unwrap_or(0);
+        eprintln!("[vm] Done in {:?}, PC=0x{:x}, result={:?}", elapsed, final_pc, result);
+
+        if miss_flag.load(Ordering::SeqCst) {
+            let addr = *miss_addr.lock().unwrap();
+            eprintln!("[vm] FAILED: unmapped memory access at 0x{:x}", addr);
+        }
+
+        if final_pc == halt_addr || final_pc == halt_addr + 4 {
+            eprintln!("[vm] VM returned normally!");
+            // Read output
+            let mut out = [0u8; 32];
+            dy.mem_read(output_addr, &mut out).unwrap();
+            eprintln!("[vm] Output: {}", hex::encode(&out));
+        }
+
+        // Dump register file state for debugging
+        for i in 0..8 {
+            let val = dy.reg_read(i).unwrap_or(0);
+            eprintln!("[vm] X{} = 0x{:016x}", i, val);
+        }
+        eprintln!("[vm] X19=0x{:x} X20=0x{:x} X28=0x{:x}",
+            dy.reg_read(19).unwrap_or(0),
+            dy.reg_read(20).unwrap_or(0),
+            dy.reg_read(28).unwrap_or(0));
+    }
 }

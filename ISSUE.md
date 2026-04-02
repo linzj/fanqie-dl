@@ -753,7 +753,7 @@ Medusa body: 960 bytes total, 272 from AES, 664 unaccounted
 
 #### 当前状态 (2026-04-02 更新)
 
-##### 已解决
+##### 已解决 (全流程模拟器)
 - ✅ dynarmic JIT 全链路通：加载 memdump → patch LSE → 执行 → syscall 处理 → 缺页迭代
 - ✅ Hook RegisterNatives → 找到 `y2.a` native 入口 = **SO+0x26e684**
 - ✅ 解码 JNI thunk 参数重排逻辑（x0=tag, x1=JNIEnv, x2=type, x3=handle, x4=url, x5=extra）
@@ -977,4 +977,113 @@ timeout 30 frida -U -p $PID -l scripts/hook_aes_alt_entry.js
 
 # ★★ Helios 多样本分析 (含更多组合测试, 但缺少 AES 关联)
 timeout 45 frida -U -p $PID -l scripts/hook_helios_v3.js
+```
+
+## Custom VM 发现 + Mini-Emulator (2026-04-02)
+
+### 重大突破：Helios 算法是自定义字节码虚拟机
+
+通过 IDA Pro MCP 深入分析 CFF 混淆代码，发现 Helios part1/part2 的计算不是 CFF 内联代码，而是一个**自定义字节码 VM 解释器**。
+
+### VM 架构
+
+| 组件 | 地址 | 说明 |
+|------|------|------|
+| VM dispatcher | SO+0x168324 | 初始化 VM state + dispatch first opcode |
+| 字节码 | SO+0x118F50 | ~48 条 32-bit 指令，嵌入 .rodata |
+| Dispatch table | SO data section 0x34CF68 | 64 entries，通过 `*(off_3798D8) + CFF_offset` 间接寻址 |
+| Handler 代码 | SO+0x168324 ~ SO+0x172940 | 48 unique handlers，纯计算 (0 外部 BL 调用) |
+
+### 指令编码
+
+```
+bits[0:5]  = opcode (6 bits, 0-63)
+bits[6:31] = operands (26 bits, format varies per opcode)
+```
+
+### VM 寄存器
+
+- **X28** = register file base (栈上分配, 32 个 64-bit 寄存器, [X28 + idx*8])
+- **X19** = pointer to bytecode pointer (double indirect)
+- **X20** = ADRP page of dispatch table pointer
+- **X4**  = `0xFF5F9EBBF5FE033C` (CFF magic XOR constant)
+- **X5**  = `0x00A061440A061440` (CFF intermediate value)
+- **[X29-8]** = `0x33DC5` (handler address adjustment)
+
+### CFF 地址计算公式 (已验证)
+
+```
+func_addr = address of sub_168324
+mask = 0x10400040400
+base = 0xA060400A021040
+X5 = ((~func_addr & mask | base) + (func_addr & mask))
+cff_offset = (X5 | 0x1010104) ^ 0xFF5F9EBBF5FE033C
+dispatch_table_base = *(off_3798D8) + cff_offset
+handler = dispatch_table_base[opcode * 8] - 0x33DC5
+```
+
+### 字节码内容 (SO+0x118F50, 64 dwords)
+
+```
+11000418 19000018 09000218 30400218 20400018 000002BB 1DDF5035 082070B7
+004B002D 09901851 01021391 31FE02C4 00CC65D1 018C3391 31800018 300C1751
+0903D991 200C1751 002A02BB 0000300D 3088001A 2080001A 07C00791 00000000
+03307BEC 9B83BD86 4358D4F2 7F2353A5 561A4BB4 D000993D D37C6983 72784A5E
+77968400 0B15D49D BC6DDBF8 E961D7B6 2B04B53E 5D5BBBBA EEBAE1AF 1621DAE3
+1F4B9206 31177B0E 8CA7BB11 6DA0C0FE 26F8856C 6A0E29E1 2002F3D4 F27FC5AA
+000000FD 00000000 00000000 00000000 62081EDE A9B18CE4 7468B0C1 1E15609D
+357C7FD0 B366AC0B B14D51B6 4A48726A 00000000 00000000 00000000 00000000
+```
+
+Opcode 序列: 24×5, 59, 53, 55, 45, 17×2, 4, 17×2, 24, 17×2, 59, 13, 26×2, 17, 0, ...
+
+### Handler 分类
+
+| Opcode | Handler offset | 大小 | 核心操作 |
+|--------|---------------|------|---------|
+| 0  | 0x16F9B8 | 244B | 1 RF read + 1 RF write (register op) |
+| 1  | 0x170270 | 216B | 1 RF read + 1 RF write |
+| 17 | 0x16855C | **13KB** | 205 RF ops, 50 BR jumps (★ 核心计算) |
+| 24 | 0x16F8E0 | 216B | LOAD: `reg[dst] = *(reg[src] + imm16)` |
+| 5  | 0x172440 | 512B | 17 opcodes 共用 (unused/exit handler) |
+
+OP 17 (13KB, 3074 条指令) 是核心计算 handler，在字节码中出现 8 次。**纯计算，0 个外部 BL 调用。**
+
+### Mini-Emulator 方案 ✅ 已验证
+
+由于 VM handler 是纯计算（不调用外部函数），可以单独运行，不需要 libc/JNI/handle：
+
+1. 加载 SO code+data 段到 dynarmic（映射在原始运行时地址）
+2. 调用 `sub_168324(bytecode, packed_args, 0, 0, callback_ctx)`
+3. VM 自行执行 37368 步后正常返回（78ms）
+
+```
+test_vm_helios() 在 emulator.rs 中：
+  - 加载 lib/so_code.bin (3.3MB) + so_data1.bin + so_data2.bin
+  - 映射在运行时地址 0x6d8801b000
+  - 设置栈 + TPIDR_EL0 + 输入数据
+  - sub_168324 入口执行
+  - 37368 步 / 78ms 正常返回到 HALT 地址 ✅
+```
+
+### Windows 构建修复
+
+- `build.rs`: macOS-only 代码加 `#[cfg(target_os = "macos")]` 条件编译
+- `dynarmic-sys-local/build.rs`: 自动检测 vcpkg Boost 路径 (`Boost_INCLUDE_DIR`)
+- `dynarmic-sys-local/build.rs`: MSVC 需要链接 fmt/mcl/Zycore/Zydis 静态库
+- `mman.h`: 添加 `MAP_NORESERVE` 定义 + `madvise` stub
+
+### 下一步
+
+1. **填入真实 Helios 输入数据** — 需要一组完整 Frida 样本 (R, H1_hex, ts_str, part1, part2)
+2. **验证 VM 输出** — 对比 emulator 输出与 Frida 捕获的 part1/part2
+3. **集成到签名流程** — 把 VM emulator 集成到 `sign()` 函数中
+
+### 导出文件 (lib/)
+
+```
+so_code.bin    — SO code section (3.3MB, 从运行时 dump 的 IDB 导出)
+so_data1.bin   — data segment 1 (164KB)
+so_data2.bin   — data segment 2 (425KB)
+vm_meta.txt    — VM 元数据 (地址偏移等)
 ```
