@@ -1861,22 +1861,71 @@ mod tests {
         assert!(sigs.iter().any(|(k,_)| k == "X-Helios"), "Missing X-Helios");
     }
 
-    /// Generate signing headers and print curl command for manual testing
+    /// Test actual download with signing
     #[test]
-    fn test_sign_curl() {
-        let qs = "ac=wifi&aid=1967&app_name=novelapp&version_code=71332&device_id=3405654380789289&iid=1998279496747529";
-        let headers = super::sign(qs);
-        let url = format!("https://api5-normal-sinfonlinec.fqnovel.com/reading/reader/full/v1/?{}&book_id=7143038691944959011&item_id=7143039479064498176", qs);
+    fn test_download_chapter() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .user_agent("com.dragon.read/71332 (Linux; U; Android 15; zh_CN; sdk_gphone64_arm64; Build/AP3A.241105.008;tt-ok/3.12.13.20)")
+                .timeout(std::time::Duration::from_secs(15))
+                .build().unwrap();
 
-        let mut curl = format!("curl -v '{}'", url);
-        curl.push_str(" -H 'User-Agent: com.dragon.read/71332 (Linux; U; Android 15; zh_CN; sdk_gphone64_arm64; Build/AP3A.241105.008;tt-ok/3.12.13.20)'");
-        curl.push_str(" -H 'Accept: application/json'");
-        curl.push_str(" -H 'sdk-version: 2'");
-        for (k, v) in &headers {
-            eprintln!("[curl] {}={} ({} chars)", k, &v[..v.len().min(40)], v.len());
-            curl.push_str(&format!(" -H '{}: {}'", k, v));
-        }
-        eprintln!("\n{}\n", curl);
+            let did = "1751989655468474";
+            let iid = "1751989655701946";
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+
+            let qs = format!("ac=wifi&aid=1967&app_name=novelapp&version_code=71332&version_name=7.1.3.32&device_platform=android&os=android&ssmix=a&device_type=sdk_gphone64_arm64&device_brand=google&os_api=35&os_version=15&device_id={}&iid={}&_rticket={}", did, iid, ts);
+
+            let sigs = super::sign(&qs);
+            eprintln!("[test] Helios: {} chars", sigs.get("X-Helios").map(|s| s.len()).unwrap_or(0));
+            eprintln!("[test] Medusa: {} chars", sigs.get("X-Medusa").map(|s| s.len()).unwrap_or(0));
+
+            // Test 1: book detail (simpler endpoint)
+            let url = format!("https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/detail/v1/?{}&book_id=7143038691944959011", qs);
+            let mut req = client.get(&url)
+                .header("Accept", "application/json")
+                .header("sdk-version", "2");
+            for (k, v) in &sigs { req = req.header(k.as_str(), v.as_str()); }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let hdrs: Vec<_> = resp.headers().iter()
+                        .filter(|(k,_)| k.as_str().starts_with("x-"))
+                        .map(|(k,v)| format!("{}={}", k, v.to_str().unwrap_or("?")))
+                        .collect();
+                    let body = resp.text().await.unwrap_or_default();
+                    eprintln!("[test] detail: status={}, body_len={}, x-headers={:?}",
+                        status, body.len(), hdrs);
+                    if !body.is_empty() {
+                        eprintln!("[test] body: {}...", &body[..body.len().min(300)]);
+                    }
+                }
+                Err(e) => eprintln!("[test] request error: {}", e),
+            }
+
+            // Test 2: chapter content
+            let qs2 = format!("{}&book_id=7143038691944959011&item_id=7143039479064498176", qs);
+            let sigs2 = super::sign(&qs2);
+            let url2 = format!("https://api5-normal-sinfonlinec.fqnovel.com/reading/reader/full/v1/?{}", qs2);
+            let mut req2 = client.get(&url2)
+                .header("Accept", "application/json")
+                .header("sdk-version", "2");
+            for (k, v) in &sigs2 { req2 = req2.header(k.as_str(), v.as_str()); }
+
+            match req2.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    eprintln!("[test] chapter: status={}, body_len={}", status, body.len());
+                    if !body.is_empty() {
+                        eprintln!("[test] body: {}...", &body[..body.len().min(300)]);
+                    }
+                }
+                Err(e) => eprintln!("[test] chapter error: {}", e),
+            }
+        });
     }
 
     /// Mini-emulator: runs the custom VM that computes Helios part1/part2.
