@@ -79,30 +79,71 @@
 ## 文件结构
 
 ```
-src/signer/emulator.rs     — dynarmic 模拟器主代码
+src/signer/emulator.rs     — dynarmic 模拟器主代码 (~1600 行)
+  - fake JNIEnv (232 SVC stub)
+  - JNI 函数实现 (NewStringUTF, getBytes, GetByteArrayRegion 等)
+  - MTE tagged pointer 处理（unmapped callback 中 strip top byte）
+  - handle_dump.bin 加载 + 自动缺页处理
+  - 迭代执行框架
 dynarmic-sys-local/         — patched dynarmic FFI
-  vendor/dynarmic/dynarmic.cpp  — C 端修改（null page_table, MemoryReadCode callback, ClearHalt, invalidate_cache）
-  vendor/dynarmic/dynarmic.h    — PAGE_TABLE_ADDRESS_SPACE_BITS=40
-  src/lib.rs                    — Rust wrapper（null page_table, invalidate_cache API）
+  vendor/dynarmic/dynarmic.cpp  — 修改:
+    - null page_table (hash map 模式)
+    - MemoryReadCode/MemoryRead32 unmapped callback + HaltExecution
+    - ClearHalt (MemoryAbort + CacheInvalidation)
+    - MTE strip_tag (所有 MemoryRead/Write 函数)
+    - emu_step (单步执行 API)
+  vendor/dynarmic/dynarmic.h    — PAGE_TABLE_ADDRESS_SPACE_BITS=40, emu_step 声明
+  src/lib.rs                    — Rust wrapper (null page_table, invalidate_cache, emu_step)
   src/ffi.rs                    — FFI 声明
 scripts/
-  dump_so_only.py           — /proc/pid/mem 快速 dump SO+栈
+  dump_clean.py             — /proc/pid/mem 快速 dump (SO + libc + libc++ 等)
   dump_pages.py             — 迭代缺页 dump（按模块级别，自动过滤 Frida 页面）
-  dump_regs_wait.js         — Frida hook 等待自然触发签名
-  dump_regs_deadlock.js     — Frida hook + 死锁线程用于 dump
+  get_handle.js             — Frida hook y2.a 获取 handle 地址 + hex dump
+  parse_handle_dump.py      — 解析 get_handle.js 输出，生成 handle_dump.bin
   hook_register_natives.js  — Hook RegisterNatives 找 JNI native 入口
 lib/
   memdump.bin               — 进程内存 dump
-  regs_only.txt             — 寄存器 dump
+  handle_dump.bin           — MetaSec handle 对象 (addr + data)
+  regs_only.txt             — TPIDR_EL0
+  frida_ranges.txt          — Frida agent 地址范围（空文件 = 干净进程）
 ```
 
 ## 签名函数入口
 
 - **JNI native 入口**: `SO+0x26e684` — `y2.a(int tag, int type, long handle, String url, Object extra)`
 - tag=`0x3000001` 对应签名功能
-- 函数内部重排参数后通过 CFF obfuscated dispatch 跳转到签名逻辑
-- **SO+0x2869f0** 是实际签名 CFF 函数（包含 0x286DF4 等 basic block）
 - 之前 IDA 分析的 sub_29CCD4 → sub_283748 调用链**未被实际调用**
+
+### SO+0x26e684 内部流程（已 trace 确认）
+
+```
+0x26e684: 参数重排 (x0=JNIEnv→x1, x2=tag→x0, x3=type→x2, x4=handle→x3, x5=url→x4, x6=extra→x5)
+0x26e69c: SUB SP, SP, #0x50; 保存所有参数到栈
+0x26e6b4: BL thunk → 获取 PC 值（反分析技巧）
+0x26e6c0: BR X1 → 跳转到 0x26e6f0
+0x26e6f0: 恢复参数; B 0x1734f8 (CFF dispatcher)
+```
+
+### CFF Dispatcher (0x1734f8)
+
+- 大函数 (~3KB CFF code)
+- 初始状态 0xFE，通过 MADD 计算 hash 做 switch-case
+- 保存参数到 callee-saved 寄存器: X25=tag, X24=JNIEnv, X22=handle, X21=url, X20=extra
+- 读取 TPIDR_EL0 + 0x28 设置 stack canary
+- 调用 sub_17B96C (顶层编排)
+- sub_17B96C 通过 vtable 调用签名核心
+
+### handle 对象结构
+
+handle 是 MetaSec C++ 对象 (~4KB)，内部有 0x40 字节为一组的条目数组，每组含：
+- +0x00: 指针（vtable 或堆对象）
+- +0x08: 数据/指针
+- +0x30: 类型标记（0x03010300 或 0x03810200）
+- +0x34: 某种 ID/hash（每个条目不同）
+- +0x38: SO 数据段指针（如 SO+0x34c738）
+- +0x3C: 常量 0x4000
+
+**关键约束**: handle 的所有指针必须来自同一个活着的进程，不能跨进程重用。
 
 ## TPIDR_EL0 计算
 
@@ -112,13 +153,63 @@ TPIDR_EL0 = stack_and_tls_rw_end - 0x3580
 ```
 偏移 0x3580 在 Android 15 上固定（已多次验证）。
 
+## MTE / Tagged Pointers
+
+- Android 15 使用 MTE (Memory Tagging Extension)，指针 top byte 携带 tag（如 `0xb400007cdb88bd08`）
+- dynarmic 不自动处理 TBI (Top Byte Ignore)
+- **解决**: `dynarmic.cpp` 所有 `MemoryRead*` 和 `MemoryWrite*` 函数开头加 `vaddr = strip_tag(vaddr)`
+- `strip_tag` = `vaddr & 0x00FFFFFFFFFFFFFF`
+- Rust 端 unmapped callback 也要 strip
+
 ## Frida 注意事项
 
 - Frida attach 后进程残留 `memfd:frida-agent-64.so` 映射，杀 frida-server 不会卸载
-- 迭代 dump 时 `dump_pages.py` 自动过滤 Frida agent 地址范围的页面
+- `frida -U -p PID` attach 模式：app 有反 Frida 检测，进程很快崩溃
+- `frida -f com.dragon.read` spawn 模式：可用，但 bytehook 会修改 libc 函数入口
 - **不能用 Frida 触发签名**——调用链经过 Frida 代码，栈上残留 Frida 指针污染 emulator
-- 自然触发（用户操作 app）可避免调用链污染
 - lldb/ptrace 会被 app 反调试检测到，进程挂起
+
+### bytehook 污染详情
+
+- libbytehook.so 随 SO 加载，hook libc 函数入口（替换前几条指令为 branch 到 trampoline）
+- trampoline 跳转到 Frida agent 代码（当 Frida attach 时）
+- 影响范围：libc 代码段（函数入口字节）+ libc GOT（函数指针）
+- **替换 libc 代码段不够** — GOT 表也被修改了
+- 被 hook 的函数包括 malloc/free/pthread 等关键函数，跳过它们导致 Scudo 分配器崩溃
+
+## 已验证的错误方向（不要重复）
+
+1. **跨进程 handle 重用** — handle 内的堆指针/库指针在不同进程中无效，即使重定位了 SO 指针
+2. **Frida 页面填 RET** — 被 hook 的是 malloc/free 等关键函数，跳过导致 Scudo 崩溃
+3. **只替换 libc 代码段** — GOT 仍指向 Frida agent，内部间接调用走错路径
+4. **code fetch 时分配堆返回** — 不是所有被跳过的函数都是 malloc，错误地给非分配函数返回堆指针
+5. **handle=0 或全零** — CFF dispatch 检查 handle 有效性，直接返回 NULL
+
+## Fake JNIEnv
+
+emulator.rs 构造了完整的 JNI 环境：
+
+- 232 个函数 stub（`SVC #(0x600+index); RET`），每个 JNI 函数一个
+- JNIEnv 结构在 0x4000_0000，function table 在 0x4000_0100，stub 代码在 0x4000_1000
+- JNI stack 在 0x4800_0000 (8MB)
+- JNI 对象用 HashMap 跟踪（handle → JniObject enum）
+
+已实现的 JNI 函数：
+- NewStringUTF, GetStringUTFChars, ReleaseStringUTFChars, GetStringUTFLength
+- FindClass, GetMethodID, GetStaticMethodID, GetFieldID
+- CallObjectMethod/V/A, CallStaticObjectMethod（对 String 自动返回 getBytes 结果）
+- GetObjectClass, ExceptionCheck, EnsureLocalCapacity, DeleteLocalRef
+- NewObjectArray, Get/SetObjectArrayElement, GetArrayLength
+- NewByteArray, GetByteArrayElements, GetByteArrayRegion, SetByteArrayRegion
+
+签名函数的 JNI 调用序列（已验证）：
+```
+NewStringUTF("utf-8") → EnsureLocalCapacity → GetObjectClass(url)
+→ GetMethodID("getBytes", "(Ljava/lang/String;)[B")
+→ CallObjectMethodV(url, getBytes, "utf-8") → 返回 byte[]
+→ GetArrayLength → GetByteArrayRegion(byte[], 0, len, buf)
+→ ... 后续 SO 内部处理 ...
+```
 
 ## 重新编译 dynarmic C 代码
 

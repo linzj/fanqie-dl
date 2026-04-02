@@ -751,74 +751,84 @@ Medusa body: 960 bytes total, 272 from AES, 664 unaccounted
 3. Emulator 的 unmapped callback 记录缺页，设 miss_flag 停止执行
 4. 典型 8 次迭代完成所有缺页补 dump（libc、libc++、liblog 等）
 
-#### 当前状态 (2026-04-02)
-
-**emulator 框架工作，但函数入口和调用上下文未正确建立。**
+#### 当前状态 (2026-04-02 更新)
 
 ##### 已解决
-- dynarmic JIT 全链路通：加载 memdump → 设寄存器 → patch LSE → 执行 → syscall 处理 → 缺页迭代
-- TPIDR_EL0 可从 `/proc/pid/maps` 计算：`stack_and_tls_rw_end - 0x3580`（已验证偏移固定）
-- Stack canary 在真实 TPIDR 下正确
-- dump_pages.py 过滤 Frida agent 页面
-
-##### Frida 污染问题（已定位，已有方案）
-- Frida attach 后进程内残留 `memfd:frida-agent-64.so` 映射
-- Frida 触发签名（`Java.choose → onCallToAddSecurityFactor`）的调用链经过 Frida 自身代码
-- 栈/堆中的函数指针指向 Frida agent → emulator 执行到这些指针时跳入 Frida 代码 → null call
-- 自然触发（用户操作 app）可避免 Frida 调用链污染
-- 但 Frida attach 本身仍会修改进程内部分函数指针
-
-##### 方案：完全离线 emulator（不依赖 Frida 运行时状态）
-- SO 代码：从 APK 或干净进程的 `/proc/pid/mem` 读取
-- TPIDR_EL0：从 `/proc/pid/maps` 计算
-- SP：自己分配
-- libc 等系统库：从设备 `/system/lib64/` 或干净进程 dump
-- **关键待解决**：函数调用签名（x0 参数是什么？从哪个 vtable 调用？）
-
-##### 函数分析
-- **SO+0x286DF4 不是函数入口**，是 CFF 函数内部的一个 basic block
-- **SO+0x2869f0** 是包含 0x286DF4 的函数入口（STP X29,X30,[SP,#-0x60]!, CFF 混淆）
-- SO+0x2869f0 无直接 BL 调用者，无数据段指针引用 → 通过 BLR 间接调用
-- ISSUE.md 之前列的调用链 sub_29CCD4 → sub_29CF58 → sub_283748 **未被实际调用**（Frida 验证）
-- 只有 SO+0x286DF4 和 0x16aa4c（通用工具函数，765次调用）被命中
-
-##### 已完成
+- ✅ dynarmic JIT 全链路通：加载 memdump → patch LSE → 执行 → syscall 处理 → 缺页迭代
 - ✅ Hook RegisterNatives → 找到 `y2.a` native 入口 = **SO+0x26e684**
-- ✅ 解码 JNI thunk 参数重排逻辑
-- ✅ 确认之前 IDA 分析的调用链 (sub_29CCD4→sub_283748) 不正确
+- ✅ 解码 JNI thunk 参数重排逻辑（x0=tag, x1=JNIEnv, x2=type, x3=handle, x4=url, x5=extra）
 - ✅ TPIDR_EL0 = `stack_and_tls_rw_end - 0x3580`（偏移固定，已验证）
+- ✅ Fake JNIEnv 框架：232 个 SVC stub，15 个 JNI 函数已实现
+- ✅ JNI 调用正常：NewStringUTF("utf-8") → getBytes → GetByteArrayRegion → 获取 URL 字节
+- ✅ MTE/TBI 支持：dynarmic.cpp 的所有内存回调加了 `strip_tag` 去掉 top byte
+- ✅ `emu_step` 单步 API 用于调试 trace
+- ✅ 迭代缺页 dump 框架稳定（dump_clean.py + dump_pages.py）
+- ✅ Frida spawn 获取 handle 值可用
 
-##### 当前问题
-1. **Frida 污染**：Frida attach 后进程残留 agent 映射，函数指针被修改，emulator 执行时跳入 Frida 代码
-2. **不能用 Frida 触发签名**：Frida 触发的调用链经过 Frida 自身代码，栈上残留 Frida 指针
-3. **不能用 lldb/ptrace**：app 有反调试，ptrace attach 后进程挂起
-4. **函数入口确认但调用上下文未建立**：知道 SO+0x26e684 的参数签名，但需要构造 JNIEnv、handle 等
+##### 核心阻塞：handle 数据的进程一致性问题
 
-##### 目标：完全离线 emulator
-不依赖运行时进程状态，自己构造所有参数：
-1. **SO 代码**：从 APK 直接读取（或干净进程 /proc/pid/mem）
-2. **系统库**（libc 等）：从设备 /system/lib64/ 拷贝或干净进程 dump
-3. **TPIDR_EL0**：从 /proc/pid/maps 计算
-4. **JNIEnv**：构造 fake JNI 函数表（只实现签名函数用到的 JNI 方法）
-5. **handle**：从 Java 层获取 MetaSec native handle 值
-6. **url**：构造 fake jstring
-7. **extra**：构造 fake headers 数组
+**根本矛盾：handle 必须来自 Frida 进程，但 Frida 会污染进程内存。**
 
-##### 下一步
-1. **构造 fake JNIEnv** — 实现签名函数需要的 JNI 方法（NewStringUTF, GetStringUTFChars, FindClass 等）
-2. **获取 handle 值** — Frida 读取 MetaSec 实例的 native handle
-3. **从 SO+0x26e684 入口开始执行** — tag=0x3000001, type=0, 伪造的 JNIEnv+url+extra
+MetaSec native handle 是一个 C++ 对象（~4KB），内部包含：
+- SO 代码指针（vtable 等）→ 可以重定位
+- **堆对象指针**（session state, crypto context 等）→ **无法在不同进程间重用**
+- **其他库指针**（libc++ std::string 等）→ **无法重定位**
+
+已尝试的方案及失败原因：
+
+| 方案 | 结果 | 失败原因 |
+|------|------|----------|
+| handle=0（fake） | 函数 7612 步后返回 NULL | CFF dispatch 检查 handle 有效性 |
+| handle=全零 4KB | 同上 | 同上 |
+| Frida 进程 dump + Frida 范围填 RET | Scudo ERROR: internal map failure | bytehook 修改了 libc 函数入口，RET 跳过了 malloc 等关键函数 |
+| 干净进程 dump + Frida 进程 handle（重定位 SO 指针） | 函数执行但 code fetch miss 不断增长 | handle 内的非 SO 指针（堆/库）全部无效 |
+| 替换 libc 代码段为干净版本 | SP 无限下降（栈溢出） | libc GOT 仍指向 Frida agent，内部调用走错路径 |
+
+##### 错误的尝试（教训）
+
+1. **"完全离线 emulator" 方案过于理想化** — handle 对象不是简单的配置数据，它包含运行时分配的堆指针、动态链接的 vtable 等，**必须来自同一个活着的进程**
+2. **跨进程重用 handle 数据不可行** — 即使重定位了 SO 指针，堆指针、libc++ 对象指针、其他库 vtable 全部无效
+3. **Frida 代码段 + 干净数据段 != 干净进程** — bytehook 不仅修改代码段（函数入口），还修改 GOT 表（数据段中的函数指针）
+4. **Frida 页面填 RET 太粗暴** — 被 hook 的是 malloc/free/pthread 等关键函数，跳过它们会导致内存分配器崩溃
+
+##### 正确的方向
+
+**必须从同一个进程获取所有数据**：内存 dump + handle + 系统库，全部来自同一 PID。
+
+可行方案：
+1. **`frida -f` spawn + 同进程完整 dump** — 用 Frida spawn app，在同一进程中读取 handle 并 dump 全部内存。然后用 `/apex/.../libc.so` 的干净代码替换 libc 代码段 **和** GOT 表
+2. **构造最小化 handle** — 逆向 handle 结构，只填入签名需要的字段（session UUID, device ID, crypto keys），不需要真实堆指针
+3. **on-device 执行** — 放弃 emulator，在设备上直接 `dlopen` SO 并调用签名函数
+
+##### 当前进程环境
+
+- App: `com.dragon.read` v7.1.3.32
+- 反调试：ptrace/lldb 会被检测，进程挂起
+- 反 Frida：`frida -U -p PID` attach 后进程很快崩溃（杀 frida-server 时连带崩）
+- `frida -f` spawn 可用，但进程内有 bytehook trampolines
+- bytehook (libbytehook.so) 修改 libc 函数入口跳转到 Frida agent
 
 #### 文件
 
-- `lib/memdump.bin` — 进程内存 dump
-- `lib/regs_only.txt` — 寄存器 dump
-- `src/signer/emulator.rs` — dynarmic JIT 模拟器实现
-- `dynarmic-sys-local/` — patched dynarmic FFI
-- `scripts/dump_so_only.py` — /proc/pid/mem dump SO+栈
-- `scripts/dump_pages.py` — 迭代缺页 dump（过滤 Frida 页面）
-- `scripts/dump_regs_wait.js` — Frida hook 等待自然触发
-- `scripts/dump_regs_deadlock.js` — Frida hook + 死锁线程用于 dump
+```
+src/signer/emulator.rs      — dynarmic JIT 模拟器 (~1600 行)，含 fake JNIEnv + MTE + handle 加载
+dynarmic-sys-local/
+  vendor/dynarmic/dynarmic.cpp — MTE strip_tag + emu_step + MemoryReadCode callback
+  src/lib.rs                   — emu_step Rust wrapper
+scripts/
+  dump_clean.py              — /proc/pid/mem 快速 dump（SO + libc + libc++ 等）
+  dump_pages.py              — 迭代缺页 dump（按模块，过滤 Frida）
+  get_handle.js              — Frida hook y2.a 获取 handle + dump 内存
+  get_handle_save.js         — Frida hook 保存 handle 到设备文件
+  parse_handle_dump.py       — 解析 Frida 输出的 handle hex dump
+  hook_register_natives.js   — Hook RegisterNatives 找 JNI native 入口
+  dump_regs_wait.js          — Frida hook 等待自然触发签名
+lib/
+  memdump.bin                — 进程内存 dump（当前是干净进程但 handle 不匹配）
+  handle_dump.bin            — MetaSec native handle dump（来自不同进程，指针无效）
+  regs_only.txt              — TPIDR_EL0
+  frida_ranges.txt           — Frida agent 地址范围
+```
 
 ## Helios 生成流程破解 (2026-03-31, 第五轮)
 

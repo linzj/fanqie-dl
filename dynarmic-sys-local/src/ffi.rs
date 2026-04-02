@@ -118,6 +118,7 @@ extern "C" {
     pub fn reg_read_c13_c0_3(dynarmic: *mut c_void) -> u32;
 
     pub fn dynarmic_emu_start(dynarmic: *mut c_void, pc: u64) -> i32;
+    pub fn dynarmic_emu_step(dynarmic: *mut c_void, pc: u64) -> i32;
 
     pub fn dynarmic_emu_stop(dynarmic: *mut c_void) -> i32;
 

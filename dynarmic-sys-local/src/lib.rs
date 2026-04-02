@@ -241,6 +241,17 @@ impl<'a, T: Clone + Send + Sync> Dynarmic<'a, T> {
         }
     }
 
+    /// Single-step: execute one instruction at the given PC.
+    pub fn emu_step(&self, pc: u64) -> anyhow::Result<()> {
+        unsafe {
+            let ret = ffi::dynarmic_emu_step(self.cur_handle, pc);
+            if ret != 0 {
+                return Err(anyhow!("Failed to step: code={}", ret));
+            }
+            Ok(())
+        }
+    }
+
     /// Invalidates JIT cache for a range of addresses.
     pub fn invalidate_cache(&self, addr: u64, size: u64) {
         unsafe { ffi::dynarmic_invalidate_cache(self.cur_handle, addr, size); }

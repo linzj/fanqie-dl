@@ -58,8 +58,12 @@ public:
     explicit DynarmicCallbacks64(khash_t(memory) *memory)
             : memory{memory} {}
 
+    // Strip MTE/TBI top byte from addresses (Android uses tagged pointers)
+    static inline u64 strip_tag(u64 vaddr) { return vaddr & 0x00FFFFFFFFFFFFFFULL; }
+
     bool IsReadOnlyMemory(u64 vaddr) override { return false; }
     std::optional<std::uint32_t> MemoryReadCode(u64 vaddr) override {
+        vaddr = strip_tag(vaddr);
         u32 *dest = (u32 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) return dest[0];
         // Unmapped code page — try callback, then halt if still unmapped
@@ -74,6 +78,7 @@ public:
     }
 
     u8 MemoryRead8(u64 vaddr) override {
+        vaddr = strip_tag(vaddr);
         u8 *dest = (u8 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) return dest[0];
         if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 1, 0, unmapped_mem_user_data)) {
@@ -83,11 +88,13 @@ public:
         return 0;
     }
     u16 MemoryRead16(u64 vaddr) override {
+        vaddr = strip_tag(vaddr);
         u16 *dest = (u16 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) return dest[0];
         return 0;
     }
     u32 MemoryRead32(u64 vaddr) override {
+        vaddr = strip_tag(vaddr);
         u32 *dest = (u32 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) return dest[0];
         if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 4, 0, unmapped_mem_user_data)) {
@@ -97,31 +104,38 @@ public:
         return 0;
     }
     u64 MemoryRead64(u64 vaddr) override {
+        vaddr = strip_tag(vaddr);
         u64 *dest = (u64 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) return dest[0];
         return 0;
     }
     Dynarmic::A64::Vector MemoryRead128(u64 vaddr) override {
+        vaddr = strip_tag(vaddr);
         return {MemoryRead64(vaddr), MemoryRead64(vaddr + 8)};
     }
 
     void MemoryWrite8(u64 vaddr, u8 value) override {
+        vaddr = strip_tag(vaddr);
         u8 *dest = (u8 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
     }
     void MemoryWrite16(u64 vaddr, u16 value) override {
+        vaddr = strip_tag(vaddr);
         u16 *dest = (u16 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
     }
     void MemoryWrite32(u64 vaddr, u32 value) override {
+        vaddr = strip_tag(vaddr);
         u32 *dest = (u32 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
     }
     void MemoryWrite64(u64 vaddr, u64 value) override {
+        vaddr = strip_tag(vaddr);
         u64 *dest = (u64 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
     }
     void MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) override {
+        vaddr = strip_tag(vaddr);
         MemoryWrite64(vaddr, value[0]);
         MemoryWrite64(vaddr + 8, value[1]);
     }
@@ -658,6 +672,18 @@ FQL int dynarmic_emu_start(dynarmic* d, u64 pc) {
         d->jit64->Run();
     }
     if (d->jit32) { reg_write_pc(d, pc); d->jit32->Run(); }
+    return 0;
+}
+FQL int dynarmic_emu_step(dynarmic* d, u64 pc) {
+    if (d->jit64) {
+        if (d->cb64) d->cb64->ticks_remaining = 1;
+        d->jit64->ClearHalt(Dynarmic::HaltReason::UserDefined1);
+        d->jit64->ClearHalt(Dynarmic::HaltReason::UserDefined2);
+        d->jit64->ClearHalt(Dynarmic::HaltReason::MemoryAbort);
+        d->jit64->ClearHalt(Dynarmic::HaltReason::CacheInvalidation);
+        d->jit64->SetPC(pc);
+        d->jit64->Step();
+    }
     return 0;
 }
 FQL int dynarmic_emu_stop(dynarmic* d) { if (d->jit64) d->jit64->HaltExecution(); if (d->jit32) d->jit32->HaltExecution(); return 0; }

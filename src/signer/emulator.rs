@@ -28,13 +28,86 @@ const SVC_LDADDH: u32        = 0x200; // LDADDH W0, W0, [X1]
 const SVC_LDADDLH: u32       = 0x201; // LDADDLH W0, W0, [X1]
 const SVC_REFCOUNT_NOP: u32  = 0x202; // Stub for ref-counting library functions
 const SVC_TRAP_NULL: u32     = 0x300; // Trap at address 0 (null jump detection)
+const SVC_JNI_BASE: u32      = 0x600; // JNI function stubs: SVC #(0x600 + index)
 
 /// No SVC patches in SO — CFF dispatch uses instruction addresses as constants.
 const HOOK_TABLE: &[(u64, u32)] = &[];
 
+// JNI memory layout
+const JNI_ENV_ADDR: u64      = 0x4000_0000; // JNIEnv* → [functions_ptr]
+const JNI_FUNC_TABLE: u64    = 0x4000_0100; // JNINativeInterface_ function table
+const JNI_STUBS_ADDR: u64    = 0x4000_1000; // SVC stub code page
+const JNI_STRING_AREA: u64   = 0x4000_2000; // Fake jstring / string data
+const JNI_OBJ_AREA: u64      = 0x4000_3000; // Fake jobject / jclass area
+const JNI_STACK_BASE: u64    = 0x4800_0000; // Fresh stack for JNI call
+const JNI_STACK_SIZE: u64    = 0x0080_0000; // 8MB stack
+const JNI_NUM_FUNCS: usize   = 232;         // Number of JNI functions
+
+// JNI function table indices (from jni.h)
+const JNI_FIND_CLASS: usize          = 6;
+const JNI_EXCEPTION_OCCURRED: usize  = 15;
+const JNI_EXCEPTION_CLEAR: usize     = 17;
+const JNI_NEW_GLOBAL_REF: usize      = 21;
+const JNI_DELETE_GLOBAL_REF: usize   = 22;
+const JNI_DELETE_LOCAL_REF: usize    = 23;
+const JNI_ENSURE_LOCAL_CAPACITY: usize = 26;
+const JNI_NEW_OBJECT: usize          = 28;
+const JNI_GET_OBJECT_CLASS: usize    = 31;
+const JNI_GET_METHOD_ID: usize       = 33;
+const JNI_CALL_OBJECT_METHOD: usize  = 34;
+const JNI_CALL_OBJECT_METHOD_V: usize = 35;
+const JNI_CALL_OBJECT_METHOD_A: usize = 36;
+const JNI_CALL_BOOLEAN_METHOD: usize = 37;
+const JNI_CALL_INT_METHOD: usize     = 49;
+const JNI_CALL_VOID_METHOD: usize    = 61;
+const JNI_GET_STATIC_METHOD_ID: usize= 113;
+const JNI_CALL_STATIC_OBJECT_METHOD: usize = 114;
+const JNI_CALL_STATIC_INT_METHOD: usize = 120;
+const JNI_CALL_STATIC_VOID_METHOD: usize = 141;
+const JNI_GET_FIELD_ID: usize        = 94;
+const JNI_GET_OBJECT_FIELD: usize    = 95;
+const JNI_GET_INT_FIELD: usize       = 100;
+const JNI_GET_LONG_FIELD: usize      = 101;
+const JNI_SET_OBJECT_FIELD: usize    = 104;
+const JNI_SET_INT_FIELD: usize       = 109;
+const JNI_SET_LONG_FIELD: usize      = 110;
+const JNI_GET_STATIC_FIELD_ID: usize = 144;
+const JNI_GET_STATIC_OBJECT_FIELD: usize = 145;
+const JNI_NEW_STRING_UTF: usize      = 167;
+const JNI_GET_STRING_UTF_LENGTH: usize = 168;
+const JNI_GET_STRING_UTF_CHARS: usize= 169;
+const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
+const JNI_GET_ARRAY_LENGTH: usize    = 171;
+const JNI_NEW_OBJECT_ARRAY: usize    = 172;
+const JNI_GET_OBJECT_ARRAY_ELEMENT: usize = 173;
+const JNI_SET_OBJECT_ARRAY_ELEMENT: usize = 174;
+const JNI_NEW_BYTE_ARRAY: usize      = 176;
+const JNI_GET_BYTE_ARRAY_ELEMENTS: usize = 184;
+const JNI_RELEASE_BYTE_ARRAY_ELEMENTS: usize = 192;
+const JNI_GET_BYTE_ARRAY_REGION: usize = 200;
+const JNI_SET_BYTE_ARRAY_REGION: usize = 211;
+const JNI_EXCEPTION_CHECK: usize     = 228;
+
+// Fake JNI object handles (opaque references)
+const JCLASS_HANDLE: u64     = 0x4000_3100; // Fake jclass for y2
+const JSTRING_URL: u64       = 0x4000_3200; // Fake jstring for URL
+const JOBJ_EXTRA: u64        = 0x4000_3300; // Fake jobject for extra headers array
+
+#[derive(Clone, Debug)]
+enum JniObject {
+    String(String),
+    ByteArray(Vec<u8>),
+    ObjectArray(Vec<u64>), // handles
+    Class(String),
+    Null,
+}
+
 struct SharedState {
     heap_next: u64,
     sigs: Vec<(String, String)>,
+    jni_objects: HashMap<u64, JniObject>, // handle → object
+    jni_next_handle: u64,
+    jni_string_next: u64, // next address for string data in emulator memory
 }
 
 fn reg_index(name: &str) -> Option<usize> {
@@ -49,6 +122,56 @@ fn reg_index(name: &str) -> Option<usize> {
         "x27"=>Some(27),"x28"=>Some(28),
         "fp"=>Some(29),"lr"=>Some(30),
         _ => None,
+    }
+}
+
+fn jni_name(idx: usize) -> &'static str {
+    match idx {
+        4 => "GetVersion",
+        6 => "FindClass",
+        15 => "ExceptionOccurred",
+        17 => "ExceptionClear",
+        21 => "NewGlobalRef",
+        22 => "DeleteGlobalRef",
+        23 => "DeleteLocalRef",
+        26 => "EnsureLocalCapacity",
+        28 => "NewObject",
+        31 => "GetObjectClass",
+        33 => "GetMethodID",
+        34 => "CallObjectMethod",
+        35 => "CallObjectMethodV",
+        36 => "CallObjectMethodA",
+        37 => "CallBooleanMethod",
+        49 => "CallIntMethod",
+        61 => "CallVoidMethod",
+        94 => "GetFieldID",
+        95 => "GetObjectField",
+        100 => "GetIntField",
+        101 => "GetLongField",
+        104 => "SetObjectField",
+        109 => "SetIntField",
+        110 => "SetLongField",
+        113 => "GetStaticMethodID",
+        114 => "CallStaticObjectMethod",
+        120 => "CallStaticIntMethod",
+        141 => "CallStaticVoidMethod",
+        144 => "GetStaticFieldID",
+        145 => "GetStaticObjectField",
+        167 => "NewStringUTF",
+        168 => "GetStringUTFLength",
+        169 => "GetStringUTFChars",
+        170 => "ReleaseStringUTFChars",
+        171 => "GetArrayLength",
+        172 => "NewObjectArray",
+        173 => "GetObjectArrayElement",
+        174 => "SetObjectArrayElement",
+        176 => "NewByteArray",
+        184 => "GetByteArrayElements",
+        192 => "ReleaseByteArrayElements",
+        200 => "GetByteArrayRegion",
+        211 => "SetByteArrayRegion",
+        228 => "ExceptionCheck",
+        _ => "Unknown",
     }
 }
 
@@ -263,6 +386,35 @@ pub fn test_signing() -> Vec<(String, String)> {
     let _ = dy.mem_write(0, &svc_bytes(SVC_TRAP_NULL));
     eprintln!("[emu] Patched {} hooks + null trap (LSE handled dynamically)", HOOK_TABLE.len());
 
+    // ========== Set up fake JNIEnv ==========
+    // Map JNI area: 0x4000_0000..0x4000_FFFF
+    let _ = dy.mem_map(0x4000_0000, 0x10000, 3);
+    let _ = dy.mem_protect(0x4000_0000, 0x10000, 7); // RWX for stubs
+
+    // JNIEnv* → [functions_ptr]
+    let _ = dy.mem_write(JNI_ENV_ADDR, &JNI_FUNC_TABLE.to_le_bytes());
+
+    // Build SVC stubs and function table
+    for i in 0..JNI_NUM_FUNCS {
+        // Stub: SVC #(0x600 + i); RET
+        let stub_addr = JNI_STUBS_ADDR + (i as u64) * 8;
+        let _ = dy.mem_write(stub_addr, &svc_bytes(SVC_JNI_BASE + i as u32));
+        let _ = dy.mem_write(stub_addr + 4, &0xD65F03C0u32.to_le_bytes()); // RET
+
+        // Function table entry → stub
+        let _ = dy.mem_write(JNI_FUNC_TABLE + (i as u64) * 8, &stub_addr.to_le_bytes());
+    }
+
+    // Map JNI object area
+    let _ = dy.mem_write(JCLASS_HANDLE, &[0x01u8; 8]); // non-zero marker
+    let _ = dy.mem_write(JOBJ_EXTRA, &[0x02u8; 8]); // non-zero marker
+
+    // Map stack for JNI call (extra page on top for guard)
+    let _ = dy.mem_map(JNI_STACK_BASE, JNI_STACK_SIZE as usize + 0x1000, 3);
+    let _ = dy.mem_protect(JNI_STACK_BASE, JNI_STACK_SIZE as usize + 0x1000, 7);
+
+    eprintln!("[emu] Fake JNIEnv at 0x{:x}, {} stubs, stack at 0x{:x}", JNI_ENV_ADDR, JNI_NUM_FUNCS, JNI_STACK_BASE);
+
     // Set TPIDR_EL0 from register dump (real thread-local storage pointer)
     let mut tpidr = 0u64;
     for line in std::fs::read_to_string(format!("{}/lib/regs_only.txt", dir)).unwrap().lines() {
@@ -274,32 +426,16 @@ pub fn test_signing() -> Vec<(String, String)> {
     dy.reg_write_tpidr_el0(tpidr).unwrap();
     eprintln!("[emu] TPIDR_EL0 = 0x{:x}", tpidr);
 
-    // Load registers from dump
-    for line in std::fs::read_to_string(format!("{}/lib/regs_only.txt", dir)).unwrap().lines() {
-        if let Some(rest) = line.strip_prefix("REG:") {
-            let p: Vec<&str> = rest.split(':').collect();
-            if p.len() == 2 {
-                if let Ok(v) = u64::from_str_radix(p[1].trim_start_matches("0x"), 16) {
-                    if p[0] == "sp" {
-                        dy.reg_write_sp(v).unwrap();
-                    } else if let Some(idx) = reg_index(p[0]) {
-                        dy.reg_write_raw(idx, v).unwrap();
-                    }
-                }
-            }
-        }
-    }
-
-    // With real TPIDR_EL0, stack canary is already in TLS — just log it
-    if let Ok(b) = dy.mem_read_as_vec(tpidr + 0x28, 8) {
-        let canary = u64::from_le_bytes(b.try_into().unwrap());
-        eprintln!("[emu] Stack canary at [TPIDR+0x28] = 0x{:x}", canary);
-    }
+    // NOTE: Not loading registers from dump — using JNI calling convention instead
+    // Only TPIDR_EL0 is set from the dump (for TLS/stack canary)
 
     // Shared mutable state for SVC callbacks
     let state = Arc::new(Mutex::new(SharedState {
         heap_next: 0x5000_0000,
         sigs: vec![],
+        jni_objects: HashMap::new(),
+        jni_next_handle: 0x4000_A000,
+        jni_string_next: JNI_STRING_AREA,
     }));
 
     // SVC callback — dispatch to fast-path implementations
@@ -674,6 +810,355 @@ pub fn test_signing() -> Vec<(String, String)> {
                 // Continue after the patched instruction
                 dy.reg_write_pc(pc + 4).unwrap();
             }
+            swi if swi >= SVC_JNI_BASE && swi < SVC_JNI_BASE + JNI_NUM_FUNCS as u32 => {
+                // JNI function call
+                let idx = (swi - SVC_JNI_BASE) as usize;
+                let env = dy.reg_read(0).unwrap_or(0);
+                let a1 = dy.reg_read(1).unwrap_or(0);
+                let a2 = dy.reg_read(2).unwrap_or(0);
+                let a3 = dy.reg_read(3).unwrap_or(0);
+                let a4 = dy.reg_read(4).unwrap_or(0);
+                let _a5 = dy.reg_read(5).unwrap_or(0);
+
+                if n < 200 {
+                    eprintln!("[JNI] #{} func={} a1=0x{:x} a2=0x{:x} a3=0x{:x} a4=0x{:x}",
+                        n, jni_name(idx), a1, a2, a3, a4);
+                }
+
+                match idx {
+                    JNI_GET_STRING_UTF_CHARS => {
+                        // GetStringUTFChars(env, jstring, isCopy*) → const char*
+                        let jstr = a1;
+                        let is_copy_ptr = a2;
+                        let mut result = 0u64;
+                        {
+                            let st_lock = st.lock().unwrap();
+                            if let Some(JniObject::String(s)) = st_lock.jni_objects.get(&jstr) {
+                                // Return pointer to string data in emulator memory
+                                // We already wrote URL to JNI_STRING_AREA
+                                if jstr == JSTRING_URL {
+                                    result = JNI_STRING_AREA;
+                                } else {
+                                    // Find or create string in emulator memory
+                                    drop(st_lock);
+                                    let mut st_lock = st.lock().unwrap();
+                                    let addr = st_lock.jni_string_next;
+                                    let bytes = if let Some(JniObject::String(s)) = st_lock.jni_objects.get(&jstr) {
+                                        s.as_bytes().to_vec()
+                                    } else { vec![] };
+                                    let _ = dy.mem_write(addr, &bytes);
+                                    let _ = dy.mem_write(addr + bytes.len() as u64, &[0u8]);
+                                    st_lock.jni_string_next = addr + ((bytes.len() as u64 + 16) & !0xF);
+                                    result = addr;
+                                }
+                            }
+                        }
+                        if is_copy_ptr != 0 {
+                            let _ = dy.mem_write(is_copy_ptr, &[0u8]); // isCopy = false
+                        }
+                        eprintln!("[JNI]   GetStringUTFChars(0x{:x}) → 0x{:x}", a1, result);
+                        dy.reg_write_raw(0, result).unwrap();
+                    }
+                    JNI_RELEASE_STRING_UTF_CHARS => {
+                        // ReleaseStringUTFChars(env, jstring, chars) — no-op
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_GET_STRING_UTF_LENGTH => {
+                        // GetStringUTFLength(env, jstring) → jsize
+                        let jstr = a1;
+                        let len = {
+                            let st_lock = st.lock().unwrap();
+                            if let Some(JniObject::String(s)) = st_lock.jni_objects.get(&jstr) {
+                                s.len() as u64
+                            } else { 0 }
+                        };
+                        dy.reg_write_raw(0, len).unwrap();
+                    }
+                    JNI_NEW_STRING_UTF => {
+                        // NewStringUTF(env, const char* utf) → jstring
+                        let utf_ptr = a1;
+                        // Read null-terminated string from emulator memory
+                        let mut bytes = vec![];
+                        for i in 0..4096u64 {
+                            if let Ok(b) = dy.mem_read_as_vec(utf_ptr + i, 1) {
+                                if b[0] == 0 { break; }
+                                bytes.push(b[0]);
+                            } else { break; }
+                        }
+                        let s = String::from_utf8_lossy(&bytes).to_string();
+                        let handle = {
+                            let mut st_lock = st.lock().unwrap();
+                            let h = st_lock.jni_next_handle;
+                            st_lock.jni_next_handle += 0x10;
+                            st_lock.jni_objects.insert(h, JniObject::String(s.clone()));
+                            h
+                        };
+                        eprintln!("[JNI]   NewStringUTF({:?}) → 0x{:x}", &s[..s.len().min(80)], handle);
+                        dy.reg_write_raw(0, handle).unwrap();
+                    }
+                    JNI_FIND_CLASS => {
+                        // FindClass(env, const char* name) → jclass
+                        let name_ptr = a1;
+                        let mut bytes = vec![];
+                        for i in 0..256u64 {
+                            if let Ok(b) = dy.mem_read_as_vec(name_ptr + i, 1) {
+                                if b[0] == 0 { break; }
+                                bytes.push(b[0]);
+                            } else { break; }
+                        }
+                        let name = String::from_utf8_lossy(&bytes).to_string();
+                        let handle = {
+                            let mut st_lock = st.lock().unwrap();
+                            let h = st_lock.jni_next_handle;
+                            st_lock.jni_next_handle += 0x10;
+                            st_lock.jni_objects.insert(h, JniObject::Class(name.clone()));
+                            h
+                        };
+                        eprintln!("[JNI]   FindClass({:?}) → 0x{:x}", name, handle);
+                        dy.reg_write_raw(0, handle).unwrap();
+                    }
+                    JNI_GET_METHOD_ID | JNI_GET_STATIC_METHOD_ID => {
+                        // Get(Static)MethodID(env, class, name, sig) → jmethodID
+                        let name_ptr = a2;
+                        let sig_ptr = a3;
+                        let mut read_cstr = |ptr: u64| -> String {
+                            let mut bytes = vec![];
+                            for i in 0..256u64 {
+                                if let Ok(b) = dy.mem_read_as_vec(ptr + i, 1) {
+                                    if b[0] == 0 { break; }
+                                    bytes.push(b[0]);
+                                } else { break; }
+                            }
+                            String::from_utf8_lossy(&bytes).to_string()
+                        };
+                        let name = read_cstr(name_ptr);
+                        let sig = read_cstr(sig_ptr);
+                        // Return a fake method ID (non-zero)
+                        let mid = {
+                            let mut st_lock = st.lock().unwrap();
+                            let h = st_lock.jni_next_handle;
+                            st_lock.jni_next_handle += 0x10;
+                            h
+                        };
+                        eprintln!("[JNI]   GetMethodID(0x{:x}, {:?}, {:?}) → 0x{:x}", a1, name, sig, mid);
+                        dy.reg_write_raw(0, mid).unwrap();
+                    }
+                    JNI_GET_FIELD_ID | JNI_GET_STATIC_FIELD_ID => {
+                        let name_ptr = a2;
+                        let mut bytes = vec![];
+                        for i in 0..256u64 {
+                            if let Ok(b) = dy.mem_read_as_vec(name_ptr + i, 1) {
+                                if b[0] == 0 { break; }
+                                bytes.push(b[0]);
+                            } else { break; }
+                        }
+                        let name = String::from_utf8_lossy(&bytes).to_string();
+                        let fid = {
+                            let mut st_lock = st.lock().unwrap();
+                            let h = st_lock.jni_next_handle;
+                            st_lock.jni_next_handle += 0x10;
+                            h
+                        };
+                        eprintln!("[JNI]   GetFieldID(0x{:x}, {:?}) → 0x{:x}", a1, name, fid);
+                        dy.reg_write_raw(0, fid).unwrap();
+                    }
+                    JNI_NEW_OBJECT_ARRAY => {
+                        // NewObjectArray(env, size, class, init) → jobjectArray
+                        let size = a1 as usize;
+                        let handle = {
+                            let mut st_lock = st.lock().unwrap();
+                            let h = st_lock.jni_next_handle;
+                            st_lock.jni_next_handle += 0x10;
+                            st_lock.jni_objects.insert(h, JniObject::ObjectArray(vec![0; size]));
+                            h
+                        };
+                        eprintln!("[JNI]   NewObjectArray(size={}) → 0x{:x}", size, handle);
+                        dy.reg_write_raw(0, handle).unwrap();
+                    }
+                    JNI_SET_OBJECT_ARRAY_ELEMENT => {
+                        // SetObjectArrayElement(env, array, index, value)
+                        let array = a1;
+                        let index = a2 as usize;
+                        let value = a3;
+                        {
+                            let mut st_lock = st.lock().unwrap();
+                            if let Some(JniObject::ObjectArray(ref mut arr)) = st_lock.jni_objects.get_mut(&array) {
+                                if index < arr.len() {
+                                    arr[index] = value;
+                                }
+                            }
+                        }
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_GET_OBJECT_ARRAY_ELEMENT => {
+                        // GetObjectArrayElement(env, array, index) → jobject
+                        let array = a1;
+                        let index = a2 as usize;
+                        let result = {
+                            let st_lock = st.lock().unwrap();
+                            if let Some(JniObject::ObjectArray(arr)) = st_lock.jni_objects.get(&array) {
+                                arr.get(index).copied().unwrap_or(0)
+                            } else { 0 }
+                        };
+                        dy.reg_write_raw(0, result).unwrap();
+                    }
+                    JNI_GET_ARRAY_LENGTH => {
+                        // GetArrayLength(env, array) → jsize
+                        let array = a1;
+                        let len = {
+                            let st_lock = st.lock().unwrap();
+                            match st_lock.jni_objects.get(&array) {
+                                Some(JniObject::ObjectArray(arr)) => arr.len() as u64,
+                                Some(JniObject::ByteArray(arr)) => arr.len() as u64,
+                                _ => 0,
+                            }
+                        };
+                        dy.reg_write_raw(0, len).unwrap();
+                    }
+                    JNI_EXCEPTION_CHECK => {
+                        // ExceptionCheck(env) → jboolean (0 = no exception)
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_EXCEPTION_OCCURRED => {
+                        // ExceptionOccurred(env) → jthrowable (NULL = no exception)
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_EXCEPTION_CLEAR => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_ENSURE_LOCAL_CAPACITY => {
+                        // EnsureLocalCapacity(env, capacity) → 0 (JNI_OK)
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_DELETE_LOCAL_REF | JNI_DELETE_GLOBAL_REF => {
+                        // Delete ref — no-op
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_NEW_GLOBAL_REF => {
+                        // NewGlobalRef(env, obj) → globalRef (just return same ref)
+                        dy.reg_write_raw(0, a1).unwrap();
+                    }
+                    JNI_GET_OBJECT_CLASS => {
+                        // GetObjectClass(env, obj) → jclass
+                        dy.reg_write_raw(0, JCLASS_HANDLE).unwrap();
+                    }
+                    JNI_CALL_OBJECT_METHOD | JNI_CALL_OBJECT_METHOD_V | JNI_CALL_OBJECT_METHOD_A
+                    | JNI_CALL_STATIC_OBJECT_METHOD => {
+                        // CallObjectMethod(V/A) / CallStaticObjectMethod
+                        // a1 = object, a2 = methodID, a3+ = args
+                        let obj = a1;
+                        // Check if this is a getBytes call on a string
+                        let result_handle = {
+                            let st_lock = st.lock().unwrap();
+                            if let Some(JniObject::String(s)) = st_lock.jni_objects.get(&obj) {
+                                // Likely getBytes("utf-8") — return byte array of string
+                                let bytes = s.as_bytes().to_vec();
+                                drop(st_lock);
+                                let mut st_lock = st.lock().unwrap();
+                                let h = st_lock.jni_next_handle;
+                                st_lock.jni_next_handle += 0x10;
+                                st_lock.jni_objects.insert(h, JniObject::ByteArray(bytes));
+                                eprintln!("[JNI]   CallObjectMethod on string → ByteArray 0x{:x}", h);
+                                h
+                            } else {
+                                eprintln!("[JNI]   CallObjectMethod(0x{:x}) → NULL", obj);
+                                0
+                            }
+                        };
+                        dy.reg_write_raw(0, result_handle).unwrap();
+                    }
+                    JNI_CALL_INT_METHOD | JNI_CALL_STATIC_INT_METHOD => {
+                        // CallIntMethod / CallStaticIntMethod — return 0
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_CALL_BOOLEAN_METHOD => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_CALL_VOID_METHOD | JNI_CALL_STATIC_VOID_METHOD => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_GET_OBJECT_FIELD | JNI_GET_STATIC_OBJECT_FIELD => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_GET_INT_FIELD => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_GET_LONG_FIELD => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_SET_OBJECT_FIELD | JNI_SET_INT_FIELD | JNI_SET_LONG_FIELD => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_NEW_BYTE_ARRAY => {
+                        // NewByteArray(env, size) → jbyteArray
+                        let size = a1 as usize;
+                        let handle = {
+                            let mut st_lock = st.lock().unwrap();
+                            let h = st_lock.jni_next_handle;
+                            st_lock.jni_next_handle += 0x10;
+                            st_lock.jni_objects.insert(h, JniObject::ByteArray(vec![0; size]));
+                            h
+                        };
+                        dy.reg_write_raw(0, handle).unwrap();
+                    }
+                    JNI_GET_BYTE_ARRAY_ELEMENTS => {
+                        // GetByteArrayElements(env, array, isCopy) → jbyte*
+                        let array = a1;
+                        let data_copy = {
+                            let st_lock = st.lock().unwrap();
+                            if let Some(JniObject::ByteArray(ref data)) = st_lock.jni_objects.get(&array) {
+                                Some(data.clone())
+                            } else { None }
+                        };
+                        let result = if let Some(data) = data_copy {
+                            let mut s = st.lock().unwrap();
+                            let addr = s.heap_next;
+                            s.heap_next += ((data.len() as u64 + 15) & !15).max(16);
+                            let _ = dy.mem_write(addr, &data);
+                            addr
+                        } else { 0 };
+                        if a2 != 0 {
+                            let _ = dy.mem_write(a2, &[0u8]); // isCopy = false
+                        }
+                        dy.reg_write_raw(0, result).unwrap();
+                    }
+                    JNI_RELEASE_BYTE_ARRAY_ELEMENTS => {
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_GET_BYTE_ARRAY_REGION => {
+                        // GetByteArrayRegion(env, array, start, len, buf)
+                        let array = a1;
+                        let start = a2 as usize;
+                        let len = a3 as usize;
+                        let buf = a4;
+                        let data = {
+                            let st_lock = st.lock().unwrap();
+                            if let Some(JniObject::ByteArray(ref arr)) = st_lock.jni_objects.get(&array) {
+                                let end = (start + len).min(arr.len());
+                                if start < arr.len() {
+                                    Some(arr[start..end].to_vec())
+                                } else { None }
+                            } else { None }
+                        };
+                        if let Some(data) = data {
+                            if buf != 0 {
+                                let _ = dy.mem_write(buf, &data);
+                                eprintln!("[JNI]   GetByteArrayRegion(0x{:x}, {}, {}) → wrote {} bytes to 0x{:x}",
+                                    array, start, len, data.len(), buf);
+                            }
+                        }
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    JNI_SET_BYTE_ARRAY_REGION => {
+                        // SetByteArrayRegion(env, array, start, len, buf)
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                    _ => {
+                        eprintln!("[JNI] UNHANDLED func={} (idx={})", jni_name(idx), idx);
+                        dy.reg_write_raw(0, 0).unwrap();
+                    }
+                }
+            }
             _ => {
                 // Unknown SVC — return 0
                 if n < 20 { eprintln!("[SVC] unknown swi=0x{:x} pc=0x{:x}", swi, pc); }
@@ -682,14 +1167,63 @@ pub fn test_signing() -> Vec<(String, String)> {
         }
     });
 
+    // Load Frida agent address ranges (for detecting contaminated function pointers)
+    let frida_ranges: Vec<(u64, u64)> = {
+        let frida_path = format!("{}/lib/frida_ranges.txt", dir);
+        let mut ranges = vec![];
+        if let Ok(content) = std::fs::read_to_string(&frida_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let parts: Vec<&str> = line.split('-').collect();
+                if parts.len() == 2 {
+                    if let (Ok(s), Ok(e)) = (u64::from_str_radix(parts[0], 16), u64::from_str_radix(parts[1], 16)) {
+                        ranges.push((s, e));
+                    }
+                }
+            }
+            eprintln!("[emu] Loaded {} Frida ranges", ranges.len());
+        }
+        ranges
+    };
+    let frida_ranges = Arc::new(frida_ranges);
+
     // Unmapped memory callback — record missing pages, map with zeros, signal stop
     let missing_pages = Arc::new(Mutex::new(std::collections::BTreeSet::<u64>::new()));
     let mp = missing_pages.clone();
     let miss_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let miss_flag_cb = miss_flag.clone();
+    let so_base_miss = so_base;
+    let frida_ranges_cb = frida_ranges.clone();
+    let st_miss = state.clone();
     dy.set_unmapped_mem_callback(move |dy: &Dynarmic<()>, addr: u64, _size: usize, _value: u64| -> bool {
+        // Strip MTE tag from top byte (Android memory tagging)
+        let addr = addr & 0x00FF_FFFF_FFFF_FFFF;
         let page = addr & !0xFFF;
         let pc = dy.reg_read_pc().unwrap_or(0);
+
+        // Check if this is a code fetch into Frida agent range
+        let in_frida = frida_ranges_cb.iter().any(|&(s, e)| addr >= s && addr < e);
+        let is_code_fetch = (pc & !0xFFF) == page || pc == addr;
+
+        if in_frida || is_code_fetch {
+            let lr = dy.reg_read(30).unwrap_or(0);
+            let x0 = dy.reg_read(0).unwrap_or(0);
+            eprintln!("[MISS] Frida/code fetch at 0x{:x} pc=0x{:x} LR=0x{:x} x0=0x{:x}", addr, pc, lr, x0);
+            // Skip the function: allocate heap block as return value and return to caller
+            let ptr = {
+                let mut s = st_miss.lock().unwrap();
+                let p = s.heap_next;
+                s.heap_next += 0x100;
+                p
+            };
+            let _ = dy.mem_write(ptr, &[0u8; 0x100]);
+            dy.reg_write_raw(0, ptr).unwrap();
+            dy.reg_write_pc(lr).unwrap();
+            let _ = dy.emu_stop(); // stop so retry loop picks up at LR
+            return false;
+        }
+
         eprintln!("[MISS] addr=0x{:x} page=0x{:x} pc=0x{:x}", addr, page, pc);
         if page < 0x8000_0000_0000 {
             mp.lock().unwrap().insert(page);
@@ -699,9 +1233,104 @@ pub fn test_signing() -> Vec<(String, String)> {
         false
     });
 
-    // Execute with timeout
-    let start = so_base + 0x286DF4;
-    eprintln!("[emu] Starting at SO+0x286DF4 (dynarmic JIT)");
+    // ========== Set up JNI call to SO+0x26e684 ==========
+    // y2.a(int tag, int type, long handle, String url, Object extra)
+    // JNI convention: x0=JNIEnv*, x1=jclass, x2=tag, x3=type, x4=handle, x5=url, x6=extra
+
+    // Write URL string to emulator memory and register as JNI object
+    let test_url = "https://novel.snssdk.com/api/novel/book/directory/list_v2/?device_platform=android&parent_enterfrom=novel_channel_search.tab.&aid=1967&app_name=novel_android&version_code=71332&device_type=sdk_gphone64_arm64&device_brand=google&language=zh&os_api=35&os_version=15&ac=wifi&channel=googleplay&device_id=3722313718058683&iid=3722313718062779&cdid=e1f62191-7252-491d-a4ef-6936fee1c2f7&openudid=9809e655-067c-47fe-a937-b150bfad0be9";
+    {
+        // Store URL string data in emulator memory
+        let url_data_addr = JNI_STRING_AREA;
+        let url_bytes = test_url.as_bytes();
+        let _ = dy.mem_write(url_data_addr, url_bytes);
+        let _ = dy.mem_write(url_data_addr + url_bytes.len() as u64, &[0u8]); // null terminator
+
+        // Register URL jstring in object table
+        let mut st = state.lock().unwrap();
+        st.jni_objects.insert(JSTRING_URL, JniObject::String(test_url.to_string()));
+        // Register extra as empty array
+        st.jni_objects.insert(JOBJ_EXTRA, JniObject::ObjectArray(vec![]));
+        st.jni_objects.insert(JCLASS_HANDLE, JniObject::Class("ms.bd.c.y2".into()));
+        st.jni_string_next = url_data_addr + ((url_bytes.len() as u64 + 16) & !0xF);
+    }
+
+    // Set up fresh stack
+    let stack_top = JNI_STACK_BASE + JNI_STACK_SIZE - 0x100; // leave headroom
+    dy.reg_write_sp(stack_top).unwrap();
+    dy.reg_write_raw(29, stack_top).unwrap(); // FP = SP
+
+    // Set JNI call registers
+    dy.reg_write_raw(0, JNI_ENV_ADDR).unwrap();  // x0 = JNIEnv*
+    dy.reg_write_raw(1, JCLASS_HANDLE).unwrap();  // x1 = jclass
+    dy.reg_write_raw(2, 0x3000001).unwrap();      // x2 = tag (signing)
+    dy.reg_write_raw(3, 0).unwrap();               // x3 = type
+    // Load real MetaSec handle object from dump
+    let handle_addr;
+    let handle_dump_path = format!("{}/lib/handle_dump.bin", dir);
+    if std::path::Path::new(&handle_dump_path).exists() {
+        let hdata = std::fs::read(&handle_dump_path).unwrap();
+        let orig_addr = u64::from_le_bytes(hdata[0..8].try_into().unwrap());
+        let data_len = u32::from_le_bytes(hdata[8..12].try_into().unwrap()) as usize;
+        let data = &hdata[12..12 + data_len];
+
+        // Map the handle at its original address (so internal pointers remain valid)
+        let page = orig_addr & !0xFFF;
+        let page_end = ((orig_addr + data_len as u64) + 0xFFF) & !0xFFF;
+        let map_size = (page_end - page) as usize;
+        let _ = dy.mem_map(page, map_size, 3);
+        let _ = dy.mem_write(orig_addr, data);
+        handle_addr = orig_addr;
+        eprintln!("[emu] Loaded real MetaSec handle: 0x{:x} ({} bytes)", handle_addr, data_len);
+
+        // Also map pages for pointers found in handle data (follow internal pointers)
+        for off in (0..data_len).step_by(8) {
+            if off + 8 <= data_len {
+                let ptr = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
+                // Check if it's a heap-like pointer in the same range (not SO, not stack)
+                let ptr_page = ptr & !0xFFF;
+                if ptr > 0x7000_0000_0000 && ptr < 0x8000_0000_0000
+                    && !(ptr >= so_base && ptr < so_base + 0x400000) // not in SO
+                    && ptr_page != page // not same page as handle
+                {
+                    // Try to map it if not already mapped (will fail silently if already mapped)
+                    let _ = dy.mem_map(ptr_page, 0x1000, 3);
+                }
+            }
+        }
+    } else {
+        // Fallback: allocate fake handle
+        handle_addr = {
+            let mut st = state.lock().unwrap();
+            let h = st.heap_next;
+            st.heap_next += 0x1000;
+            h
+        };
+        let _ = dy.mem_write(handle_addr, &vec![0u8; 0x1000]);
+        eprintln!("[emu] WARNING: No handle_dump.bin, using fake handle at 0x{:x}", handle_addr);
+    }
+    dy.reg_write_raw(4, handle_addr).unwrap();      // x4 = handle (MetaSec context)
+    dy.reg_write_raw(5, JSTRING_URL).unwrap();     // x5 = url (jstring)
+    dy.reg_write_raw(6, JOBJ_EXTRA).unwrap();      // x6 = extra (jobject)
+    dy.reg_write_raw(30, HALT_ADDR).unwrap();      // LR = halt (return here when done)
+
+    // Write stack canary at [TPIDR+0x28] if not already present
+    if tpidr != 0 {
+        if let Ok(b) = dy.mem_read_as_vec(tpidr + 0x28, 8) {
+            let canary = u64::from_le_bytes(b.try_into().unwrap());
+            if canary == 0 {
+                // Write a fixed canary value
+                let _ = dy.mem_write(tpidr + 0x28, &0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+                eprintln!("[emu] Wrote fake stack canary");
+            }
+        }
+    }
+
+    let start = so_base + 0x26e684;
+    eprintln!("[emu] Starting at SO+0x26e684 (JNI native entry, dynarmic JIT)");
+    eprintln!("[emu]   x0(JNIEnv)=0x{:x} x1(jclass)=0x{:x} x2(tag)=0x{:x}", JNI_ENV_ADDR, JCLASS_HANDLE, 0x3000001u64);
+    eprintln!("[emu]   x3(type)=0 x4(handle)=0 x5(url)=0x{:x} x6(extra)=0x{:x}", JSTRING_URL, JOBJ_EXTRA);
+    eprintln!("[emu]   SP=0x{:x} LR=0x{:x}", stack_top, HALT_ADDR);
     let t0 = std::time::Instant::now();
 
     // Timeout flag + PC sampling thread
@@ -726,6 +1355,48 @@ pub fn test_signing() -> Vec<(String, String)> {
         let _ = dy_timeout.emu_stop();
         eprintln!("[emu] Timeout: forced stop after 5s");
     });
+
+    // Trace mode: set EMU_TRACE=1 to enable single-step tracing
+    if std::env::var("EMU_TRACE").is_ok() {
+        eprintln!("[emu] Trace mode enabled");
+        let mut trace_pc = start;
+        for step in 0..20000 {
+            dy.emu_step(trace_pc).ok();
+            let pc = dy.reg_read_pc().unwrap_or(0);
+            let so_off = pc.wrapping_sub(so_base);
+            let is_branch = pc != trace_pc + 4;
+            if step < 30 || is_branch || pc == HALT_ADDR {
+                let insn = dy.mem_read_as_vec(trace_pc, 4).ok()
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0;4])))
+                    .unwrap_or(0);
+                if so_off < 0x400000 {
+                    eprintln!("[trace] #{:4} SO+0x{:x} → SO+0x{:x} insn=0x{:08x}{}",
+                        step, trace_pc.wrapping_sub(so_base), so_off, insn,
+                        if is_branch { " <<<" } else { "" });
+                } else {
+                    eprintln!("[trace] #{:4} SO+0x{:x} → 0x{:x} insn=0x{:08x} <<<",
+                        step, trace_pc.wrapping_sub(so_base), pc, insn);
+                }
+            }
+            if pc == HALT_ADDR || miss_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[trace] Reached HALT/MISS at step {}", step);
+                break;
+            }
+            trace_pc = pc;
+        }
+        // Reset for actual run
+        dy.reg_write_sp(stack_top).unwrap();
+        dy.reg_write_raw(29, stack_top).unwrap();
+        dy.reg_write_raw(0, JNI_ENV_ADDR).unwrap();
+        dy.reg_write_raw(1, JCLASS_HANDLE).unwrap();
+        dy.reg_write_raw(2, 0x3000001).unwrap();
+        dy.reg_write_raw(3, 0).unwrap();
+        dy.reg_write_raw(4, handle_addr).unwrap();
+        dy.reg_write_raw(5, JSTRING_URL).unwrap();
+        dy.reg_write_raw(6, JOBJ_EXTRA).unwrap();
+        dy.reg_write_raw(30, HALT_ADDR).unwrap();
+        miss_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let mut retries = 0u32;
     dy.emu_start(start, HALT_ADDR).ok();
@@ -870,9 +1541,58 @@ pub fn test_signing() -> Vec<(String, String)> {
     drop(timer); // timer thread will finish on its own
 
     let total_svcs = svc_n.load(std::sync::atomic::Ordering::Relaxed);
-    let sigs = state.lock().unwrap().sigs.clone();
+    let pc = dy.reg_read_pc().unwrap_or(0);
+
+    // Extract result from JNI return value (x0)
+    let ret_obj = dy.reg_read(0).unwrap_or(0);
+    eprintln!("[emu] Return value x0=0x{:x}", ret_obj);
+    {
+        let st = state.lock().unwrap();
+        if let Some(obj) = st.jni_objects.get(&ret_obj) {
+            eprintln!("[emu] Return object: {:?}", obj);
+            // If it's a String[] (ObjectArray of strings), extract key-value pairs
+            if let JniObject::ObjectArray(arr) = obj {
+                for pair in arr.chunks(2) {
+                    if pair.len() == 2 {
+                        let key = st.jni_objects.get(&pair[0]).map(|o| match o {
+                            JniObject::String(s) => s.clone(),
+                            _ => format!("obj:0x{:x}", pair[0]),
+                        }).unwrap_or_default();
+                        let val = st.jni_objects.get(&pair[1]).map(|o| match o {
+                            JniObject::String(s) => s.clone(),
+                            _ => format!("obj:0x{:x}", pair[1]),
+                        }).unwrap_or_default();
+                        eprintln!("[SIG] {}={}", key, &val[..val.len().min(80)]);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sigs = state.lock().unwrap().sigs.clone();
+
+    // Also extract from JNI objects if the function returned a string array
+    {
+        let st = state.lock().unwrap();
+        if let Some(JniObject::ObjectArray(arr)) = st.jni_objects.get(&ret_obj) {
+            for pair in arr.chunks(2) {
+                if pair.len() == 2 {
+                    if let (Some(JniObject::String(k)), Some(JniObject::String(v))) =
+                        (st.jni_objects.get(&pair[0]), st.jni_objects.get(&pair[1])) {
+                        if !sigs.iter().any(|(sk, _)| sk == k) {
+                            sigs.push((k.clone(), v.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let pages = missing_pages.lock().unwrap();
     eprintln!("[emu] {} SVCs total, {} signatures captured, {} missing pages", total_svcs, sigs.len(), pages.len());
+    if pc == HALT_ADDR {
+        eprintln!("[emu] Function returned normally!");
+    }
     if !pages.is_empty() {
         let path = format!("{}/lib/missing_pages.txt", dir);
         let content: String = pages.iter().map(|p| format!("0x{:x}\n", p)).collect();

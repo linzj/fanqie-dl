@@ -156,6 +156,7 @@ FQL int reg_write_c13_c0_3(dynarmic* dynarmic, u32 value); // TPIDRURO
 FQL u32 reg_read_c13_c0_3(dynarmic* dynarmic);
 
 FQL int dynarmic_emu_start(dynarmic* dynarmic, u64 pc);
+FQL int dynarmic_emu_step(dynarmic* dynarmic, u64 pc);
 
 FQL int dynarmic_emu_stop(dynarmic* dynarmic);
 
