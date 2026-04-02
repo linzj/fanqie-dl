@@ -79,33 +79,39 @@
 ## 文件结构
 
 ```
-src/signer/emulator.rs     — dynarmic 模拟器主代码 (~1600 行)
-  - fake JNIEnv (232 SVC stub)
-  - JNI 函数实现 (NewStringUTF, getBytes, GetByteArrayRegion 等)
-  - MTE tagged pointer 处理（unmapped callback 中 strip top byte）
-  - handle_dump.bin 加载 + 自动缺页处理
-  - 迭代执行框架
-dynarmic-sys-local/         — patched dynarmic FFI
-  vendor/dynarmic/dynarmic.cpp  — 修改:
-    - null page_table (hash map 模式)
-    - MemoryReadCode/MemoryRead32 unmapped callback + HaltExecution
-    - ClearHalt (MemoryAbort + CacheInvalidation)
-    - MTE strip_tag (所有 MemoryRead/Write 函数)
-    - emu_step (单步执行 API)
-  vendor/dynarmic/dynarmic.h    — PAGE_TABLE_ADDRESS_SPACE_BITS=40, emu_step 声明
-  src/lib.rs                    — Rust wrapper (null page_table, invalidate_cache, emu_step)
-  src/ffi.rs                    — FFI 声明
+src/signer/
+  emulator.rs               — 签名主代码:
+    - vm_compute_helios()    — Helios VM runner (dynarmic JIT, 4×16B blocks, 89ms)
+    - sign()                 — 生成 X-Helios + X-Medusa headers
+    - test_vm_helios()       — Helios VM 单元测试
+    - test_vm_medusa_regs()  — Medusa VM 寄存器 dump (handle 数据分析)
+    - test_download_chapter() — 实际 HTTP 下载测试
+    - (旧代码) fake JNIEnv, 全流程模拟器 (handle 阻塞，已废弃)
+  mod.rs                     — sign_request() 入口
+
+src/api/
+  client.rs                  — HTTP 客户端 (GET/POST 自动签名)
+  reader.rs                  — 章节下载 + 内容解密
+
+dynarmic-sys-local/          — patched dynarmic FFI (ARM64 JIT)
+  vendor/dynarmic/dynarmic.cpp — null page_table, unmapped callback, MTE, emu_step
+  vendor/dynarmic/mman.h       — Windows mmap/madvise 兼容层
+  build.rs                     — 自动检测 vcpkg Boost, MSVC 库链接
+
 scripts/
-  dump_clean.py             — /proc/pid/mem 快速 dump (SO + libc + libc++ 等)
-  dump_pages.py             — 迭代缺页 dump（按模块级别，自动过滤 Frida 页面）
-  get_handle.js             — Frida hook y2.a 获取 handle 地址 + hex dump
-  parse_handle_dump.py      — 解析 get_handle.js 输出，生成 handle_dump.bin
-  hook_register_natives.js  — Hook RegisterNatives 找 JNI native 入口
-lib/
-  memdump.bin               — 进程内存 dump
-  handle_dump.bin           — MetaSec handle 对象 (addr + data)
-  regs_only.txt             — TPIDR_EL0
-  frida_ranges.txt          — Frida agent 地址范围（空文件 = 干净进程）
+  dump_vm_data.js            — ★ Frida 一次性 dump handle 数据 (Medusa VM 输入)
+  dump_clean.py              — /proc/pid/mem 快速 dump
+  dump_pages.py              — 迭代缺页 dump
+  get_handle.js              — Frida hook y2.a 获取 handle
+  hook_register_natives.js   — Hook RegisterNatives 找 JNI native 入口
+
+docs/
+  vm_architecture.md         — ★ 完整 VM 架构文档 (指令集 + 反汇编 + 数据流)
+
+lib/  (gitignored, 从 IDA 导出)
+  so_code.bin                — SO code section (3.3MB)
+  so_data1.bin               — data segment 1 (164KB)
+  so_data2.bin               — data segment 2 (425KB)
 ```
 
 ## 签名函数入口
@@ -219,3 +225,50 @@ cargo clean -p dynarmic-sys   # 必须 clean，cargo 不追踪 C 文件变化
 cargo build --tests           # cmake 会自动重新编译
 ```
 `touch` Cargo.toml 或 build.rs **不够**，必须 `cargo clean -p dynarmic-sys`。
+
+## Windows 构建
+
+需要 Visual Studio 2022 + vcpkg Boost:
+```bash
+# 安装 Boost (只需 headers)
+vcpkg install boost-headers:x64-windows boost-icl:x64-windows boost-variant:x64-windows
+
+# 构建 (必须在 VS Developer Command Prompt 中)
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+set BOOST_ROOT=C:\Users\manji\vcpkg\installed\x64-windows
+cargo build
+cargo test test_vm_helios -- --test-threads=1 --nocapture
+```
+
+注意:
+- `build.rs` 中 macOS 代码有 `#[cfg(target_os = "macos")]` 条件编译
+- `mman.h` 添加了 `MAP_NORESERVE` + `madvise` stub (Windows 兼容)
+- dynarmic-sys `build.rs` 自动传 `Boost_INCLUDE_DIR` 和链接 fmt/mcl/Zycore/Zydis
+
+## Custom VM 架构（核心发现）
+
+libmetasec_ml.so 内嵌自定义字节码 VM，用于 Helios 和 Medusa 签名计算。
+
+### VM 关键参数
+- Dispatcher: `sub_168324` (SO+0x168324)
+- 寄存器文件: 32 个 64-bit 寄存器，X28 基址
+- 指令: 32-bit, bits[0:5]=opcode, bits[6:31]=操作数
+- CFF 地址公式: `handler = dispatch_table[opcode*8] - 0x33DC5`
+- CFF 常量: X4=`0xFF5F9EBBF5FE033C`, X5=`0x00A061440A061440`
+
+### Helios VM (已完成)
+- 字节码: SO+0x118F50 (64 dwords)
+- 输入: H1_hex(32B) + ts_str(26B) → PKCS#7 pad 到 64B → 4 blocks
+- 输出: part1(16B) + part2(16B)
+- 性能: 4 × ~37K steps = 89ms
+- **不依赖 handle**
+
+### Medusa VM (部分完成)
+- 字节码: SO+0x119050 (256 dwords)
+- 输入: TABLE_A/B → handle 数据（三级指针，运行时堆内存）
+- 输出: Medusa 明文 → AES-ECB 加密
+- **依赖 handle 数据**（需运行时捕获）
+- r12 = ASLR 重定位偏移 (bytecode 嵌入常量)
+
+### 完整指令集
+详见 `docs/vm_architecture.md`
