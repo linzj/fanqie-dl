@@ -1,9 +1,9 @@
 //! ARM64 JIT emulator using dynarmic-sys for fast signing.
 //! Crypto functions are intercepted via SVC breakpoints patched into the SO.
 
+use dynarmic_sys::Dynarmic;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use dynarmic_sys::Dynarmic;
 
 const HALT_ADDR: u64 = 0xDEAD_0000;
 
@@ -13,85 +13,85 @@ fn svc_bytes(imm16: u32) -> [u8; 4] {
 }
 
 // SVC IDs for fast-pathed functions
-const SVC_MD5_RAW: u32       = 0x100;
+const SVC_MD5_RAW: u32 = 0x100;
 const SVC_MD5_TRANSFORM: u32 = 0x101;
-const SVC_SHA1_TRANSFORM: u32= 0x102;
-const SVC_AES_ECB: u32       = 0x103;
-const SVC_ALLOC_BUF: u32     = 0x104;
-const SVC_MALLOC: u32        = 0x105;
-const SVC_CREATE_BUF: u32    = 0x106;
-const SVC_BUF_OP: u32        = 0x107;
-const SVC_FREE: u32          = 0x108;
-const SVC_AES_KEY_EXPAND: u32= 0x109;
-const SVC_MAP_SET: u32       = 0x10A;
-const SVC_LDADDH: u32        = 0x200; // LDADDH W0, W0, [X1]
-const SVC_LDADDLH: u32       = 0x201; // LDADDLH W0, W0, [X1]
-const SVC_REFCOUNT_NOP: u32  = 0x202; // Stub for ref-counting library functions
-const SVC_TRAP_NULL: u32     = 0x300; // Trap at address 0 (null jump detection)
-const SVC_JNI_BASE: u32      = 0x600; // JNI function stubs: SVC #(0x600 + index)
+const SVC_SHA1_TRANSFORM: u32 = 0x102;
+const SVC_AES_ECB: u32 = 0x103;
+const SVC_ALLOC_BUF: u32 = 0x104;
+const SVC_MALLOC: u32 = 0x105;
+const SVC_CREATE_BUF: u32 = 0x106;
+const SVC_BUF_OP: u32 = 0x107;
+const SVC_FREE: u32 = 0x108;
+const SVC_AES_KEY_EXPAND: u32 = 0x109;
+const SVC_MAP_SET: u32 = 0x10A;
+const SVC_LDADDH: u32 = 0x200; // LDADDH W0, W0, [X1]
+const SVC_LDADDLH: u32 = 0x201; // LDADDLH W0, W0, [X1]
+const SVC_REFCOUNT_NOP: u32 = 0x202; // Stub for ref-counting library functions
+const SVC_TRAP_NULL: u32 = 0x300; // Trap at address 0 (null jump detection)
+const SVC_JNI_BASE: u32 = 0x600; // JNI function stubs: SVC #(0x600 + index)
 
 /// No SVC patches in SO — CFF dispatch uses instruction addresses as constants.
 const HOOK_TABLE: &[(u64, u32)] = &[];
 
 // JNI memory layout
-const JNI_ENV_ADDR: u64      = 0x4000_0000; // JNIEnv* → [functions_ptr]
-const JNI_FUNC_TABLE: u64    = 0x4000_0100; // JNINativeInterface_ function table
-const JNI_STUBS_ADDR: u64    = 0x4000_1000; // SVC stub code page
-const JNI_STRING_AREA: u64   = 0x4000_2000; // Fake jstring / string data
-const JNI_OBJ_AREA: u64      = 0x4000_3000; // Fake jobject / jclass area
-const JNI_STACK_BASE: u64    = 0x4800_0000; // Fresh stack for JNI call
-const JNI_STACK_SIZE: u64    = 0x0080_0000; // 8MB stack
-const JNI_NUM_FUNCS: usize   = 232;         // Number of JNI functions
+const JNI_ENV_ADDR: u64 = 0x4000_0000; // JNIEnv* → [functions_ptr]
+const JNI_FUNC_TABLE: u64 = 0x4000_0100; // JNINativeInterface_ function table
+const JNI_STUBS_ADDR: u64 = 0x4000_1000; // SVC stub code page
+const JNI_STRING_AREA: u64 = 0x4000_2000; // Fake jstring / string data
+const JNI_OBJ_AREA: u64 = 0x4000_3000; // Fake jobject / jclass area
+const JNI_STACK_BASE: u64 = 0x4800_0000; // Fresh stack for JNI call
+const JNI_STACK_SIZE: u64 = 0x0080_0000; // 8MB stack
+const JNI_NUM_FUNCS: usize = 232; // Number of JNI functions
 
 // JNI function table indices (from jni.h)
-const JNI_FIND_CLASS: usize          = 6;
-const JNI_EXCEPTION_OCCURRED: usize  = 15;
-const JNI_EXCEPTION_CLEAR: usize     = 17;
-const JNI_NEW_GLOBAL_REF: usize      = 21;
-const JNI_DELETE_GLOBAL_REF: usize   = 22;
-const JNI_DELETE_LOCAL_REF: usize    = 23;
+const JNI_FIND_CLASS: usize = 6;
+const JNI_EXCEPTION_OCCURRED: usize = 15;
+const JNI_EXCEPTION_CLEAR: usize = 17;
+const JNI_NEW_GLOBAL_REF: usize = 21;
+const JNI_DELETE_GLOBAL_REF: usize = 22;
+const JNI_DELETE_LOCAL_REF: usize = 23;
 const JNI_ENSURE_LOCAL_CAPACITY: usize = 26;
-const JNI_NEW_OBJECT: usize          = 28;
-const JNI_GET_OBJECT_CLASS: usize    = 31;
-const JNI_GET_METHOD_ID: usize       = 33;
-const JNI_CALL_OBJECT_METHOD: usize  = 34;
+const JNI_NEW_OBJECT: usize = 28;
+const JNI_GET_OBJECT_CLASS: usize = 31;
+const JNI_GET_METHOD_ID: usize = 33;
+const JNI_CALL_OBJECT_METHOD: usize = 34;
 const JNI_CALL_OBJECT_METHOD_V: usize = 35;
 const JNI_CALL_OBJECT_METHOD_A: usize = 36;
 const JNI_CALL_BOOLEAN_METHOD: usize = 37;
-const JNI_CALL_INT_METHOD: usize     = 49;
-const JNI_CALL_VOID_METHOD: usize    = 61;
-const JNI_GET_STATIC_METHOD_ID: usize= 113;
+const JNI_CALL_INT_METHOD: usize = 49;
+const JNI_CALL_VOID_METHOD: usize = 61;
+const JNI_GET_STATIC_METHOD_ID: usize = 113;
 const JNI_CALL_STATIC_OBJECT_METHOD: usize = 114;
 const JNI_CALL_STATIC_INT_METHOD: usize = 120;
 const JNI_CALL_STATIC_VOID_METHOD: usize = 141;
-const JNI_GET_FIELD_ID: usize        = 94;
-const JNI_GET_OBJECT_FIELD: usize    = 95;
-const JNI_GET_INT_FIELD: usize       = 100;
-const JNI_GET_LONG_FIELD: usize      = 101;
-const JNI_SET_OBJECT_FIELD: usize    = 104;
-const JNI_SET_INT_FIELD: usize       = 109;
-const JNI_SET_LONG_FIELD: usize      = 110;
+const JNI_GET_FIELD_ID: usize = 94;
+const JNI_GET_OBJECT_FIELD: usize = 95;
+const JNI_GET_INT_FIELD: usize = 100;
+const JNI_GET_LONG_FIELD: usize = 101;
+const JNI_SET_OBJECT_FIELD: usize = 104;
+const JNI_SET_INT_FIELD: usize = 109;
+const JNI_SET_LONG_FIELD: usize = 110;
 const JNI_GET_STATIC_FIELD_ID: usize = 144;
 const JNI_GET_STATIC_OBJECT_FIELD: usize = 145;
-const JNI_NEW_STRING_UTF: usize      = 167;
+const JNI_NEW_STRING_UTF: usize = 167;
 const JNI_GET_STRING_UTF_LENGTH: usize = 168;
-const JNI_GET_STRING_UTF_CHARS: usize= 169;
+const JNI_GET_STRING_UTF_CHARS: usize = 169;
 const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
-const JNI_GET_ARRAY_LENGTH: usize    = 171;
-const JNI_NEW_OBJECT_ARRAY: usize    = 172;
+const JNI_GET_ARRAY_LENGTH: usize = 171;
+const JNI_NEW_OBJECT_ARRAY: usize = 172;
 const JNI_GET_OBJECT_ARRAY_ELEMENT: usize = 173;
 const JNI_SET_OBJECT_ARRAY_ELEMENT: usize = 174;
-const JNI_NEW_BYTE_ARRAY: usize      = 176;
+const JNI_NEW_BYTE_ARRAY: usize = 176;
 const JNI_GET_BYTE_ARRAY_ELEMENTS: usize = 184;
 const JNI_RELEASE_BYTE_ARRAY_ELEMENTS: usize = 192;
 const JNI_GET_BYTE_ARRAY_REGION: usize = 200;
 const JNI_SET_BYTE_ARRAY_REGION: usize = 211;
-const JNI_EXCEPTION_CHECK: usize     = 228;
+const JNI_EXCEPTION_CHECK: usize = 228;
 
 // Fake JNI object handles (opaque references)
-const JCLASS_HANDLE: u64     = 0x4000_3100; // Fake jclass for y2
-const JSTRING_URL: u64       = 0x4000_3200; // Fake jstring for URL
-const JOBJ_EXTRA: u64        = 0x4000_3300; // Fake jobject for extra headers array
+const JCLASS_HANDLE: u64 = 0x4000_3100; // Fake jclass for y2
+const JSTRING_URL: u64 = 0x4000_3200; // Fake jstring for URL
+const JOBJ_EXTRA: u64 = 0x4000_3300; // Fake jobject for extra headers array
 
 #[derive(Clone, Debug)]
 enum JniObject {
@@ -112,15 +112,36 @@ struct SharedState {
 
 fn reg_index(name: &str) -> Option<usize> {
     match name {
-        "x0"=>Some(0),"x1"=>Some(1),"x2"=>Some(2),"x3"=>Some(3),
-        "x4"=>Some(4),"x5"=>Some(5),"x6"=>Some(6),"x7"=>Some(7),
-        "x8"=>Some(8),"x9"=>Some(9),"x10"=>Some(10),"x11"=>Some(11),
-        "x12"=>Some(12),"x13"=>Some(13),"x14"=>Some(14),"x15"=>Some(15),
-        "x16"=>Some(16),"x17"=>Some(17),
-        "x19"=>Some(19),"x20"=>Some(20),"x21"=>Some(21),"x22"=>Some(22),
-        "x23"=>Some(23),"x24"=>Some(24),"x25"=>Some(25),"x26"=>Some(26),
-        "x27"=>Some(27),"x28"=>Some(28),
-        "fp"=>Some(29),"lr"=>Some(30),
+        "x0" => Some(0),
+        "x1" => Some(1),
+        "x2" => Some(2),
+        "x3" => Some(3),
+        "x4" => Some(4),
+        "x5" => Some(5),
+        "x6" => Some(6),
+        "x7" => Some(7),
+        "x8" => Some(8),
+        "x9" => Some(9),
+        "x10" => Some(10),
+        "x11" => Some(11),
+        "x12" => Some(12),
+        "x13" => Some(13),
+        "x14" => Some(14),
+        "x15" => Some(15),
+        "x16" => Some(16),
+        "x17" => Some(17),
+        "x19" => Some(19),
+        "x20" => Some(20),
+        "x21" => Some(21),
+        "x22" => Some(22),
+        "x23" => Some(23),
+        "x24" => Some(24),
+        "x25" => Some(25),
+        "x26" => Some(26),
+        "x27" => Some(27),
+        "x28" => Some(28),
+        "fp" => Some(29),
+        "lr" => Some(30),
         _ => None,
     }
 }
@@ -185,29 +206,31 @@ fn md5_transform_impl(state_bytes: &[u8], block: &[u8]) -> [u8; 16] {
     let (oa, ob, oc, od) = (a, b, c, d);
 
     let mut m = [0u32; 16];
-    for i in 0..16 { m[i] = u32::from_le_bytes(block[i*4..i*4+4].try_into().unwrap()); }
+    for i in 0..16 {
+        m[i] = u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
+    }
 
     static T: [u32; 64] = [
-        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
-        0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
-        0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
-        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
-        0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
-        0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
-        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
-        0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391,
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
     ];
     static S: [u32; 64] = [
-        7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
-        5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
-        4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
-        6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21,
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
     static MI: [usize; 64] = [
-        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
-        1,6,11,0,5,10,15,4,9,14,3,8,13,2,7,12,
-        5,8,11,14,1,4,7,10,13,0,3,6,9,12,15,2,
-        0,7,14,5,12,3,10,1,8,15,6,13,4,11,2,9,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1, 6, 11, 0, 5, 10, 15, 4, 9, 14, 3,
+        8, 13, 2, 7, 12, 5, 8, 11, 14, 1, 4, 7, 10, 13, 0, 3, 6, 9, 12, 15, 2, 0, 7, 14, 5, 12, 3,
+        10, 1, 8, 15, 6, 13, 4, 11, 2, 9,
     ];
 
     for i in 0..64 {
@@ -218,9 +241,16 @@ fn md5_transform_impl(state_bytes: &[u8], block: &[u8]) -> [u8; 16] {
             _ => c ^ (b | !d),
         };
         a = b.wrapping_add(
-            a.wrapping_add(fv).wrapping_add(T[i]).wrapping_add(m[MI[i]]).rotate_left(S[i])
+            a.wrapping_add(fv)
+                .wrapping_add(T[i])
+                .wrapping_add(m[MI[i]])
+                .rotate_left(S[i]),
         );
-        let tmp = d; d = c; c = b; b = a; a = tmp;
+        let tmp = d;
+        d = c;
+        c = b;
+        b = a;
+        a = tmp;
     }
 
     let mut out = [0u8; 16];
@@ -233,29 +263,48 @@ fn md5_transform_impl(state_bytes: &[u8], block: &[u8]) -> [u8; 16] {
 
 fn sha1_transform_impl(state_bytes: &[u8], block: &[u8]) -> [u8; 20] {
     let mut h = [0u32; 5];
-    for i in 0..5 { h[i] = u32::from_be_bytes(state_bytes[i*4..i*4+4].try_into().unwrap()); }
+    for i in 0..5 {
+        h[i] = u32::from_be_bytes(state_bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    }
 
     let mut w = [0u32; 80];
-    for i in 0..16 { w[i] = u32::from_be_bytes(block[i*4..i*4+4].try_into().unwrap()); }
-    for i in 16..80 { w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1); }
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    for i in 16..80 {
+        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+    }
 
     let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
     for i in 0..80 {
         let (f, k) = match i {
-            0..=19  => ((b & c) | (!b & d), 0x5A827999u32),
+            0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
             20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
             40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
-            _       => (b ^ c ^ d, 0xCA62C1D6u32),
+            _ => (b ^ c ^ d, 0xCA62C1D6u32),
         };
-        let tmp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
-        e = d; d = c; c = b.rotate_left(30); b = a; a = tmp;
+        let tmp = a
+            .rotate_left(5)
+            .wrapping_add(f)
+            .wrapping_add(e)
+            .wrapping_add(k)
+            .wrapping_add(w[i]);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = tmp;
     }
-    h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
-    h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
     h[4] = h[4].wrapping_add(e);
 
     let mut out = [0u8; 20];
-    for i in 0..5 { out[i*4..i*4+4].copy_from_slice(&h[i].to_be_bytes()); }
+    for i in 0..5 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
     out
 }
 
@@ -265,7 +314,9 @@ fn read_str_obj(dy: &Dynarmic<()>, ptr: u64) -> Option<String> {
     let len = u32::from_le_bytes(lb.try_into().ok()?) as usize;
     let pb = dy.mem_read_as_vec(ptr + 0x10, 8).ok()?;
     let dp = u64::from_le_bytes(pb.try_into().ok()?);
-    if len == 0 || len > 10000 { return None; }
+    if len == 0 || len > 10000 {
+        return None;
+    }
     String::from_utf8(dy.mem_read_as_vec(dp, len.min(2000)).ok()?).ok()
 }
 
@@ -275,22 +326,27 @@ pub fn test_signing() -> Vec<(String, String)> {
     let dir = env!("CARGO_MANIFEST_DIR");
     let memdump = std::fs::read(format!("{}/lib/memdump.bin", dir)).unwrap();
     let mut pos = 0usize;
-    let so_base = u64::from_le_bytes(memdump[pos..pos+8].try_into().unwrap()); pos += 8;
-    let count = u32::from_le_bytes(memdump[pos..pos+4].try_into().unwrap()) as usize; pos += 4;
+    let so_base = u64::from_le_bytes(memdump[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+    let count = u32::from_le_bytes(memdump[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
 
     let dy = std::sync::Arc::new(Dynarmic::<()>::new());
 
     // Collect all ranges (rebased)
     let mut ranges: Vec<(u64, usize, usize)> = Vec::with_capacity(count);
     for _ in 0..count {
-        let base = u64::from_le_bytes(memdump[pos..pos+8].try_into().unwrap()); pos += 8;
-        let size = u64::from_le_bytes(memdump[pos..pos+8].try_into().unwrap()) as usize; pos += 8;
+        let base = u64::from_le_bytes(memdump[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let size = u64::from_le_bytes(memdump[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
         ranges.push((base, size, pos));
         pos += size;
     }
 
     // Merge overlapping/adjacent page-aligned ranges for mapping
-    let mut page_ranges: Vec<(u64, u64)> = ranges.iter()
+    let mut page_ranges: Vec<(u64, u64)> = ranges
+        .iter()
         .map(|&(base, size, _)| {
             let a = base & !0xFFF;
             let b = (base + size as u64 + 0xFFF) & !0xFFF;
@@ -324,16 +380,29 @@ pub fn test_signing() -> Vec<(String, String)> {
         let mut off = 0usize;
         while off < size {
             let chunk_sz = (size - off).min(0x10000);
-            if let Err(e) = dy.mem_write(base + off as u64, &memdump[data_off + off..data_off + off + chunk_sz]) {
-                if ok { eprintln!("[emu] write fail at 0x{:x}+0x{:x}: {}", base, off, e); }
+            if let Err(e) = dy.mem_write(
+                base + off as u64,
+                &memdump[data_off + off..data_off + off + chunk_sz],
+            ) {
+                if ok {
+                    eprintln!("[emu] write fail at 0x{:x}+0x{:x}: {}", base, off, e);
+                }
                 ok = false;
                 break;
             }
             off += chunk_sz;
         }
-        if ok { loaded += 1; }
+        if ok {
+            loaded += 1;
+        }
     }
-    eprintln!("[emu] Loaded {}/{} ranges ({}KB mapped), SO=0x{:x}", loaded, count, total_mapped / 1024, so_base);
+    eprintln!(
+        "[emu] Loaded {}/{} ranges ({}KB mapped), SO=0x{:x}",
+        loaded,
+        count,
+        total_mapped / 1024,
+        so_base
+    );
 
     // Scan non-SO ranges for LSE atomic instructions and replace with SVC
     // Store original instruction in a lookup table for the SVC handler
@@ -341,9 +410,15 @@ pub fn test_signing() -> Vec<(String, String)> {
     let mut lse_map: HashMap<u64, u32> = HashMap::new(); // addr → original insn
     let mut lse_patched = 0u32;
     for &(base, size, data_off) in &ranges {
-        if base >= so_base && base < so_end { continue; }
+        if base >= so_base && base < so_end {
+            continue;
+        }
         for off in (0..size).step_by(4) {
-            let insn = u32::from_le_bytes(memdump[data_off + off..data_off + off + 4].try_into().unwrap());
+            let insn = u32::from_le_bytes(
+                memdump[data_off + off..data_off + off + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             let is_lse = (insn & 0x3F20FC00) == 0x08207C00  // CAS family
                       || (insn & 0x3F200C00) == 0x38200000; // LDADD family
             if is_lse {
@@ -356,14 +431,17 @@ pub fn test_signing() -> Vec<(String, String)> {
     }
     let lse_map = Arc::new(lse_map);
     if lse_patched > 0 {
-        eprintln!("[emu] Patched {} LSE atomic instructions in non-SO ranges", lse_patched);
+        eprintln!(
+            "[emu] Patched {} LSE atomic instructions in non-SO ranges",
+            lse_patched
+        );
     }
 
     // Map and fill halt page with RET
     let _ = dy.mem_map(HALT_ADDR, 0x1000, 3);
     let _ = dy.mem_protect(HALT_ADDR, 0x1000, 7);
     {
-        let ret_page: Vec<u8> = (0..0x1000/4)
+        let ret_page: Vec<u8> = (0..0x1000 / 4)
             .flat_map(|_| 0xD65F03C0u32.to_le_bytes())
             .collect();
         let _ = dy.mem_write(HALT_ADDR, &ret_page);
@@ -384,7 +462,10 @@ pub fn test_signing() -> Vec<(String, String)> {
     let _ = dy.mem_map(0, 0x1000, 3);
     let _ = dy.mem_protect(0, 0x1000, 7);
     let _ = dy.mem_write(0, &svc_bytes(SVC_TRAP_NULL));
-    eprintln!("[emu] Patched {} hooks + null trap (LSE handled dynamically)", HOOK_TABLE.len());
+    eprintln!(
+        "[emu] Patched {} hooks + null trap (LSE handled dynamically)",
+        HOOK_TABLE.len()
+    );
 
     // ========== Set up fake JNIEnv ==========
     // Map JNI area: 0x4000_0000..0x4000_FFFF
@@ -413,11 +494,17 @@ pub fn test_signing() -> Vec<(String, String)> {
     let _ = dy.mem_map(JNI_STACK_BASE, JNI_STACK_SIZE as usize + 0x1000, 3);
     let _ = dy.mem_protect(JNI_STACK_BASE, JNI_STACK_SIZE as usize + 0x1000, 7);
 
-    eprintln!("[emu] Fake JNIEnv at 0x{:x}, {} stubs, stack at 0x{:x}", JNI_ENV_ADDR, JNI_NUM_FUNCS, JNI_STACK_BASE);
+    eprintln!(
+        "[emu] Fake JNIEnv at 0x{:x}, {} stubs, stack at 0x{:x}",
+        JNI_ENV_ADDR, JNI_NUM_FUNCS, JNI_STACK_BASE
+    );
 
     // Set TPIDR_EL0 from register dump (real thread-local storage pointer)
     let mut tpidr = 0u64;
-    for line in std::fs::read_to_string(format!("{}/lib/regs_only.txt", dir)).unwrap().lines() {
+    for line in std::fs::read_to_string(format!("{}/lib/regs_only.txt", dir))
+        .unwrap()
+        .lines()
+    {
         if let Some(rest) = line.strip_prefix("REG:tpidr_el0:") {
             tpidr = u64::from_str_radix(rest.trim_start_matches("0x"), 16).unwrap_or(0);
         }
@@ -1174,10 +1261,15 @@ pub fn test_signing() -> Vec<(String, String)> {
         if let Ok(content) = std::fs::read_to_string(&frida_path) {
             for line in content.lines() {
                 let line = line.trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 let parts: Vec<&str> = line.split('-').collect();
                 if parts.len() == 2 {
-                    if let (Ok(s), Ok(e)) = (u64::from_str_radix(parts[0], 16), u64::from_str_radix(parts[1], 16)) {
+                    if let (Ok(s), Ok(e)) = (
+                        u64::from_str_radix(parts[0], 16),
+                        u64::from_str_radix(parts[1], 16),
+                    ) {
                         ranges.push((s, e));
                     }
                 }
@@ -1196,42 +1288,47 @@ pub fn test_signing() -> Vec<(String, String)> {
     let so_base_miss = so_base;
     let frida_ranges_cb = frida_ranges.clone();
     let st_miss = state.clone();
-    dy.set_unmapped_mem_callback(move |dy: &Dynarmic<()>, addr: u64, _size: usize, _value: u64| -> bool {
-        // Strip MTE tag from top byte (Android memory tagging)
-        let addr = addr & 0x00FF_FFFF_FFFF_FFFF;
-        let page = addr & !0xFFF;
-        let pc = dy.reg_read_pc().unwrap_or(0);
+    dy.set_unmapped_mem_callback(
+        move |dy: &Dynarmic<()>, addr: u64, _size: usize, _value: u64| -> bool {
+            // Strip MTE tag from top byte (Android memory tagging)
+            let addr = addr & 0x00FF_FFFF_FFFF_FFFF;
+            let page = addr & !0xFFF;
+            let pc = dy.reg_read_pc().unwrap_or(0);
 
-        // Check if this is a code fetch into Frida agent range
-        let in_frida = frida_ranges_cb.iter().any(|&(s, e)| addr >= s && addr < e);
-        let is_code_fetch = (pc & !0xFFF) == page || pc == addr;
+            // Check if this is a code fetch into Frida agent range
+            let in_frida = frida_ranges_cb.iter().any(|&(s, e)| addr >= s && addr < e);
+            let is_code_fetch = (pc & !0xFFF) == page || pc == addr;
 
-        if in_frida || is_code_fetch {
-            let lr = dy.reg_read(30).unwrap_or(0);
-            let x0 = dy.reg_read(0).unwrap_or(0);
-            eprintln!("[MISS] Frida/code fetch at 0x{:x} pc=0x{:x} LR=0x{:x} x0=0x{:x}", addr, pc, lr, x0);
-            // Skip the function: allocate heap block as return value and return to caller
-            let ptr = {
-                let mut s = st_miss.lock().unwrap();
-                let p = s.heap_next;
-                s.heap_next += 0x100;
-                p
-            };
-            let _ = dy.mem_write(ptr, &[0u8; 0x100]);
-            dy.reg_write_raw(0, ptr).unwrap();
-            dy.reg_write_pc(lr).unwrap();
-            let _ = dy.emu_stop(); // stop so retry loop picks up at LR
-            return false;
-        }
+            if in_frida || is_code_fetch {
+                let lr = dy.reg_read(30).unwrap_or(0);
+                let x0 = dy.reg_read(0).unwrap_or(0);
+                eprintln!(
+                    "[MISS] Frida/code fetch at 0x{:x} pc=0x{:x} LR=0x{:x} x0=0x{:x}",
+                    addr, pc, lr, x0
+                );
+                // Skip the function: allocate heap block as return value and return to caller
+                let ptr = {
+                    let mut s = st_miss.lock().unwrap();
+                    let p = s.heap_next;
+                    s.heap_next += 0x100;
+                    p
+                };
+                let _ = dy.mem_write(ptr, &[0u8; 0x100]);
+                dy.reg_write_raw(0, ptr).unwrap();
+                dy.reg_write_pc(lr).unwrap();
+                let _ = dy.emu_stop(); // stop so retry loop picks up at LR
+                return false;
+            }
 
-        eprintln!("[MISS] addr=0x{:x} page=0x{:x} pc=0x{:x}", addr, page, pc);
-        if page < 0x8000_0000_0000 {
-            mp.lock().unwrap().insert(page);
-        }
-        miss_flag_cb.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = dy.emu_stop();
-        false
-    });
+            eprintln!("[MISS] addr=0x{:x} page=0x{:x} pc=0x{:x}", addr, page, pc);
+            if page < 0x8000_0000_0000 {
+                mp.lock().unwrap().insert(page);
+            }
+            miss_flag_cb.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = dy.emu_stop();
+            false
+        },
+    );
 
     // ========== Set up JNI call to SO+0x26e684 ==========
     // y2.a(int tag, int type, long handle, String url, Object extra)
@@ -1248,10 +1345,13 @@ pub fn test_signing() -> Vec<(String, String)> {
 
         // Register URL jstring in object table
         let mut st = state.lock().unwrap();
-        st.jni_objects.insert(JSTRING_URL, JniObject::String(test_url.to_string()));
+        st.jni_objects
+            .insert(JSTRING_URL, JniObject::String(test_url.to_string()));
         // Register extra as empty array
-        st.jni_objects.insert(JOBJ_EXTRA, JniObject::ObjectArray(vec![]));
-        st.jni_objects.insert(JCLASS_HANDLE, JniObject::Class("ms.bd.c.y2".into()));
+        st.jni_objects
+            .insert(JOBJ_EXTRA, JniObject::ObjectArray(vec![]));
+        st.jni_objects
+            .insert(JCLASS_HANDLE, JniObject::Class("ms.bd.c.y2".into()));
         st.jni_string_next = url_data_addr + ((url_bytes.len() as u64 + 16) & !0xF);
     }
 
@@ -1261,11 +1361,11 @@ pub fn test_signing() -> Vec<(String, String)> {
     dy.reg_write_raw(29, stack_top).unwrap(); // FP = SP
 
     // Set JNI call registers
-    dy.reg_write_raw(0, JNI_ENV_ADDR).unwrap();  // x0 = JNIEnv*
-    dy.reg_write_raw(1, JCLASS_HANDLE).unwrap();  // x1 = jclass
-    dy.reg_write_raw(2, 0x3000001).unwrap();      // x2 = tag (signing)
-    dy.reg_write_raw(3, 0).unwrap();               // x3 = type
-    // Load real MetaSec handle object from dump
+    dy.reg_write_raw(0, JNI_ENV_ADDR).unwrap(); // x0 = JNIEnv*
+    dy.reg_write_raw(1, JCLASS_HANDLE).unwrap(); // x1 = jclass
+    dy.reg_write_raw(2, 0x3000001).unwrap(); // x2 = tag (signing)
+    dy.reg_write_raw(3, 0).unwrap(); // x3 = type
+                                     // Load real MetaSec handle object from dump
     let handle_addr;
     let handle_dump_path = format!("{}/lib/handle_dump.bin", dir);
     if std::path::Path::new(&handle_dump_path).exists() {
@@ -1281,17 +1381,21 @@ pub fn test_signing() -> Vec<(String, String)> {
         let _ = dy.mem_map(page, map_size, 3);
         let _ = dy.mem_write(orig_addr, data);
         handle_addr = orig_addr;
-        eprintln!("[emu] Loaded real MetaSec handle: 0x{:x} ({} bytes)", handle_addr, data_len);
+        eprintln!(
+            "[emu] Loaded real MetaSec handle: 0x{:x} ({} bytes)",
+            handle_addr, data_len
+        );
 
         // Also map pages for pointers found in handle data (follow internal pointers)
         for off in (0..data_len).step_by(8) {
             if off + 8 <= data_len {
-                let ptr = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
+                let ptr = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
                 // Check if it's a heap-like pointer in the same range (not SO, not stack)
                 let ptr_page = ptr & !0xFFF;
                 if ptr > 0x7000_0000_0000 && ptr < 0x8000_0000_0000
                     && !(ptr >= so_base && ptr < so_base + 0x400000) // not in SO
-                    && ptr_page != page // not same page as handle
+                    && ptr_page != page
+                // not same page as handle
                 {
                     // Try to map it if not already mapped (will fail silently if already mapped)
                     let _ = dy.mem_map(ptr_page, 0x1000, 3);
@@ -1307,12 +1411,15 @@ pub fn test_signing() -> Vec<(String, String)> {
             h
         };
         let _ = dy.mem_write(handle_addr, &vec![0u8; 0x1000]);
-        eprintln!("[emu] WARNING: No handle_dump.bin, using fake handle at 0x{:x}", handle_addr);
+        eprintln!(
+            "[emu] WARNING: No handle_dump.bin, using fake handle at 0x{:x}",
+            handle_addr
+        );
     }
-    dy.reg_write_raw(4, handle_addr).unwrap();      // x4 = handle (MetaSec context)
-    dy.reg_write_raw(5, JSTRING_URL).unwrap();     // x5 = url (jstring)
-    dy.reg_write_raw(6, JOBJ_EXTRA).unwrap();      // x6 = extra (jobject)
-    dy.reg_write_raw(30, HALT_ADDR).unwrap();      // LR = halt (return here when done)
+    dy.reg_write_raw(4, handle_addr).unwrap(); // x4 = handle (MetaSec context)
+    dy.reg_write_raw(5, JSTRING_URL).unwrap(); // x5 = url (jstring)
+    dy.reg_write_raw(6, JOBJ_EXTRA).unwrap(); // x6 = extra (jobject)
+    dy.reg_write_raw(30, HALT_ADDR).unwrap(); // LR = halt (return here when done)
 
     // Write stack canary at [TPIDR+0x28] if not already present
     if tpidr != 0 {
@@ -1328,8 +1435,14 @@ pub fn test_signing() -> Vec<(String, String)> {
 
     let start = so_base + 0x26e684;
     eprintln!("[emu] Starting at SO+0x26e684 (JNI native entry, dynarmic JIT)");
-    eprintln!("[emu]   x0(JNIEnv)=0x{:x} x1(jclass)=0x{:x} x2(tag)=0x{:x}", JNI_ENV_ADDR, JCLASS_HANDLE, 0x3000001u64);
-    eprintln!("[emu]   x3(type)=0 x4(handle)=0 x5(url)=0x{:x} x6(extra)=0x{:x}", JSTRING_URL, JOBJ_EXTRA);
+    eprintln!(
+        "[emu]   x0(JNIEnv)=0x{:x} x1(jclass)=0x{:x} x2(tag)=0x{:x}",
+        JNI_ENV_ADDR, JCLASS_HANDLE, 0x3000001u64
+    );
+    eprintln!(
+        "[emu]   x3(type)=0 x4(handle)=0 x5(url)=0x{:x} x6(extra)=0x{:x}",
+        JSTRING_URL, JOBJ_EXTRA
+    );
     eprintln!("[emu]   SP=0x{:x} LR=0x{:x}", stack_top, HALT_ADDR);
     let t0 = std::time::Instant::now();
 
@@ -1346,9 +1459,9 @@ pub fn test_signing() -> Vec<(String, String)> {
             let sp = dy_timeout.reg_read_sp().unwrap_or(0);
             let so_off = pc.wrapping_sub(so_base_timer);
             if so_off < 0x400000 {
-                eprintln!("[sample] t={}s PC=SO+0x{:x} SP=0x{:x}", i+1, so_off, sp);
+                eprintln!("[sample] t={}s PC=SO+0x{:x} SP=0x{:x}", i + 1, so_off, sp);
             } else {
-                eprintln!("[sample] t={}s PC=0x{:x} SP=0x{:x}", i+1, pc, sp);
+                eprintln!("[sample] t={}s PC=0x{:x} SP=0x{:x}", i + 1, pc, sp);
             }
         }
         timed_out_flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1366,16 +1479,28 @@ pub fn test_signing() -> Vec<(String, String)> {
             let so_off = pc.wrapping_sub(so_base);
             let is_branch = pc != trace_pc + 4;
             if step < 30 || is_branch || pc == HALT_ADDR {
-                let insn = dy.mem_read_as_vec(trace_pc, 4).ok()
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0;4])))
+                let insn = dy
+                    .mem_read_as_vec(trace_pc, 4)
+                    .ok()
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
                     .unwrap_or(0);
                 if so_off < 0x400000 {
-                    eprintln!("[trace] #{:4} SO+0x{:x} → SO+0x{:x} insn=0x{:08x}{}",
-                        step, trace_pc.wrapping_sub(so_base), so_off, insn,
-                        if is_branch { " <<<" } else { "" });
+                    eprintln!(
+                        "[trace] #{:4} SO+0x{:x} → SO+0x{:x} insn=0x{:08x}{}",
+                        step,
+                        trace_pc.wrapping_sub(so_base),
+                        so_off,
+                        insn,
+                        if is_branch { " <<<" } else { "" }
+                    );
                 } else {
-                    eprintln!("[trace] #{:4} SO+0x{:x} → 0x{:x} insn=0x{:08x} <<<",
-                        step, trace_pc.wrapping_sub(so_base), pc, insn);
+                    eprintln!(
+                        "[trace] #{:4} SO+0x{:x} → 0x{:x} insn=0x{:08x} <<<",
+                        step,
+                        trace_pc.wrapping_sub(so_base),
+                        pc,
+                        insn
+                    );
                 }
             }
             if pc == HALT_ADDR || miss_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1402,26 +1527,45 @@ pub fn test_signing() -> Vec<(String, String)> {
     dy.emu_start(start, HALT_ADDR).ok();
     loop {
         let pc = dy.reg_read_pc().unwrap_or(0);
-        if pc == HALT_ADDR || timed_out.load(std::sync::atomic::Ordering::Relaxed) || miss_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        if pc == HALT_ADDR
+            || timed_out.load(std::sync::atomic::Ordering::Relaxed)
+            || miss_flag.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let elapsed = t0.elapsed().as_secs_f64();
-            eprintln!("[emu] Done in {:.1}s, {} retries, PC=0x{:x}", elapsed, retries, pc);
+            eprintln!(
+                "[emu] Done in {:.1}s, {} retries, PC=0x{:x}",
+                elapsed, retries, pc
+            );
             break;
         }
         retries += 1;
         // Check if PC is in a missing page or garbage address — stop
         let pc_page = pc & !0xFFF;
-        if missing_pages.lock().unwrap().contains(&pc_page) || pc > 0x8000_0000_0000 || pc < 0x1000 {
+        if missing_pages.lock().unwrap().contains(&pc_page) || pc > 0x8000_0000_0000 || pc < 0x1000
+        {
             let elapsed = t0.elapsed().as_secs_f64();
-            eprintln!("[emu] Halted at missing page PC=0x{:x} after {:.1}s, {} retries", pc, elapsed, retries);
+            eprintln!(
+                "[emu] Halted at missing page PC=0x{:x} after {:.1}s, {} retries",
+                pc, elapsed, retries
+            );
             break;
         }
         if retries <= 50 {
             let lr = dy.reg_read(30).unwrap_or(0);
-            let insn_hex = dy.mem_read_as_vec(pc, 4).ok()
+            let insn_hex = dy
+                .mem_read_as_vec(pc, 4)
+                .ok()
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
                 .unwrap_or(0);
-            eprintln!("[emu] Retry #{}: PC=0x{:x} (SO+0x{:x}) LR=0x{:x} insn=0x{:08x} t={:.1}s",
-                retries, pc, pc.wrapping_sub(so_base), lr, insn_hex, t0.elapsed().as_secs_f64());
+            eprintln!(
+                "[emu] Retry #{}: PC=0x{:x} (SO+0x{:x}) LR=0x{:x} insn=0x{:08x} t={:.1}s",
+                retries,
+                pc,
+                pc.wrapping_sub(so_base),
+                lr,
+                insn_hex,
+                t0.elapsed().as_secs_f64()
+            );
         }
         if retries > 10000 {
             eprintln!("[emu] Too many retries, giving up");
@@ -1443,19 +1587,25 @@ pub fn test_signing() -> Vec<(String, String)> {
                 let addend = dy.reg_read(rs).unwrap_or(0);
                 let xn = dy.reg_read(rn).unwrap_or(0);
                 let nbytes = 1usize << size;
-                let old = dy.mem_read_as_vec(xn, nbytes).ok()
+                let old = dy
+                    .mem_read_as_vec(xn, nbytes)
+                    .ok()
                     .map(|b| {
                         let mut buf = [0u8; 8];
                         buf[..nbytes].copy_from_slice(&b);
                         u64::from_le_bytes(buf)
-                    }).unwrap_or(0);
+                    })
+                    .unwrap_or(0);
                 let new_val = old.wrapping_add(addend) & ((1u128 << (nbytes * 8)) - 1) as u64;
                 let _ = dy.mem_write(xn, &new_val.to_le_bytes()[..nbytes]);
                 if rt != 31 {
                     dy.reg_write_raw(rt, old).unwrap();
                 }
                 if retries <= 50 {
-                    eprintln!("[emu] LDADD({}): [X{}=0x{:x}] old=0x{:x} +0x{:x} → W{}", nbytes, rn, xn, old, addend, rt);
+                    eprintln!(
+                        "[emu] LDADD({}): [X{}=0x{:x}] old=0x{:x} +0x{:x} → W{}",
+                        nbytes, rn, xn, old, addend, rt
+                    );
                 }
                 dy.reg_write_pc(pc + 4).unwrap();
                 handled = true;
@@ -1473,13 +1623,27 @@ pub fn test_signing() -> Vec<(String, String)> {
                 let addr = dy.reg_read(rn).unwrap_or(0);
                 let is_64 = (insn >> 30) == 3;
                 let (old, compare, new_val) = if is_64 {
-                    let old = dy.mem_read_as_vec(addr, 8).ok()
-                        .map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
-                    (old, dy.reg_read(rs).unwrap_or(0), dy.reg_read(rt).unwrap_or(0))
+                    let old = dy
+                        .mem_read_as_vec(addr, 8)
+                        .ok()
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        .unwrap_or(0);
+                    (
+                        old,
+                        dy.reg_read(rs).unwrap_or(0),
+                        dy.reg_read(rt).unwrap_or(0),
+                    )
                 } else {
-                    let old = dy.mem_read_as_vec(addr, 4).ok()
-                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as u64).unwrap_or(0);
-                    (old, dy.reg_read(rs).unwrap_or(0) & 0xFFFFFFFF, dy.reg_read(rt).unwrap_or(0) & 0xFFFFFFFF)
+                    let old = dy
+                        .mem_read_as_vec(addr, 4)
+                        .ok()
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as u64)
+                        .unwrap_or(0);
+                    (
+                        old,
+                        dy.reg_read(rs).unwrap_or(0) & 0xFFFFFFFF,
+                        dy.reg_read(rt).unwrap_or(0) & 0xFFFFFFFF,
+                    )
                 };
                 if old == compare {
                     if is_64 {
@@ -1490,9 +1654,17 @@ pub fn test_signing() -> Vec<(String, String)> {
                 }
                 dy.reg_write_raw(rs, old).unwrap();
                 if retries <= 50 {
-                    eprintln!("[emu] CAS: [X{}=0x{:x}] old=0x{:x} cmp=W{}=0x{:x} new=W{}=0x{:x} {}",
-                        rn, addr, old, rs, compare, rt, new_val,
-                        if old == compare { "SWAPPED" } else { "KEPT" });
+                    eprintln!(
+                        "[emu] CAS: [X{}=0x{:x}] old=0x{:x} cmp=W{}=0x{:x} new=W{}=0x{:x} {}",
+                        rn,
+                        addr,
+                        old,
+                        rs,
+                        compare,
+                        rt,
+                        new_val,
+                        if old == compare { "SWAPPED" } else { "KEPT" }
+                    );
                 }
                 dy.reg_write_pc(pc + 4).unwrap();
                 handled = true;
@@ -1503,10 +1675,14 @@ pub fn test_signing() -> Vec<(String, String)> {
                 let rn = ((insn >> 5) & 0x1F) as usize;
                 let rt = (insn & 0x1F) as usize;
                 let addr = dy.reg_read(rn).unwrap_or(0);
-                let val = dy.mem_read_as_vec(addr, 4).ok()
+                let val = dy
+                    .mem_read_as_vec(addr, 4)
+                    .ok()
                     .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
                     .unwrap_or(0);
-                if rt != 31 { dy.reg_write_raw(rt, val as u64).unwrap(); }
+                if rt != 31 {
+                    dy.reg_write_raw(rt, val as u64).unwrap();
+                }
                 if retries <= 50 {
                     eprintln!("[emu] LDAXR: W{}=[X{}=0x{:x}] = 0x{:x}", rt, rn, addr, val);
                 }
@@ -1523,9 +1699,14 @@ pub fn test_signing() -> Vec<(String, String)> {
                 let val = dy.reg_read(rt).unwrap_or(0) as u32;
                 let _ = dy.mem_write(addr, &val.to_le_bytes());
                 // Ws = 0 (success)
-                if rs != 31 { dy.reg_write_raw(rs, 0).unwrap(); }
+                if rs != 31 {
+                    dy.reg_write_raw(rs, 0).unwrap();
+                }
                 if retries <= 50 {
-                    eprintln!("[emu] STLXR: [X{}=0x{:x}] = W{}=0x{:x}, W{}=0", rn, addr, rt, val, rs);
+                    eprintln!(
+                        "[emu] STLXR: [X{}=0x{:x}] = W{}=0x{:x}, W{}=0",
+                        rn, addr, rt, val, rs
+                    );
                 }
                 dy.reg_write_pc(pc + 4).unwrap();
                 handled = true;
@@ -1554,14 +1735,22 @@ pub fn test_signing() -> Vec<(String, String)> {
             if let JniObject::ObjectArray(arr) = obj {
                 for pair in arr.chunks(2) {
                     if pair.len() == 2 {
-                        let key = st.jni_objects.get(&pair[0]).map(|o| match o {
-                            JniObject::String(s) => s.clone(),
-                            _ => format!("obj:0x{:x}", pair[0]),
-                        }).unwrap_or_default();
-                        let val = st.jni_objects.get(&pair[1]).map(|o| match o {
-                            JniObject::String(s) => s.clone(),
-                            _ => format!("obj:0x{:x}", pair[1]),
-                        }).unwrap_or_default();
+                        let key = st
+                            .jni_objects
+                            .get(&pair[0])
+                            .map(|o| match o {
+                                JniObject::String(s) => s.clone(),
+                                _ => format!("obj:0x{:x}", pair[0]),
+                            })
+                            .unwrap_or_default();
+                        let val = st
+                            .jni_objects
+                            .get(&pair[1])
+                            .map(|o| match o {
+                                JniObject::String(s) => s.clone(),
+                                _ => format!("obj:0x{:x}", pair[1]),
+                            })
+                            .unwrap_or_default();
                         eprintln!("[SIG] {}={}", key, &val[..val.len().min(80)]);
                     }
                 }
@@ -1578,7 +1767,8 @@ pub fn test_signing() -> Vec<(String, String)> {
             for pair in arr.chunks(2) {
                 if pair.len() == 2 {
                     if let (Some(JniObject::String(k)), Some(JniObject::String(v))) =
-                        (st.jni_objects.get(&pair[0]), st.jni_objects.get(&pair[1])) {
+                        (st.jni_objects.get(&pair[0]), st.jni_objects.get(&pair[1]))
+                    {
                         if !sigs.iter().any(|(sk, _)| sk == k) {
                             sigs.push((k.clone(), v.clone()));
                         }
@@ -1589,7 +1779,12 @@ pub fn test_signing() -> Vec<(String, String)> {
     }
 
     let pages = missing_pages.lock().unwrap();
-    eprintln!("[emu] {} SVCs total, {} signatures captured, {} missing pages", total_svcs, sigs.len(), pages.len());
+    eprintln!(
+        "[emu] {} SVCs total, {} signatures captured, {} missing pages",
+        total_svcs,
+        sigs.len(),
+        pages.len()
+    );
     if pc == HALT_ADDR {
         eprintln!("[emu] Function returned normally!");
     }
@@ -1608,7 +1803,10 @@ pub fn test_signing() -> Vec<(String, String)> {
 /// Output: 32 bytes (part1 + part2)
 fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
     use dynarmic_sys::Dynarmic;
-    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
 
     let dir = env!("CARGO_MANIFEST_DIR");
     let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir)).expect("so_code.bin");
@@ -1620,13 +1818,24 @@ fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
 
     // Map SO
     let code_page = so_base & !0xFFF;
-    dy.mem_map(code_page, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3).unwrap();
+    dy.mem_map(code_page, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3)
+        .unwrap();
     dy.mem_write(so_base, &so_code[..0x348700]).unwrap();
     let d1 = so_base + 0x34C700;
-    dy.mem_map(d1 & !0xFFF, ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+    dy.mem_map(
+        d1 & !0xFFF,
+        ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF),
+        3,
+    )
+    .unwrap();
     dy.mem_write(d1, &so_data1[..0x28F10]).unwrap();
     let d2 = so_base + 0x379610;
-    dy.mem_map(d2 & !0xFFF, ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+    dy.mem_map(
+        d2 & !0xFFF,
+        ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF),
+        3,
+    )
+    .unwrap();
     dy.mem_write(d2, &so_data2[..0x6A460]).unwrap();
 
     // Stack + halt + TPIDR
@@ -1637,12 +1846,14 @@ fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
     let halt_addr: u64 = 0xDEAD_0000;
     dy.mem_map(halt_addr, 0x1000, 3).unwrap();
     for off in (0..0x1000).step_by(4) {
-        dy.mem_write(halt_addr + off, &0xD65F03C0u32.to_le_bytes()).unwrap();
+        dy.mem_write(halt_addr + off, &0xD65F03C0u32.to_le_bytes())
+            .unwrap();
     }
 
     let tpidr: u64 = 0x8000_0000;
     dy.mem_map(tpidr, 0x1000, 3).unwrap();
-    dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+    dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
+        .unwrap();
     dy.reg_write_tpidr_el0(tpidr).unwrap();
 
     // PKCS#7 padding: h1_hex(32) + ts_str(26) = 58 → pad to 64
@@ -1664,12 +1875,14 @@ fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
     let miss = Arc::new(AtomicBool::new(false));
     {
         let m = miss.clone();
-        dy.set_unmapped_mem_callback(move |d: &Dynarmic<()>, addr: u64, _: usize, _: u64| -> bool {
-            eprintln!("[helios] UNMAPPED 0x{:x}", addr & 0x00FF_FFFF_FFFF_FFFF);
-            m.store(true, std::sync::atomic::Ordering::SeqCst);
-            d.emu_stop().ok();
-            false
-        });
+        dy.set_unmapped_mem_callback(
+            move |d: &Dynarmic<()>, addr: u64, _: usize, _: u64| -> bool {
+                eprintln!("[helios] UNMAPPED 0x{:x}", addr & 0x00FF_FFFF_FFFF_FFFF);
+                m.store(true, std::sync::atomic::Ordering::SeqCst);
+                d.emu_stop().ok();
+                false
+            },
+        );
     }
     dy.set_svc_callback(|_: &Dynarmic<()>, n: u32, _: u64, _: u64| {
         eprintln!("[helios] SVC #{:#x}", n);
@@ -1683,14 +1896,16 @@ fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
     for i in 0..(padded.len() / 16) {
         let off = (i * 16) as u64;
         let pa = sp - 0x100;
-        dy.mem_write(pa,      &workspace.to_le_bytes()).unwrap();
-        dy.mem_write(pa + 8,  &(input_addr + off).to_le_bytes()).unwrap();
-        dy.mem_write(pa + 16, &(output_addr + off).to_le_bytes()).unwrap();
+        dy.mem_write(pa, &workspace.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 8, &(input_addr + off).to_le_bytes())
+            .unwrap();
+        dy.mem_write(pa + 16, &(output_addr + off).to_le_bytes())
+            .unwrap();
 
         let ctx = sp - 0x200;
         let vm_stk = sp - 0x300 - (i as u64) * 0x200;
-        dy.mem_write(ctx,      &callback.to_le_bytes()).unwrap();
-        dy.mem_write(ctx + 8,  &vm_stk.to_le_bytes()).unwrap();
+        dy.mem_write(ctx, &callback.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 8, &vm_stk.to_le_bytes()).unwrap();
         dy.mem_write(ctx + 16, &0u64.to_le_bytes()).unwrap();
 
         dy.reg_write_raw(0, bytecode).unwrap();
@@ -1705,8 +1920,12 @@ fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
         let mut steps = 0u64;
         loop {
             let pc = dy.reg_read_pc().unwrap_or(0);
-            if pc == halt_addr || pc == halt_addr + 4 { break; }
-            if miss.load(std::sync::atomic::Ordering::SeqCst) || steps >= 200_000 { break; }
+            if pc == halt_addr || pc == halt_addr + 4 {
+                break;
+            }
+            if miss.load(std::sync::atomic::Ordering::SeqCst) || steps >= 200_000 {
+                break;
+            }
             dy.emu_step(pc).ok();
             steps += 1;
         }
@@ -1742,7 +1961,9 @@ pub fn sign(url_query: &str) -> HashMap<String, String> {
 
     // ts_str = "{unix_ts}-{device_reg_id}-1967"
     let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let ts_str = format!("{}-1394812046-1967", ts);
 
     // Compute part1+part2 via VM
@@ -1762,9 +1983,7 @@ pub fn sign(url_query: &str) -> HashMap<String, String> {
     // === X-Medusa construction ===
     // AES-128-ECB key = MD5("1967" + [0xab,0x7c,0xfe,0x85] + "1967")
     let aes_key_input = [
-        b'1', b'9', b'6', b'7',
-        0xab, 0x7c, 0xfe, 0x85,
-        b'1', b'9', b'6', b'7',
+        b'1', b'9', b'6', b'7', 0xab, 0x7c, 0xfe, 0x85, b'1', b'9', b'6', b'7',
     ];
     let aes_key = md5::compute(&aes_key_input).0; // 059874c397db2a6594024f0aa1c288c4
 
@@ -1793,14 +2012,16 @@ pub fn sign(url_query: &str) -> HashMap<String, String> {
     medusa_plain.extend_from_slice(&h5);
     medusa_plain.extend_from_slice(&ts.to_le_bytes());
     medusa_plain.extend_from_slice(&[0u8; 8]); // padding
-    // Remaining blocks: zeros/device info
+                                               // Remaining blocks: zeros/device info
     while medusa_plain.len() < 272 {
         medusa_plain.push(0);
     }
 
     // AES-128-ECB encrypt in-place
     use aes::cipher::{BlockEncrypt, KeyInit};
-    let cipher = aes::Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(&aes_key));
+    let cipher = aes::Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(
+        &aes_key,
+    ));
     let mut medusa_enc = medusa_plain.clone();
     for chunk in medusa_enc.chunks_exact_mut(16) {
         let block = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
@@ -1827,7 +2048,7 @@ pub fn sign(url_query: &str) -> HashMap<String, String> {
     sha1_input.extend_from_slice(b"1967");
     sha1_input.extend_from_slice(&[0xab, 0x7c, 0xfe, 0x85]);
     let sha1_hash = {
-        use sha1::{Sha1, Digest};
+        use sha1::{Digest, Sha1};
         let mut hasher = Sha1::new();
         hasher.update(&sha1_input);
         hasher.finalize()
@@ -1848,7 +2069,11 @@ pub fn sign(url_query: &str) -> HashMap<String, String> {
     let medusa_b64 = base64::engine::general_purpose::STANDARD.encode(&medusa_raw);
     headers.insert("X-Medusa".to_string(), medusa_b64);
 
-    eprintln!("[sign] X-Medusa generated ({} bytes raw, {} b64)", medusa_raw.len(), headers["X-Medusa"].len());
+    eprintln!(
+        "[sign] X-Medusa generated ({} bytes raw, {} b64)",
+        medusa_raw.len(),
+        headers["X-Medusa"].len()
+    );
     headers
 }
 
@@ -1857,8 +2082,13 @@ mod tests {
     #[test]
     fn test_signing() {
         let sigs = super::test_signing();
-        for (k, v) in &sigs { println!("  {}: {}...", k, &v[..v.len().min(60)]); }
-        assert!(sigs.iter().any(|(k,_)| k == "X-Helios"), "Missing X-Helios");
+        for (k, v) in &sigs {
+            println!("  {}: {}...", k, &v[..v.len().min(60)]);
+        }
+        assert!(
+            sigs.iter().any(|(k, _)| k == "X-Helios"),
+            "Missing X-Helios"
+        );
     }
 
     /// Test actual download with signing
@@ -1936,17 +2166,20 @@ mod tests {
     #[test]
     fn test_vm_helios() {
         use dynarmic_sys::Dynarmic;
-        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
 
         let dir = env!("CARGO_MANIFEST_DIR");
 
         // --- Load SO sections from IDA-dumped files ---
         let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir))
             .expect("Missing lib/so_code.bin — dump from IDA");
-        let so_data1 = std::fs::read(format!("{}/lib/so_data1.bin", dir))
-            .expect("Missing lib/so_data1.bin");
-        let so_data2 = std::fs::read(format!("{}/lib/so_data2.bin", dir))
-            .expect("Missing lib/so_data2.bin");
+        let so_data1 =
+            std::fs::read(format!("{}/lib/so_data1.bin", dir)).expect("Missing lib/so_data1.bin");
+        let so_data2 =
+            std::fs::read(format!("{}/lib/so_data2.bin", dir)).expect("Missing lib/so_data2.bin");
 
         // Runtime base address (from IDA)
         let so_base: u64 = 0x6d88_01b0_00;
@@ -1956,8 +2189,12 @@ mod tests {
         let data2_off: u64 = 0x379610;
         let data2_size = 0x6A460usize;
 
-        eprintln!("[vm] SO base=0x{:x}, code={}KB, data={}KB",
-            so_base, code_size/1024, (data1_size+data2_size)/1024);
+        eprintln!(
+            "[vm] SO base=0x{:x}, code={}KB, data={}KB",
+            so_base,
+            code_size / 1024,
+            (data1_size + data2_size) / 1024
+        );
 
         // --- Create dynarmic instance ---
         let dy = Arc::new(Dynarmic::<()>::new());
@@ -1966,21 +2203,26 @@ mod tests {
         let code_page = so_base & !0xFFF;
         let code_map_size = ((code_size + 0xFFF) & !0xFFF) + 0x1000;
         dy.mem_map(code_page, code_map_size, 3).expect("map code");
-        dy.mem_write(so_base, &so_code[..code_size]).expect("write code");
+        dy.mem_write(so_base, &so_code[..code_size])
+            .expect("write code");
         eprintln!("[vm] Mapped code: 0x{:x} +0x{:x}", code_page, code_map_size);
 
         // Map data sections (RW-) — contains dispatch table ptr + runtime data
         let d1_addr = so_base + data1_off;
         let d1_page = d1_addr & !0xFFF;
         let d1_map = ((d1_addr + data1_size as u64 + 0xFFF) & !0xFFF) - d1_page;
-        dy.mem_map(d1_page as u64, d1_map as usize, 3).expect("map data1");
-        dy.mem_write(d1_addr, &so_data1[..data1_size]).expect("write data1");
+        dy.mem_map(d1_page as u64, d1_map as usize, 3)
+            .expect("map data1");
+        dy.mem_write(d1_addr, &so_data1[..data1_size])
+            .expect("write data1");
 
         let d2_addr = so_base + data2_off;
         let d2_page = d2_addr & !0xFFF;
         let d2_map = ((d2_addr + data2_size as u64 + 0xFFF) & !0xFFF) - d2_page;
-        dy.mem_map(d2_page as u64, d2_map as usize, 3).expect("map data2");
-        dy.mem_write(d2_addr, &so_data2[..data2_size]).expect("write data2");
+        dy.mem_map(d2_page as u64, d2_map as usize, 3)
+            .expect("map data2");
+        dy.mem_write(d2_addr, &so_data2[..data2_size])
+            .expect("write data2");
         eprintln!("[vm] Mapped data sections");
 
         // --- Map the external dispatch table ---
@@ -2002,7 +2244,7 @@ mod tests {
         // H1_hex(32 bytes ASCII) + ts_str(26 bytes) = 58, PKCS#7 padded to 64
         // Test data: use known patterns
         let h1_hex = b"bb7a9a17c05b0a773849723adc3bc5af"; // sample H1 hex string (32 bytes)
-        let ts_str = b"1774952267-1394812046-1967";        // sample ts string (26 bytes)
+        let ts_str = b"1774952267-1394812046-1967"; // sample ts string (26 bytes)
         let mut padded_input = Vec::with_capacity(64);
         padded_input.extend_from_slice(h1_hex);
         padded_input.extend_from_slice(ts_str);
@@ -2010,18 +2252,25 @@ mod tests {
         let pad_len = 64 - padded_input.len();
         padded_input.extend(std::iter::repeat(pad_len as u8).take(pad_len));
         assert_eq!(padded_input.len(), 64);
-        eprintln!("[vm] Padded input ({} bytes): {}", padded_input.len(), hex::encode(&padded_input));
+        eprintln!(
+            "[vm] Padded input ({} bytes): {}",
+            padded_input.len(),
+            hex::encode(&padded_input)
+        );
 
         let input_addr: u64 = stack_base + 0x200;
-        dy.mem_write(input_addr, &padded_input).expect("write input");
+        dy.mem_write(input_addr, &padded_input)
+            .expect("write input");
 
         // Output accumulator: 64 bytes, initially zero (same size as padded input)
         let output_accum_addr: u64 = stack_base + 0x400;
-        dy.mem_write(output_accum_addr, &[0u8; 64]).expect("write output accum");
+        dy.mem_write(output_accum_addr, &[0u8; 64])
+            .expect("write output accum");
 
         // Workspace buffer for VM
         let workspace_addr: u64 = stack_base + 0x600;
-        dy.mem_write(workspace_addr, &[0u8; 256]).expect("write workspace");
+        dy.mem_write(workspace_addr, &[0u8; 256])
+            .expect("write workspace");
 
         // --- HALT page ---
         let halt_addr: u64 = 0xDEAD_0000;
@@ -2034,7 +2283,8 @@ mod tests {
         // TPIDR_EL0 setup
         let tpidr_area: u64 = 0x8000_0000;
         dy.mem_map(tpidr_area, 0x1000, 3).expect("map tpidr");
-        dy.mem_write(tpidr_area + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+        dy.mem_write(tpidr_area + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
+            .unwrap();
         dy.reg_write_tpidr_el0(tpidr_area).unwrap();
 
         // --- Set up SVC + unmapped memory callbacks ---
@@ -2043,14 +2293,16 @@ mod tests {
         {
             let miss_flag2 = miss_flag.clone();
             let miss_addr2 = miss_addr.clone();
-            dy.set_unmapped_mem_callback(move |dy_ref: &Dynarmic<()>, addr: u64, _size: usize, _pc: u64| -> bool {
-                let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
-                eprintln!("[vm] UNMAPPED: 0x{:x} (clean=0x{:x})", addr, clean);
-                miss_flag2.store(true, Ordering::SeqCst);
-                *miss_addr2.lock().unwrap() = clean;
-                dy_ref.emu_stop().ok();
-                false
-            });
+            dy.set_unmapped_mem_callback(
+                move |dy_ref: &Dynarmic<()>, addr: u64, _size: usize, _pc: u64| -> bool {
+                    let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
+                    eprintln!("[vm] UNMAPPED: 0x{:x} (clean=0x{:x})", addr, clean);
+                    miss_flag2.store(true, Ordering::SeqCst);
+                    *miss_addr2.lock().unwrap() = clean;
+                    dy_ref.emu_stop().ok();
+                    false
+                },
+            );
         }
         dy.set_svc_callback(|_dy_ref: &Dynarmic<()>, svc_num: u32, _pc: u64, _lr: u64| {
             eprintln!("[vm] SVC #{:#x} — unexpected!", svc_num);
@@ -2070,16 +2322,25 @@ mod tests {
 
             // packed_args = [workspace, input_block_ptr, output_block_ptr]
             let packed_args_addr = sp - 0x100;
-            dy.mem_write(packed_args_addr,      &workspace_addr.to_le_bytes()).unwrap();
-            dy.mem_write(packed_args_addr + 8,   &(input_addr + offset).to_le_bytes()).unwrap();
-            dy.mem_write(packed_args_addr + 16,  &(output_accum_addr + offset).to_le_bytes()).unwrap();
+            dy.mem_write(packed_args_addr, &workspace_addr.to_le_bytes())
+                .unwrap();
+            dy.mem_write(packed_args_addr + 8, &(input_addr + offset).to_le_bytes())
+                .unwrap();
+            dy.mem_write(
+                packed_args_addr + 16,
+                &(output_accum_addr + offset).to_le_bytes(),
+            )
+            .unwrap();
 
             // callback context: [callback_func, stack_area_ptr, 0]
             let vm_stack_area = sp - 0x300 - (block_idx as u64) * 0x200;
             let callback_ctx_addr = sp - 0x200;
-            dy.mem_write(callback_ctx_addr,      &callback_func_addr.to_le_bytes()).unwrap();
-            dy.mem_write(callback_ctx_addr + 8,  &vm_stack_area.to_le_bytes()).unwrap();
-            dy.mem_write(callback_ctx_addr + 16, &0u64.to_le_bytes()).unwrap();
+            dy.mem_write(callback_ctx_addr, &callback_func_addr.to_le_bytes())
+                .unwrap();
+            dy.mem_write(callback_ctx_addr + 8, &vm_stack_area.to_le_bytes())
+                .unwrap();
+            dy.mem_write(callback_ctx_addr + 16, &0u64.to_le_bytes())
+                .unwrap();
 
             // Set registers for sub_168324 call
             dy.reg_write_raw(0, bytecode_addr).unwrap();
@@ -2097,18 +2358,31 @@ mod tests {
             let mut halted = false;
             loop {
                 let pc = dy.reg_read_pc().unwrap_or(0);
-                if pc == halt_addr || pc == halt_addr + 4 { halted = true; break; }
+                if pc == halt_addr || pc == halt_addr + 4 {
+                    halted = true;
+                    break;
+                }
                 if miss_flag.load(Ordering::SeqCst) {
                     let addr = *miss_addr.lock().unwrap();
                     eprintln!("[vm] Block {}: UNMAPPED at 0x{:x}", block_idx, addr);
                     break;
                 }
                 if steps >= max_steps {
-                    eprintln!("[vm] Block {}: max steps ({}) at PC=SO+0x{:x}", block_idx, max_steps, pc.wrapping_sub(so_base));
+                    eprintln!(
+                        "[vm] Block {}: max steps ({}) at PC=SO+0x{:x}",
+                        block_idx,
+                        max_steps,
+                        pc.wrapping_sub(so_base)
+                    );
                     break;
                 }
                 if let Err(e) = dy.emu_step(pc) {
-                    eprintln!("[vm] Block {}: step error at SO+0x{:x}: {}", block_idx, pc.wrapping_sub(so_base), e);
+                    eprintln!(
+                        "[vm] Block {}: step error at SO+0x{:x}: {}",
+                        block_idx,
+                        pc.wrapping_sub(so_base),
+                        e
+                    );
                     break;
                 }
                 steps += 1;
@@ -2120,8 +2394,13 @@ mod tests {
 
             // Read output block
             let mut out_block = [0u8; 16];
-            dy.mem_read(output_accum_addr + offset, &mut out_block).unwrap();
-            eprintln!("[vm] Block {}: output={}", block_idx, hex::encode(&out_block));
+            dy.mem_read(output_accum_addr + offset, &mut out_block)
+                .unwrap();
+            eprintln!(
+                "[vm] Block {}: output={}",
+                block_idx,
+                hex::encode(&out_block)
+            );
 
             miss_flag.store(false, Ordering::SeqCst);
         }
@@ -2135,7 +2414,10 @@ mod tests {
         eprintln!("[vm] Full output: {}", hex::encode(&full_output));
 
         // The Helios result is the first 32 bytes (part1 + part2)
-        eprintln!("[vm] Helios part1+part2: {}", hex::encode(&full_output[..32]));
+        eprintln!(
+            "[vm] Helios part1+part2: {}",
+            hex::encode(&full_output[..32])
+        );
 
         let result: Result<(), anyhow::Error> = Ok(());
 
@@ -2147,7 +2429,10 @@ mod tests {
     #[test]
     fn test_vm_medusa_regs() {
         use dynarmic_sys::Dynarmic;
-        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
 
         let dir = env!("CARGO_MANIFEST_DIR");
         let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir)).expect("so_code.bin");
@@ -2158,13 +2443,24 @@ mod tests {
         let dy = Arc::new(Dynarmic::<()>::new());
 
         // Map SO
-        dy.mem_map(so_base & !0xFFF, ((0x348700+0xFFF) & !0xFFF)+0x1000, 3).unwrap();
+        dy.mem_map(so_base & !0xFFF, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3)
+            .unwrap();
         dy.mem_write(so_base, &so_code[..0x348700]).unwrap();
         let d1 = so_base + 0x34C700;
-        dy.mem_map(d1 & !0xFFF, ((0x28F10+0xFFF+(d1&0xFFF) as usize)&!0xFFF), 3).unwrap();
+        dy.mem_map(
+            d1 & !0xFFF,
+            ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF),
+            3,
+        )
+        .unwrap();
         dy.mem_write(d1, &so_data1[..0x28F10]).unwrap();
         let d2 = so_base + 0x379610;
-        dy.mem_map(d2 & !0xFFF, ((0x6A460+0xFFF+(d2&0xFFF) as usize)&!0xFFF), 3).unwrap();
+        dy.mem_map(
+            d2 & !0xFFF,
+            ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF),
+            3,
+        )
+        .unwrap();
         dy.mem_write(d2, &so_data2[..0x6A460]).unwrap();
 
         let stack_base: u64 = 0x7000_0000;
@@ -2173,10 +2469,14 @@ mod tests {
 
         let halt: u64 = 0xDEAD_0000;
         dy.mem_map(halt, 0x1000, 3).unwrap();
-        for off in (0..0x1000).step_by(4) { dy.mem_write(halt+off, &0xD65F03C0u32.to_le_bytes()).unwrap(); }
+        for off in (0..0x1000).step_by(4) {
+            dy.mem_write(halt + off, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+        }
         let tpidr: u64 = 0x8000_0000;
         dy.mem_map(tpidr, 0x1000, 3).unwrap();
-        dy.mem_write(tpidr+0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+        dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
+            .unwrap();
         dy.reg_write_tpidr_el0(tpidr).unwrap();
 
         // Medusa args
@@ -2186,18 +2486,19 @@ mod tests {
         dy.mem_write(output, &[0u8; 1024]).unwrap();
         let pa = sp - 0x100;
         dy.mem_write(pa, &output.to_le_bytes()).unwrap();
-        dy.mem_write(pa+8, &output.to_le_bytes()).unwrap();
-        dy.mem_write(pa+16, &0u64.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 8, &output.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 16, &0u64.to_le_bytes()).unwrap();
         let ctx = sp - 0x200;
         dy.mem_write(ctx, &callback.to_le_bytes()).unwrap();
-        dy.mem_write(ctx+8, &(sp-0x400).to_le_bytes()).unwrap();
-        dy.mem_write(ctx+16, &0u64.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 8, &(sp - 0x400).to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 16, &0u64.to_le_bytes()).unwrap();
 
         // Stop on unmapped
         let miss = Arc::new(AtomicBool::new(false));
         let miss_a = Arc::new(Mutex::new(0u64));
         {
-            let m=miss.clone(); let ma=miss_a.clone();
+            let m = miss.clone();
+            let ma = miss_a.clone();
             dy.set_unmapped_mem_callback(move |d: &Dynarmic<()>, addr: u64, _, _| -> bool {
                 let c = addr & 0x00FF_FFFF_FFFF_FFFF;
                 eprintln!("[medusa] UNMAPPED 0x{:x}", c);
@@ -2207,7 +2508,9 @@ mod tests {
                 false
             });
         }
-        dy.set_svc_callback(|_: &Dynarmic<()>, n: u32, _, _| { eprintln!("[medusa] SVC {:#x}", n); });
+        dy.set_svc_callback(|_: &Dynarmic<()>, n: u32, _, _| {
+            eprintln!("[medusa] SVC {:#x}", n);
+        });
 
         dy.reg_write_raw(0, bytecode).unwrap();
         dy.reg_write_raw(1, pa).unwrap();
@@ -2224,13 +2527,19 @@ mod tests {
         let mut steps = 0u64;
         loop {
             let pc = dy.reg_read_pc().unwrap_or(0);
-            if pc == halt || pc == halt+4 { eprintln!("[medusa] HALT at {}", steps); break; }
+            if pc == halt || pc == halt + 4 {
+                eprintln!("[medusa] HALT at {}", steps);
+                break;
+            }
             if miss.load(Ordering::SeqCst) {
                 let a = *miss_a.lock().unwrap();
                 eprintln!("[medusa] Hit unmapped at step {}, addr=0x{:x}", steps, a);
                 break;
             }
-            if steps > 100_000 { eprintln!("[medusa] max steps"); break; }
+            if steps > 100_000 {
+                eprintln!("[medusa] max steps");
+                break;
+            }
             dy.emu_step(pc).ok();
             steps += 1;
         }
@@ -2241,9 +2550,11 @@ mod tests {
         if x28 > 0 {
             for i in 0..32 {
                 let mut buf = [0u8; 8];
-                if dy.mem_read(x28 + i*8, &mut buf).is_ok() {
+                if dy.mem_read(x28 + i * 8, &mut buf).is_ok() {
                     let val = u64::from_le_bytes(buf);
-                    if val != 0 { eprintln!("[medusa] r{} = 0x{:016x}", i, val); }
+                    if val != 0 {
+                        eprintln!("[medusa] r{} = 0x{:016x}", i, val);
+                    }
                 }
             }
         }
@@ -2255,7 +2566,10 @@ mod tests {
     #[test]
     fn test_vm_medusa_probe() {
         use dynarmic_sys::Dynarmic;
-        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
 
         let dir = env!("CARGO_MANIFEST_DIR");
         let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir)).expect("so_code.bin");
@@ -2266,13 +2580,24 @@ mod tests {
         let dy = Arc::new(Dynarmic::<()>::new());
 
         // Map SO code + data (same as Helios test)
-        dy.mem_map(so_base & !0xFFF, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3).unwrap();
+        dy.mem_map(so_base & !0xFFF, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3)
+            .unwrap();
         dy.mem_write(so_base, &so_code[..0x348700]).unwrap();
         let d1 = so_base + 0x34C700;
-        dy.mem_map(d1 & !0xFFF, ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+        dy.mem_map(
+            d1 & !0xFFF,
+            ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF),
+            3,
+        )
+        .unwrap();
         dy.mem_write(d1, &so_data1[..0x28F10]).unwrap();
         let d2 = so_base + 0x379610;
-        dy.mem_map(d2 & !0xFFF, ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+        dy.mem_map(
+            d2 & !0xFFF,
+            ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF),
+            3,
+        )
+        .unwrap();
         dy.mem_write(d2, &so_data2[..0x6A460]).unwrap();
 
         let stack_base: u64 = 0x7000_0000;
@@ -2282,11 +2607,13 @@ mod tests {
         let halt_addr: u64 = 0xDEAD_0000;
         dy.mem_map(halt_addr, 0x1000, 3).unwrap();
         for off in (0..0x1000).step_by(4) {
-            dy.mem_write(halt_addr + off, &0xD65F03C0u32.to_le_bytes()).unwrap();
+            dy.mem_write(halt_addr + off, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
         }
         let tpidr: u64 = 0x8000_0000;
         dy.mem_map(tpidr, 0x1000, 3).unwrap();
-        dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+        dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
+            .unwrap();
         dy.reg_write_tpidr_el0(tpidr).unwrap();
 
         // Medusa VM args: sub_2A3C5C(a1=output_struct, a2=flags_byte, a3=??)
@@ -2305,14 +2632,16 @@ mod tests {
         let output_buf: u64 = stack_base + 0x400;
         dy.mem_write(output_buf, &[0u8; 1024]).unwrap();
         let packed_args = sp - 0x100;
-        dy.mem_write(packed_args,      &output_buf.to_le_bytes()).unwrap(); // a3 (struct?)
-        dy.mem_write(packed_args + 8,  &output_buf.to_le_bytes()).unwrap(); // a1 (output)
-        dy.mem_write(packed_args + 16, &0u64.to_le_bytes()).unwrap();       // a2 (flags=0)
+        dy.mem_write(packed_args, &output_buf.to_le_bytes())
+            .unwrap(); // a3 (struct?)
+        dy.mem_write(packed_args + 8, &output_buf.to_le_bytes())
+            .unwrap(); // a1 (output)
+        dy.mem_write(packed_args + 16, &0u64.to_le_bytes()).unwrap(); // a2 (flags=0)
 
         let ctx = sp - 0x200;
         let vm_stk = sp - 0x400;
-        dy.mem_write(ctx,      &callback.to_le_bytes()).unwrap();
-        dy.mem_write(ctx + 8,  &vm_stk.to_le_bytes()).unwrap();
+        dy.mem_write(ctx, &callback.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 8, &vm_stk.to_le_bytes()).unwrap();
         dy.mem_write(ctx + 16, &0u64.to_le_bytes()).unwrap();
 
         // Track unmapped accesses — stop immediately on first external access
@@ -2321,13 +2650,15 @@ mod tests {
         {
             let mf = miss_flag.clone();
             let mi = miss_info.clone();
-            dy.set_unmapped_mem_callback(move |d: &Dynarmic<()>, addr: u64, _: usize, pc: u64| -> bool {
-                let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
-                mf.store(true, Ordering::SeqCst);
-                *mi.lock().unwrap() = (clean, pc);
-                d.emu_stop().ok();
-                false
-            });
+            dy.set_unmapped_mem_callback(
+                move |d: &Dynarmic<()>, addr: u64, _: usize, pc: u64| -> bool {
+                    let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
+                    mf.store(true, Ordering::SeqCst);
+                    *mi.lock().unwrap() = (clean, pc);
+                    d.emu_stop().ok();
+                    false
+                },
+            );
         }
         dy.set_svc_callback(|_: &Dynarmic<()>, n: u32, _: u64, _: u64| {
             eprintln!("[probe] SVC #{:#x}", n);
@@ -2369,24 +2700,42 @@ mod tests {
 
             loop {
                 let pc = dy.reg_read_pc().unwrap_or(0);
-                if pc == halt_addr || pc == halt_addr + 4 { halted = true; break; }
-                if miss_flag.load(Ordering::SeqCst) { break; }
-                if steps >= max_steps { break; }
-                if let Err(_) = dy.emu_step(pc) { break; }
+                if pc == halt_addr || pc == halt_addr + 4 {
+                    halted = true;
+                    break;
+                }
+                if miss_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if steps >= max_steps {
+                    break;
+                }
+                if let Err(_) = dy.emu_step(pc) {
+                    break;
+                }
                 steps += 1;
             }
             total_steps += steps;
 
             if halted {
-                eprintln!("[probe] VM halted after {} total steps, {} rounds", total_steps, round + 1);
+                eprintln!(
+                    "[probe] VM halted after {} total steps, {} rounds",
+                    total_steps,
+                    round + 1
+                );
                 break;
             }
 
             if miss_flag.load(Ordering::SeqCst) {
                 let (addr, pc) = *miss_info.lock().unwrap();
                 external_reads.push((addr, pc));
-                eprintln!("[probe] R{}: unmapped 0x{:x} at PC=SO+0x{:x} (step {})",
-                    round, addr, pc.wrapping_sub(so_base), total_steps);
+                eprintln!(
+                    "[probe] R{}: unmapped 0x{:x} at PC=SO+0x{:x} (step {})",
+                    round,
+                    addr,
+                    pc.wrapping_sub(so_base),
+                    total_steps
+                );
 
                 // Map the page with distinguishable pattern (not zero)
                 let page = addr & !0xFFF;
@@ -2401,29 +2750,469 @@ mod tests {
             break;
         }
 
-        eprintln!("\n[probe] {} external memory accesses:", external_reads.len());
+        eprintln!(
+            "\n[probe] {} external memory accesses:",
+            external_reads.len()
+        );
         // Classify
         let table_a: Vec<u64> = vec![
-            0x6d8892e690, 0x6d8892e6b0, 0x6d8892e650,
-            0x6d885db208, 0x6d885db350, 0x6d8892e658,
-            0x6d885db20c, 0x6d885db34c, 0x6d8892e660,
-            0x6d885db210, 0x6d885db348, 0x6d8892e688,
+            0x6d8892e690,
+            0x6d8892e6b0,
+            0x6d8892e650,
+            0x6d885db208,
+            0x6d885db350,
+            0x6d8892e658,
+            0x6d885db20c,
+            0x6d885db34c,
+            0x6d8892e660,
+            0x6d885db210,
+            0x6d885db348,
+            0x6d8892e688,
         ];
         let table_b: Vec<u64> = vec![
-            0x6d885db220, 0x6d885db330, 0x6d8892e6ac,
-            0x6d885db240, 0x6d885db310, 0x6d8892e6bc,
-            0x6d885db25c, 0x6d885db304, 0x6d8892e5c8,
-            0x6d8892e5d0, 0x6d885db1c4, 0x6d885db390,
+            0x6d885db220,
+            0x6d885db330,
+            0x6d8892e6ac,
+            0x6d885db240,
+            0x6d885db310,
+            0x6d8892e6bc,
+            0x6d885db25c,
+            0x6d885db304,
+            0x6d8892e5c8,
+            0x6d8892e5d0,
+            0x6d885db1c4,
+            0x6d885db390,
         ];
         for (addr, pc) in &external_reads {
             let idx_a = table_a.iter().position(|t| *addr >= *t && *addr < *t + 64);
             let idx_b = table_b.iter().position(|t| *addr >= *t && *addr < *t + 64);
             if let Some(i) = idx_a {
-                eprintln!("  0x{:x} = TABLE_A[{}]+{} (PC=SO+0x{:x})", addr, i, addr - table_a[i], pc.wrapping_sub(so_base));
+                eprintln!(
+                    "  0x{:x} = TABLE_A[{}]+{} (PC=SO+0x{:x})",
+                    addr,
+                    i,
+                    addr - table_a[i],
+                    pc.wrapping_sub(so_base)
+                );
             } else if let Some(i) = idx_b {
-                eprintln!("  0x{:x} = TABLE_B[{}]+{} (PC=SO+0x{:x})", addr, i, addr - table_b[i], pc.wrapping_sub(so_base));
+                eprintln!(
+                    "  0x{:x} = TABLE_B[{}]+{} (PC=SO+0x{:x})",
+                    addr,
+                    i,
+                    addr - table_b[i],
+                    pc.wrapping_sub(so_base)
+                );
             } else {
-                eprintln!("  0x{:x} = UNKNOWN (PC=SO+0x{:x})", addr, pc.wrapping_sub(so_base));
+                eprintln!(
+                    "  0x{:x} = UNKNOWN (PC=SO+0x{:x})",
+                    addr,
+                    pc.wrapping_sub(so_base)
+                );
+            }
+        }
+    }
+
+    /// Trace Medusa VM instruction-by-instruction.
+    /// Monitors the bytecode pointer (*X19) to detect VM instruction boundaries.
+    /// At each boundary, dumps the full VM register file diff.
+    /// Uses synthetic handle data with identifiable patterns.
+    #[test]
+    fn test_vm_medusa_trace() {
+        use dynarmic_sys::Dynarmic;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex,
+        };
+
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir)).expect("so_code.bin");
+        let so_data1 = std::fs::read(format!("{}/lib/so_data1.bin", dir)).expect("so_data1.bin");
+        let so_data2 = std::fs::read(format!("{}/lib/so_data2.bin", dir)).expect("so_data2.bin");
+
+        let so_base: u64 = 0x6d88_01b0_00;
+        let dy = Arc::new(Dynarmic::<()>::new());
+
+        // Map SO code + data
+        dy.mem_map(so_base & !0xFFF, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3)
+            .unwrap();
+        dy.mem_write(so_base, &so_code[..0x348700]).unwrap();
+        let d1 = so_base + 0x34C700;
+        dy.mem_map(
+            d1 & !0xFFF,
+            ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF),
+            3,
+        )
+        .unwrap();
+        dy.mem_write(d1, &so_data1[..0x28F10]).unwrap();
+        let d2 = so_base + 0x379610;
+        dy.mem_map(
+            d2 & !0xFFF,
+            ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF),
+            3,
+        )
+        .unwrap();
+        dy.mem_write(d2, &so_data2[..0x6A460]).unwrap();
+
+        // Stack
+        let stack_base: u64 = 0x7000_0000;
+        dy.mem_map(stack_base, 0x10_0000, 3).unwrap();
+        let sp = stack_base + 0x10_0000 - 0x1000;
+
+        // Halt
+        let halt: u64 = 0xDEAD_0000;
+        dy.mem_map(halt, 0x1000, 3).unwrap();
+        for off in (0..0x1000).step_by(4) {
+            dy.mem_write(halt + off, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+        }
+
+        // TPIDR
+        let tpidr: u64 = 0x8000_0000;
+        dy.mem_map(tpidr, 0x1000, 3).unwrap();
+        dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
+            .unwrap();
+        dy.reg_write_tpidr_el0(tpidr).unwrap();
+
+        // ====== Synthetic handle data ======
+        // Fill r12-adjusted regions with non-zero test data so the VM can progress.
+        // Pattern: each qword at offset N = (N/8 + 1), small sequential integers.
+        let ta_off_in_d2: usize = 0x37A6D0 - 0x379610;
+        let tb_off_in_d2: usize = 0x37A730 - 0x379610;
+        let r12: i64 = -0xAFEE18;
+        let mut mapped_pages = std::collections::HashSet::<u64>::new();
+
+        let map_page =
+            |dy: &Dynarmic<()>, addr: u64, pages: &mut std::collections::HashSet<u64>| {
+                let page = addr & !0xFFF;
+                if pages.insert(page) {
+                    dy.mem_map(page, 0x1000, 3).ok();
+                }
+            };
+
+        // Collect all table pointers and their r12-adjusted versions
+        let mut handle_addrs: Vec<u64> = Vec::new();
+        for tbl in 0..2u8 {
+            let base_off = if tbl == 0 { ta_off_in_d2 } else { tb_off_in_d2 };
+            for i in 0..24usize {
+                let off = base_off + i * 8;
+                if off + 8 > so_data2.len() {
+                    break;
+                }
+                let ptr = u64::from_le_bytes(so_data2[off..off + 8].try_into().unwrap());
+                if ptr > 0x1000 && ptr < 0x800000000000 {
+                    map_page(&dy, ptr, &mut mapped_pages);
+                    map_page(&dy, ptr + 0x1000, &mut mapped_pages);
+                    let adj = (ptr as i64 + r12) as u64;
+                    map_page(&dy, adj, &mut mapped_pages);
+                    map_page(&dy, adj + 0x1000, &mut mapped_pages);
+                    handle_addrs.push(adj);
+                }
+            }
+        }
+
+        // Fill r12-adjusted addresses: write the ADDRESS itself as value.
+        // When VM reads from addr+offset, register = addr+offset → directly reveals offset.
+        for &addr in &handle_addrs {
+            for slot in 0..32u64 {
+                let a = addr + slot * 8;
+                dy.mem_write(a, &a.to_le_bytes()).ok();
+            }
+        }
+        // Also fill the original (non-adjusted) TABLE entry targets the same way
+        for tbl in 0..2u8 {
+            let base_off = if tbl == 0 { ta_off_in_d2 } else { tb_off_in_d2 };
+            for i in 0..24usize {
+                let off = base_off + i * 8;
+                if off + 8 > so_data2.len() {
+                    break;
+                }
+                let ptr = u64::from_le_bytes(so_data2[off..off + 8].try_into().unwrap());
+                if ptr > 0x1000 && ptr < 0x800000000000 {
+                    for slot in 0..32u64 {
+                        let a = ptr + slot * 8;
+                        dy.mem_write(a, &a.to_le_bytes()).ok();
+                    }
+                }
+            }
+        }
+
+        // Map page 0 and wide low range
+        dy.mem_map(0, 0x10000, 3).unwrap();
+
+        // Packed args
+        let output_buf: u64 = stack_base + 0x400;
+        dy.mem_write(output_buf, &[0u8; 2048]).unwrap();
+        let pa = sp - 0x100;
+        dy.mem_write(pa, &output_buf.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 8, &output_buf.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 16, &0u64.to_le_bytes()).unwrap();
+
+        // Callback context — use a RET stub instead of real SO callback.
+        // This lets SPLIT/OR/SPLIT patterns complete without needing real handle context.
+        let cb_stub: u64 = 0x9000_0000;
+        dy.mem_map(cb_stub, 0x1000, 3).unwrap();
+        // Write: MOV X0, #0; RET (return 0)
+        dy.mem_write(cb_stub, &0xD2800000u32.to_le_bytes()).unwrap(); // MOV X0, #0
+        dy.mem_write(cb_stub + 4, &0xD65F03C0u32.to_le_bytes())
+            .unwrap(); // RET
+                       // Also fill a few more RET instructions for safety
+        for off in (8..0x100).step_by(4) {
+            dy.mem_write(cb_stub + off, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+        }
+
+        let ctx = sp - 0x200;
+        dy.mem_write(ctx, &cb_stub.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 8, &(sp - 0x400).to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 16, &0u64.to_le_bytes()).unwrap();
+
+        // Also patch r22/r25 source: instruction 11 does r22 = r7 | something.
+        // r7 initially = 0, but after TABLE load r7 = TA[0]. Before TABLE load,
+        // the OR at [11] picks up whatever r7 had. The callback addr ends up in r22.
+        // We need r22 to point to our stub instead of SO+0x2884AC.
+        // The simplest fix: write cb_stub address into the ctx callback slot (already done)
+        // and also into the VM's initial "callback context" at ctx[0].
+
+        // Unmapped callback: map on demand, continue
+        let miss_flag = Arc::new(AtomicBool::new(false));
+        let miss_addr = Arc::new(AtomicU64::new(0));
+        {
+            let mf = miss_flag.clone();
+            let ma = miss_addr.clone();
+            dy.set_unmapped_mem_callback(
+                move |d: &Dynarmic<()>, addr: u64, _sz: usize, _pc: u64| -> bool {
+                    let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
+                    let page = clean & !0xFFF;
+                    // Map with zeros and retry
+                    if d.mem_map(page, 0x1000, 3).is_ok() {
+                        d.mem_write(page, &vec![0u8; 0x1000]).ok();
+                        return true; // retry
+                    }
+                    mf.store(true, Ordering::SeqCst);
+                    ma.store(clean, Ordering::SeqCst);
+                    d.emu_stop().ok();
+                    false
+                },
+            );
+        }
+        dy.set_svc_callback(|_: &Dynarmic<()>, _: u32, _: u64, _: u64| {});
+
+        // Set initial registers
+        let bytecode_base = so_base + 0x119050;
+        dy.reg_write_raw(0, bytecode_base).unwrap();
+        dy.reg_write_raw(1, pa).unwrap();
+        dy.reg_write_raw(2, so_base + 0x37A6D0).unwrap(); // TABLE_A
+        dy.reg_write_raw(3, so_base + 0x37A730).unwrap(); // TABLE_B
+        dy.reg_write_raw(4, ctx).unwrap();
+        dy.reg_write_sp(sp).unwrap();
+        dy.reg_write_lr(halt).unwrap();
+        dy.reg_write_pc(so_base + 0x168324).unwrap();
+
+        eprintln!("[trace] Starting Medusa VM trace...");
+        eprintln!("[trace] bytecode_base = 0x{:x}", bytecode_base);
+
+        // Read bytecodes for opcode display
+        let mut bytecodes = [0u32; 256];
+        for i in 0..256 {
+            let off = 0x119050 + i * 4;
+            bytecodes[i] = u32::from_le_bytes(so_code[off..off + 4].try_into().unwrap());
+        }
+
+        // Run with instruction-level tracing
+        // Strategy: after each ARM64 step, read X19 → bytecode_ptr.
+        // When bytecode_ptr advances by 4, a VM instruction completed.
+        let mut prev_regs = [0u64; 32];
+        let mut prev_bc_ptr: u64 = 0;
+        let mut vm_insn_count = 0u32;
+        let mut arm_steps = 0u64;
+        let mut steps_since_advance = 0u64; // stuck detection
+        let max_vm_insns = 260u32;
+        let max_arm_steps = 5_000_000u64;
+        let stuck_threshold = 100_000u64; // if no bc_ptr advance in 100K steps → stuck
+
+        loop {
+            let pc = dy.reg_read_pc().unwrap_or(0);
+            if pc == halt || pc == halt + 4 {
+                eprintln!("[trace] VM halted at arm_step={}", arm_steps);
+                break;
+            }
+            if miss_flag.load(Ordering::SeqCst) {
+                eprintln!(
+                    "[trace] Stuck unmapped at 0x{:x}",
+                    miss_addr.load(Ordering::SeqCst)
+                );
+                break;
+            }
+            if arm_steps >= max_arm_steps || vm_insn_count >= max_vm_insns {
+                eprintln!(
+                    "[trace] Limit reached: {} arm steps, {} vm insns",
+                    arm_steps, vm_insn_count
+                );
+                break;
+            }
+
+            dy.emu_step(pc).ok();
+            arm_steps += 1;
+
+            // Check bytecode pointer: read X19, then read [X19] to get current bc_ptr
+            let x19 = dy.reg_read(19).unwrap_or(0);
+            if x19 == 0 {
+                continue;
+            }
+            let mut bc_buf = [0u8; 8];
+            if dy.mem_read(x19, &mut bc_buf).is_err() {
+                continue;
+            }
+            let bc_ptr = u64::from_le_bytes(bc_buf);
+
+            steps_since_advance += 1;
+            if steps_since_advance > stuck_threshold {
+                let insn_idx = if prev_bc_ptr >= bytecode_base {
+                    ((prev_bc_ptr - bytecode_base) / 4) as usize
+                } else {
+                    999
+                };
+                let stuck_pc = dy.reg_read_pc().unwrap_or(0);
+                let stuck_lr = dy.reg_read(30).unwrap_or(0);
+                eprintln!(
+                    "[trace] STUCK at vm_insn {} after {}K arm steps, PC=SO+0x{:x} LR=SO+0x{:x}",
+                    insn_idx,
+                    stuck_threshold / 1000,
+                    stuck_pc.wrapping_sub(so_base),
+                    stuck_lr.wrapping_sub(so_base)
+                );
+                // Dump ARM64 X0-X5 to help diagnose
+                for i in 0..6usize {
+                    let v = dy.reg_read(i).unwrap_or(0);
+                    eprint!(" X{}=0x{:x}", i, v);
+                }
+                eprintln!();
+                break;
+            }
+
+            if bc_ptr != prev_bc_ptr && bc_ptr >= bytecode_base && bc_ptr < bytecode_base + 1024 {
+                steps_since_advance = 0;
+                // VM instruction boundary!
+                let insn_idx = ((bc_ptr - bytecode_base) / 4) as usize;
+
+                // Read current register file
+                let x28 = dy.reg_read(28).unwrap_or(0);
+                let mut cur_regs = [0u64; 32];
+                if x28 > 0 {
+                    for i in 0..32 {
+                        let mut buf = [0u8; 8];
+                        if dy.mem_read(x28 + (i as u64) * 8, &mut buf).is_ok() {
+                            cur_regs[i] = u64::from_le_bytes(buf);
+                        }
+                    }
+                }
+
+                if vm_insn_count > 0 {
+                    // Print the PREVIOUS instruction's effect (register changes)
+                    let prev_idx = if insn_idx > 0 { insn_idx - 1 } else { 0 };
+                    let prev_raw = if prev_idx < 256 {
+                        bytecodes[prev_idx]
+                    } else {
+                        0
+                    };
+                    let opc = prev_raw & 0x3F;
+                    let opc_name = match opc {
+                        24 => "LOAD64",
+                        26 => "STORE64",
+                        22 => "STORE32",
+                        59 => "LOAD32S",
+                        15 => "ADDPTR",
+                        52 => "MOVI_HI",
+                        48 => "ORI_LO",
+                        1 => "SEXT",
+                        45 => "BEQ",
+                        17 => {
+                            let sub = (prev_raw >> 6) & 0x3F;
+                            match sub {
+                                14 => "ADD",
+                                16 => "SUB",
+                                44 => "OR",
+                                54 => "AND",
+                                29 => "XOR_M",
+                                10 => "AND2",
+                                51 => "ADDW",
+                                46 => "SUBW",
+                                23 => "SHL",
+                                3 => "SHLW",
+                                7 => "SHRW",
+                                50 => "SPLIT",
+                                13 => "NOP",
+                                _ => "ALU?",
+                            }
+                        }
+                        4 => "OP4",
+                        20 => "OP20",
+                        40 => "OP40",
+                        16 => "OP16",
+                        53 => "OP53",
+                        _ => "???",
+                    };
+
+                    // Collect changes
+                    let mut changes = Vec::new();
+                    for i in 0..32 {
+                        if cur_regs[i] != prev_regs[i] {
+                            changes
+                                .push(format!("r{}:0x{:x}→0x{:x}", i, prev_regs[i], cur_regs[i]));
+                        }
+                    }
+
+                    if !changes.is_empty() || opc == 26 || opc == 22 {
+                        // always show stores
+                        eprintln!(
+                            "[{:3}] {:7} 0x{:08x} | {}",
+                            prev_idx,
+                            opc_name,
+                            prev_raw,
+                            if changes.is_empty() {
+                                "(no reg change)".to_string()
+                            } else {
+                                changes.join(", ")
+                            }
+                        );
+                    }
+                }
+
+                prev_regs = cur_regs;
+                prev_bc_ptr = bc_ptr;
+                vm_insn_count += 1;
+            }
+        }
+
+        eprintln!(
+            "\n[trace] Total: {} VM instructions, {} ARM64 steps",
+            vm_insn_count, arm_steps
+        );
+
+        // Final register dump
+        let x28 = dy.reg_read(28).unwrap_or(0);
+        eprintln!("\n[trace] Final register file:");
+        if x28 > 0 {
+            for i in 0..32 {
+                let mut buf = [0u8; 8];
+                if dy.mem_read(x28 + (i as u64) * 8, &mut buf).is_ok() {
+                    let val = u64::from_le_bytes(buf);
+                    if val != 0 {
+                        // Decode tagged values
+                        let tag = (val >> 60) & 0xF;
+                        let desc = match tag {
+                            0xA => format!("TA[{}] slot{}", (val >> 48) & 0xFF, (val >> 40) & 0xFF),
+                            0xB => format!("TB[{}] slot{}", (val >> 48) & 0xFF, (val >> 40) & 0xFF),
+                            0xC => format!(
+                                "r12adj TA/B[{}][{}]",
+                                (val >> 48) & 0xFF,
+                                (val >> 40) & 0xFF
+                            ),
+                            _ => String::new(),
+                        };
+                        eprintln!("  r{:2} = 0x{:016x}  {}", i, val, desc);
+                    }
+                }
             }
         }
     }

@@ -1160,6 +1160,133 @@ TABLE_A/B (SO data section)
 - 第三级: 实际数据 (device_id string, session UUID, crypto keys)
 - **纯静态无法获取第三级数据**——依赖运行时堆内存
 
+## 重大发现: VM 是代码虚拟化保护 (2026-04-02)
+
+### 结论: 字节码 VM = ARM64 代码翻译
+
+通过 dynarmic JIT 逐条追踪 Medusa 256 条字节码指令，发现 VM 不是"自定义算法"——而是 **ARM64 代码虚拟化保护 (Code Virtualization)**。原始签名函数的 ARM64 代码被翻译成了自定义字节码。
+
+| VM 字节码 | 原始 ARM64 等价 | 说明 |
+|-----------|---------------|------|
+| LOAD64 (OP24) | LDR X, [X, #imm] | 64位内存读 |
+| STORE64 (OP26) | STR X, [X, #imm] | 64位内存写 |
+| STORE32 (OP22) | STR W, [X, #imm] | 32位内存写 |
+| LOAD32S (OP59) | LDRSW X, [X, #imm] | 带符号32位读 |
+| ADD_PTR (OP15) | ADD X, X, #imm | 指针偏移 |
+| MOVI_HI (OP52) | MOVZ W, #imm, LSL#16 + SXTW | 高16位常量 |
+| ORI_LO (OP48) | ORR X, X, #imm | 低16位OR |
+| SEXT (OP1) | SXTH / SXTW | 符号扩展 |
+| BEQ (OP45) | B.EQ | 条件跳转 |
+| OP17.ADD | ADD X, X, X | 64位加法 |
+| OP17.ADDW | ADD W,W,W + SXTW | 32位加法 |
+| OP17.OR | ORR X, X, X | 按位或 |
+| OP17.AND | AND X, X, X | 按位与 |
+| OP17.SHL | LSL X, X, #imm | 左移 |
+| OP17.SHRW | LSR W, W, #imm | 32位右移 |
+| **OP17.SPLIT (sub50)** | **BLR X (函数调用!)** | **间接调用** |
+| OP4.11 | UBFX | 位域提取 |
+| OP20 | B.NE / CBNZ | 条件跳转 |
+
+**关键证据**: OP17.SPLIT handler (SO+0x16A8E4) 内部做了 BLR 跳转，LR=SO+0x16AA4C 确认。每次 OR+SPLIT 模式 = 加载函数地址 + 调用外部函数。
+
+### Medusa VM 逐条追踪结果 (指令 0-94)
+
+通过 dynarmic step + bytecode pointer 监控，完成了前 94 条指令的精确追踪：
+
+#### Phase 1 [0-10]: 栈帧设置
+```
+[0]  r29 -= 1280              (SP = frame pointer - 1280)
+[1-10] STORE r31..r16 → stack  (保存 callee-saved 寄存器)
+```
+
+#### Phase 2 [11-67]: TABLE 加载 (48 个 handle 入口指针)
+```
+r12 构建: [12] MOVI_HI 0xFF50_0000 + [33] ORI_LO 0x11E8
+→ r12 = 0xFFFFFFFFFF5011E8 (-0xAFEE18)
+
+寄存器赋值 (从 TABLE_A r5 和 TABLE_B r6 加载):
+  r7  = TA[0]  = 0x6d8892e690  (ClusterH+200)
+  r8  = TA[3]  = 0x6d885db208  (ClusterB+ 68)
+  r1  = TA[4]  = 0x6d885db350  (ClusterB+396)
+  r2  = TA[5]  = 0x6d8892e658  (ClusterH+144)
+  r3  = TA[6]  = 0x6d885db20c  (ClusterB+ 72)
+  r5  = TB[0]  = 0x6d885db220  (ClusterB+ 92)
+  r9  = TB[1]  = 0x6d885db330  (ClusterB+364)
+  r10 = TB[2]  = 0x6d8892e6ac  (ClusterH+228)
+  r11 = TB[3]  = 0x6d885db240  (ClusterB+124)
+  r20 = TB[4]  = 0x6d885db310  (ClusterB+332)
+
+保存到栈: TA[1,2,5,7-11], TB[5-13,19] (共 23 个)
+```
+
+#### Phase 3 [68-74]: r12 重定位 → handle 数据访问指针
+```
+r23 = TA[0] + r12 = 0x6d87e2f878  ← 主数据指针 (ClusterH)
+r21 = TA[4] + r12 = 0x6d87adc538  (ClusterB)
+r17 = TB[3] + r12 = 0x6d87adc428  (ClusterB)
+r18 = TB[2] + r12 = 0x6d87e2f894  (ClusterH)
+r19 = TB[1] + r12 = 0x6d87adc518  (ClusterB)
+r6  = TA[3] + r12 = 0x6d87adc3f0  (ClusterB)
+```
+
+r12 将 TABLE 指针（指向 handle C++ 对象）转换为指向**相关联数据区域**的指针。这些数据区域包含 vtable、函数指针、配置数据。
+
+#### Phase 4 [75-94]: packed_args + handle 数据 + 函数调用
+```
+[75]  OP40: r1 = 0 (初始化)
+[77]  r16 = packed_args[1] = output_buf (0x70000400)
+[78]  r1  = packed_args[0] = struct_ptr
+[80]  r1  = sext(r1)
+[83]  OP20 条件跳转: struct=0 → 跳过 16 条 (83→99)
+[84-86] 更多 r12 调整: r4, r1, r2
+[87]  ★ r3 = *(r23+offset) — 第一次 handle 数据读取
+[93]  r5 = r29 + offset (stack addr)
+[94]  r25 = r22 = callback_stub_addr
+```
+
+**指令 83 (OP20)**: 根据 struct_ptr 是否为零决定跳转，有两条执行路径。
+
+**指令 87**: 第一次通过 r23 (r12-adjusted ClusterH) 读取 handle 数据。
+
+**指令 94-95 (OR+SPLIT)**: 加载函数地址 + BLR 调用。**VM 卡在这里** — SPLIT 跳转到 r12-adjusted 地址（应该是 SO 函数的 vtable 入口），但 emulator 中没有有效代码。
+
+#### 阻塞点: SPLIT = BLR
+
+VM 在 Phase 4 中需要通过 handle vtable 调用外部 SO 函数。追踪确认:
+- PC 跳转到 r12-adjusted 地址 (handle 数据区)
+- LR = SO+0x16AA4C (SPLIT handler 内部的 BLR 返回地址)
+- 后续每个 OR+SPLIT 都是同样的 BLR 调用模式
+
+**要跑完 Medusa 字节码，必须:**
+1. 知道每个 SPLIT 调用的目标函数 (从 handle vtable 读出)
+2. 在 emulator 中实现这些函数，或提供正确的函数指针
+3. 这些函数可能包括: hash (MD5/SHA-1), 内存分配, 字符串操作等
+
+### TABLE_A/TABLE_B 完整映射
+
+```
+TABLE_A (SO+0x37A6D0, 24 entries) 和 TABLE_B (SO+0x37A730, 24 entries)
+指向两个堆对象集群:
+
+Cluster H (handle 对象): 0x6d8892e5c8 - 0x6d8892e6bc (252 bytes)
+  10 个 TABLE 入口指向此区域，间距不均匀
+
+Cluster B (config 对象): 0x6d885db1c4 - 0x6d885db390 (468 bytes)
+  14 个 TABLE 入口指向此区域
+
+其他:
+  TB[12] = 0x0100000001000000 (packed flags, 非指针)
+  TB[13] = SO+0x6ef26 (SO code section 内的地址!)
+  TB[14-23] = 0x6d890e92a4... (12字节间距的结构体数组)
+```
+
+### 下一步
+
+1. **IDA 分析 SPLIT handler (SO+0x16A8E4)**: BLR 目标地址如何从寄存器计算
+2. **IDA 分析 SO+0x16AA4C 附近**: BLR 调用上下文，参数传递方式
+3. **识别被调用函数**: handle vtable 中的函数指针对应哪些 SO 函数
+4. **在 emulator 中 stub 这些函数**: 让 VM 能跑完所有 256 条指令
+
 ## 当前实现状态 (2026-04-02)
 
 ### X-Helios ✅ 完成
@@ -1202,19 +1329,21 @@ adb shell "cat /proc/PID/mem" | extract_regions.py
 
 ```
 src/signer/emulator.rs:
-  vm_compute_helios()  — Helios VM runner (dynarmic JIT, 4 blocks)
-  sign()               — 生成 X-Helios + X-Medusa headers
-  test_vm_helios()     — Helios VM 单元测试
-  test_vm_medusa_regs() — Medusa VM 寄存器 dump
-  test_download_chapter() — 实际下载测试
+  vm_compute_helios()      — Helios VM runner (dynarmic JIT, 4 blocks)
+  sign()                   — 生成 X-Helios + X-Medusa headers
+  test_vm_helios()         — Helios VM 单元测试
+  test_vm_medusa_regs()    — Medusa VM 寄存器 dump (发现 r12)
+  test_vm_medusa_probe()   — Medusa VM 探测 (缺页迭代)
+  test_vm_medusa_trace()   — ★ Medusa VM 逐条追踪 (bytecode ptr 监控)
+  test_download_chapter()  — 实际下载测试
 
 src/signer/mod.rs:
-  sign_request()       — 签名入口 (调用 emulator::sign)
+  sign_request()           — 签名入口 (调用 emulator::sign)
 
 src/api/client.rs:
-  get()                — GET 请求 (自动签名)
+  get()                    — GET 请求 (自动签名)
   register_encryption_key() — registerkey POST (自动签名)
 
-docs/vm_architecture.md — 完整 VM 架构文档
-scripts/dump_vm_data.js — Frida 一次性 dump handle 数据
+docs/vm_architecture.md   — VM 架构文档 (指令集 + 反汇编)
+scripts/dump_vm_data.js   — Frida 一次性 dump handle 数据
 ```

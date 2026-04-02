@@ -233,10 +233,7 @@ impl FanqieClient {
                 .header("x-tt-store-region", "cn-gd")
                 .header("x-tt-store-region-src", "did")
                 .header("X-SS-REQ-TICKET", ts_ms.to_string())
-                .header(
-                    "x-reading-request",
-                    format!("{}-{}", ts_ms, random_hex),
-                );
+                .header("x-reading-request", format!("{}-{}", ts_ms, random_hex));
             for (k, v) in &sig_headers {
                 req = req.header(k.as_str(), v.as_str());
             }
@@ -255,7 +252,13 @@ impl FanqieClient {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                             return Ok(parsed);
                         }
-                        Err(e) => return Err(anyhow::anyhow!("JSON: {} body={}", e, &text[..text.len().min(200)])),
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "JSON: {} body={}",
+                                e,
+                                &text[..text.len().min(200)]
+                            ))
+                        }
                     }
                 }
                 Err(e) => last_err = Some(e.into()),

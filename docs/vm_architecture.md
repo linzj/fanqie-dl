@@ -2,8 +2,12 @@
 
 ## Overview
 
-libmetasec_ml.so 内嵌了一个自定义字节码虚拟机，用于 Helios 和 Medusa 签名的核心计算。
+libmetasec_ml.so 内嵌了一个**代码虚拟化保护层 (Code Virtualization)**。
+原始 ARM64 签名函数被翻译/编译成自定义字节码，运行在 SO 内嵌的 VM 解释器上。
 VM dispatcher 在 SO+0x168324 (sub_168324)，handler 代码在 SO+0x168324~0x172940 范围。
+
+**关键发现 (2026-04-02)**: 每条 VM 字节码指令对应一条 ARM64 指令。
+OP17.SPLIT (sub50) = BLR (间接函数调用)，不是值拆分操作。
 
 ## VM 架构
 
