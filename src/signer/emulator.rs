@@ -1684,70 +1684,44 @@ mod tests {
 
         let sp = stack_base + stack_size as u64 - 0x1000; // leave some room at top
 
-        // --- Prepare input data ---
-        // For Helios: H1_hex(32) + ts_str(26) = 58 bytes, PKCS#7 padded to 64
-        // For now, use test data (zeros) — we'll fill in real data once the VM works
-        let mut padded_input = vec![0u8; 64];
-        // Fill with recognizable pattern for debugging
-        for i in 0..64 { padded_input[i] = i as u8; }
+        // --- Prepare Helios input data ---
+        // H1_hex(32 bytes ASCII) + ts_str(26 bytes) = 58, PKCS#7 padded to 64
+        // Test data: use known patterns
+        let h1_hex = b"bb7a9a17c05b0a773849723adc3bc5af"; // sample H1 hex string (32 bytes)
+        let ts_str = b"1774952267-1394812046-1967";        // sample ts string (26 bytes)
+        let mut padded_input = Vec::with_capacity(64);
+        padded_input.extend_from_slice(h1_hex);
+        padded_input.extend_from_slice(ts_str);
+        // PKCS#7 pad to 64 bytes: 64 - 58 = 6 bytes of 0x06
+        let pad_len = 64 - padded_input.len();
+        padded_input.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+        assert_eq!(padded_input.len(), 64);
+        eprintln!("[vm] Padded input ({} bytes): {}", padded_input.len(), hex::encode(&padded_input));
 
-        let input_addr = stack_base + 0x200; // input data buffer
+        let input_addr: u64 = stack_base + 0x200;
         dy.mem_write(input_addr, &padded_input).expect("write input");
 
-        let output_addr = stack_base + 0x400; // output buffer (32 bytes)
-        dy.mem_write(output_addr, &[0u8; 64]).expect("write output");
+        // Output accumulator: 64 bytes, initially zero (same size as padded input)
+        let output_accum_addr: u64 = stack_base + 0x400;
+        dy.mem_write(output_accum_addr, &[0u8; 64]).expect("write output accum");
 
-        // --- Set up sub_168324 call ---
-        // sub_168324(a1=bytecode, a2=packed_args, a3=0, a4=0, a5=callback_ctx)
-        //
-        // a1 = &bytecode (SO+0x118F50)
-        let bytecode_addr = so_base + 0x118F50;
+        // Workspace buffer for VM
+        let workspace_addr: u64 = stack_base + 0x600;
+        dy.mem_write(workspace_addr, &[0u8; 256]).expect("write workspace");
 
-        // a2 = packed_args: [output_buf, addr, src_data]
-        // For now: [output_addr, 0, input_addr]
-        let packed_args_addr = sp - 0x100;
-        dy.mem_write(packed_args_addr, &output_addr.to_le_bytes()).unwrap();
-        dy.mem_write(packed_args_addr + 8, &0u64.to_le_bytes()).unwrap();
-        dy.mem_write(packed_args_addr + 16, &input_addr.to_le_bytes()).unwrap();
-
-        // a5 = callback context: [callback_func, stack_area_ptr, 0]
-        // callback_func = sub_2884AC (just calls a1(a2), used as exit handler)
-        let callback_func_addr = so_base + 0x2884AC;
-        // stack_area_ptr: needs enough space below for register file (0x130 bytes)
-        let vm_stack_area = sp - 0x300; // plenty of room
-        let callback_ctx_addr = sp - 0x200;
-        dy.mem_write(callback_ctx_addr, &callback_func_addr.to_le_bytes()).unwrap();
-        dy.mem_write(callback_ctx_addr + 8, &vm_stack_area.to_le_bytes()).unwrap();
-        dy.mem_write(callback_ctx_addr + 16, &0u64.to_le_bytes()).unwrap();
-
-        // --- HALT page: when VM returns, it will RET to LR ---
+        // --- HALT page ---
         let halt_addr: u64 = 0xDEAD_0000;
         dy.mem_map(halt_addr, 0x1000, 3).expect("map halt");
-        // Fill with RET instructions
         let ret_insn = 0xD65F03C0u32.to_le_bytes();
         for off in (0..0x1000).step_by(4) {
             dy.mem_write(halt_addr + off, &ret_insn).unwrap();
         }
 
-        // TPIDR_EL0 setup (handlers read stack canary from TPIDR_EL0+0x28)
+        // TPIDR_EL0 setup
         let tpidr_area: u64 = 0x8000_0000;
         dy.mem_map(tpidr_area, 0x1000, 3).expect("map tpidr");
         dy.mem_write(tpidr_area + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
         dy.reg_write_tpidr_el0(tpidr_area).unwrap();
-
-        // --- Set ARM64 registers ---
-        dy.reg_write_raw(0, bytecode_addr).unwrap();      // X0 = a1 = bytecode
-        dy.reg_write_raw(1, packed_args_addr).unwrap();    // X1 = a2 = packed args
-        dy.reg_write_raw(2, 0).unwrap();                   // X2 = a3 = 0
-        dy.reg_write_raw(3, 0).unwrap();                   // X3 = a4 = 0
-        dy.reg_write_raw(4, callback_ctx_addr).unwrap();   // X4 = a5 = callback ctx
-        dy.reg_write_sp(sp).unwrap();
-        dy.reg_write_lr(halt_addr).unwrap();
-
-        let entry_pc = so_base + 0x168324; // sub_168324 entry
-        eprintln!("[vm] Entry PC=0x{:x}, SP=0x{:x}", entry_pc, sp);
-        eprintln!("[vm] Bytecode at 0x{:x}, input at 0x{:x}, output at 0x{:x}",
-            bytecode_addr, input_addr, output_addr);
 
         // --- Set up SVC + unmapped memory callbacks ---
         let miss_flag = Arc::new(AtomicBool::new(false));
@@ -1756,7 +1730,6 @@ mod tests {
             let miss_flag2 = miss_flag.clone();
             let miss_addr2 = miss_addr.clone();
             dy.set_unmapped_mem_callback(move |dy_ref: &Dynarmic<()>, addr: u64, _size: usize, _pc: u64| -> bool {
-                // Strip MTE tag
                 let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
                 eprintln!("[vm] UNMAPPED: 0x{:x} (clean=0x{:x})", addr, clean);
                 miss_flag2.store(true, Ordering::SeqCst);
@@ -1765,65 +1738,93 @@ mod tests {
                 false
             });
         }
-
         dy.set_svc_callback(|_dy_ref: &Dynarmic<()>, svc_num: u32, _pc: u64, _lr: u64| {
             eprintln!("[vm] SVC #{:#x} — unexpected!", svc_num);
         });
 
-        // --- RUN with step counting to find loop ---
-        eprintln!("[vm] Starting VM execution (step analysis)...");
+        // --- Run VM for each 16-byte block (4 iterations for 64-byte padded input) ---
+        let bytecode_addr = so_base + 0x118F50;
+        let callback_func_addr = so_base + 0x2884AC;
+        let entry_pc = so_base + 0x168324;
+        let num_blocks = padded_input.len() / 16;
+
+        eprintln!("[vm] Running {} VM iterations...", num_blocks);
         let start = std::time::Instant::now();
-        dy.reg_write_pc(entry_pc).unwrap();
-        let mut step_count = 0u64;
-        let max_steps = 50_000u64;
-        let mut pc_hist: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        loop {
-            let pc = dy.reg_read_pc().unwrap_or(0);
-            *pc_hist.entry(pc).or_insert(0) += 1;
-            if step_count < 20 || step_count % 5000 == 0 {
-                eprintln!("[vm] step {}: PC=SO+0x{:x}", step_count, pc.wrapping_sub(so_base));
-            }
-            if pc == halt_addr || pc == halt_addr + 4 { eprintln!("[vm] HALT at step {}", step_count); break; }
-            if miss_flag.load(Ordering::SeqCst) { eprintln!("[vm] UNMAPPED at step {}", step_count); break; }
-            if step_count >= max_steps {
-                eprintln!("[vm] Max {} steps. Top visited PCs:", max_steps);
-                let mut top: Vec<_> = pc_hist.iter().collect();
-                top.sort_by(|a,b| b.1.cmp(a.1));
-                for (pc, cnt) in top.iter().take(10) {
-                    eprintln!("  SO+0x{:x}: {} times", pc.wrapping_sub(so_base), cnt);
+
+        for block_idx in 0..num_blocks {
+            let offset = (block_idx * 16) as u64;
+
+            // packed_args = [workspace, input_block_ptr, output_block_ptr]
+            let packed_args_addr = sp - 0x100;
+            dy.mem_write(packed_args_addr,      &workspace_addr.to_le_bytes()).unwrap();
+            dy.mem_write(packed_args_addr + 8,   &(input_addr + offset).to_le_bytes()).unwrap();
+            dy.mem_write(packed_args_addr + 16,  &(output_accum_addr + offset).to_le_bytes()).unwrap();
+
+            // callback context: [callback_func, stack_area_ptr, 0]
+            let vm_stack_area = sp - 0x300 - (block_idx as u64) * 0x200;
+            let callback_ctx_addr = sp - 0x200;
+            dy.mem_write(callback_ctx_addr,      &callback_func_addr.to_le_bytes()).unwrap();
+            dy.mem_write(callback_ctx_addr + 8,  &vm_stack_area.to_le_bytes()).unwrap();
+            dy.mem_write(callback_ctx_addr + 16, &0u64.to_le_bytes()).unwrap();
+
+            // Set registers for sub_168324 call
+            dy.reg_write_raw(0, bytecode_addr).unwrap();
+            dy.reg_write_raw(1, packed_args_addr).unwrap();
+            dy.reg_write_raw(2, 0).unwrap();
+            dy.reg_write_raw(3, 0).unwrap();
+            dy.reg_write_raw(4, callback_ctx_addr).unwrap();
+            dy.reg_write_sp(sp).unwrap();
+            dy.reg_write_lr(halt_addr).unwrap();
+
+            // Run with emu_step loop (emu_start + timeout threads unreliable on Windows)
+            dy.reg_write_pc(entry_pc).unwrap();
+            let max_steps = 100_000u64;
+            let mut steps = 0u64;
+            let mut halted = false;
+            loop {
+                let pc = dy.reg_read_pc().unwrap_or(0);
+                if pc == halt_addr || pc == halt_addr + 4 { halted = true; break; }
+                if miss_flag.load(Ordering::SeqCst) {
+                    let addr = *miss_addr.lock().unwrap();
+                    eprintln!("[vm] Block {}: UNMAPPED at 0x{:x}", block_idx, addr);
+                    break;
                 }
+                if steps >= max_steps {
+                    eprintln!("[vm] Block {}: max steps ({}) at PC=SO+0x{:x}", block_idx, max_steps, pc.wrapping_sub(so_base));
+                    break;
+                }
+                if let Err(e) = dy.emu_step(pc) {
+                    eprintln!("[vm] Block {}: step error at SO+0x{:x}: {}", block_idx, pc.wrapping_sub(so_base), e);
+                    break;
+                }
+                steps += 1;
+            }
+            if !halted {
+                eprintln!("[vm] Block {} failed after {} steps", block_idx, steps);
                 break;
             }
-            if let Err(e) = dy.emu_step(pc) { eprintln!("[vm] Error at SO+0x{:x}: {}", pc.wrapping_sub(so_base), e); break; }
-            step_count += 1;
+
+            // Read output block
+            let mut out_block = [0u8; 16];
+            dy.mem_read(output_accum_addr + offset, &mut out_block).unwrap();
+            eprintln!("[vm] Block {}: output={}", block_idx, hex::encode(&out_block));
+
+            miss_flag.store(false, Ordering::SeqCst);
         }
+
         let elapsed = start.elapsed();
+        eprintln!("[vm] All blocks done in {:?}", elapsed);
+
+        // Read full output accumulator
+        let mut full_output = [0u8; 64];
+        dy.mem_read(output_accum_addr, &mut full_output).unwrap();
+        eprintln!("[vm] Full output: {}", hex::encode(&full_output));
+
+        // The Helios result is the first 32 bytes (part1 + part2)
+        eprintln!("[vm] Helios part1+part2: {}", hex::encode(&full_output[..32]));
+
         let result: Result<(), anyhow::Error> = Ok(());
 
-        let final_pc = dy.reg_read_pc().unwrap_or(0);
-        eprintln!("[vm] Done in {:?}, PC=0x{:x}, result={:?}", elapsed, final_pc, result);
-
-        if miss_flag.load(Ordering::SeqCst) {
-            let addr = *miss_addr.lock().unwrap();
-            eprintln!("[vm] FAILED: unmapped memory access at 0x{:x}", addr);
-        }
-
-        if final_pc == halt_addr || final_pc == halt_addr + 4 {
-            eprintln!("[vm] VM returned normally!");
-            // Read output
-            let mut out = [0u8; 32];
-            dy.mem_read(output_addr, &mut out).unwrap();
-            eprintln!("[vm] Output: {}", hex::encode(&out));
-        }
-
-        // Dump register file state for debugging
-        for i in 0..8 {
-            let val = dy.reg_read(i).unwrap_or(0);
-            eprintln!("[vm] X{} = 0x{:016x}", i, val);
-        }
-        eprintln!("[vm] X19=0x{:x} X20=0x{:x} X28=0x{:x}",
-            dy.reg_read(19).unwrap_or(0),
-            dy.reg_read(20).unwrap_or(0),
-            dy.reg_read(28).unwrap_or(0));
+        eprintln!("[vm] Done in {:?}", elapsed);
     }
 }
