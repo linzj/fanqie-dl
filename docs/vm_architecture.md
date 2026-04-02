@@ -208,14 +208,23 @@ reg[d] = sign_extend_32((reg[a] & mask) >> extra)
 ```
 - Sub-handler: SO+0x168DF0
 
-#### sub50: SPLIT — 分割值
+#### sub50: SPLIT — BLR/EXIT/BRANCH (多功能调用指令)
 ```
-reg[d1] = part1(reg[a])
-reg[d2] = part2(reg[a])
+reg[reg_d] = bytecode_ptr + 4    ; 保存返回地址 (link register)
+val = reg[reg_b]
+if val == callback_fn (ctx[0]):   ; 原生函数调用
+    BLR reg[4] with X0=reg[5]
+elif val == flags (ctx[2]):       ; VM 退出
+    restore callee-saved regs; RET
+else:                             ; VM 内部跳转
+    bytecode_ptr = val; dispatch from new addr
 ```
-- Sub-handler: SO+0x16A8E4
-- 1 RF read, 2 RF writes
-- 用途: 将一个 64 位值分成两部分
+- Sub-handler: SO+0x16A8E4 (~416 bytes, 多 CFF 路径)
+- BLR 路径: reg[4] = 函数指针, reg[5] = 参数, 返回后继续下一条指令
+- EXIT 路径: 跳转到 SO+0x172440 (函数尾声)
+- BRANCH 路径: 设 bytecode_ptr=reg[reg_b], 类似 BLR 但在 VM 字节码内
+- Medusa 中全部 5 个 SPLIT 使用 reg_b=25, reg_d=31
+- 调用者设置: ctx[0]=callback_thunk, ctx[2]=LR (返回地址作为 EXIT 哨兵)
 
 #### sub13: NOP
 - Sub-handler: SO+0x16AA88

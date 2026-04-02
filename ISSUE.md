@@ -1280,12 +1280,119 @@ Cluster B (config 对象): 0x6d885db1c4 - 0x6d885db390 (468 bytes)
   TB[14-23] = 0x6d890e92a4... (12字节间距的结构体数组)
 ```
 
+### SPLIT Handler 完整逆向 (2026-04-02, IDA MCP 分析)
+
+**SPLIT (OP17.sub50, SO+0x16A8E4) 有三种行为:**
+
+```
+1. reg[reg_b] == callback_fn (ctx[0]) → BLR 调用 reg[4](reg[5])
+2. reg[reg_b] == flags (ctx[2])       → VM EXIT (恢复寄存器 + RET)  
+3. 其他                               → VM BRANCH: bytecode_ptr = reg[reg_b]
+```
+
+**SPLIT handler 详细流程:**
+1. 保存返回地址: `reg[reg_d] = bytecode_ptr + 4` (类似 BL 保存 LR)
+2. 读取 `val = reg[reg_b]`
+3. 三路分支: BLR / EXIT / BRANCH
+
+**BLR 路径 (0x16AA30-0x16AA84):**
+```
+保存: STP X30,X0 → [frame-0x80]; STP X5,X1 → [frame-0x90]
+读取: X8 = reg[4] (通过 [frame-0x58] = &reg_file[4])  
+      X0 = reg[5] (通过 [frame-0x70] = &reg_file[5])
+调用: BLR X8  → 返回到 SO+0x16AA4C
+恢复: X4(CFF), X5, X6(dispatcher), X7, X2, X3, X30, X0
+前进: bytecode_ptr += 4; CFF dispatch to next handler
+```
+
+**EXIT 路径 (SO+0x172440):**
+```
+MOV SP, X29; 恢复所有 callee-saved 寄存器; RET
+```
+
+**BRANCH 路径 (0x1859AC):**
+```
+*[X19] = reg[reg_b]  → 设置 bytecode_ptr 为 reg[reg_b]
+LDR W8, [reg[reg_b]] → 从新地址读取下一条指令
+CFF dispatch          → 跳转到新地址执行 (VM 内部子程序调用)
+```
+
+### Medusa VM 调用者 (IDA 反编译)
+
+**wrapper: sub_6D882A3C5C (SO+0x28EC5C)**
+```c
+// IDA 反编译 (简化)
+int64 medusa_vm_call(int64 a1, char a2, int64 a3) {
+    char workspace[0x7C8];     // 未初始化 (栈上 1992 bytes)
+    int64 packed_args[2] = {a3, a1};
+    char type_byte = a2;
+    int64 ctx[3] = {
+        sub_6D882A3CE4,        // ctx[0] = callback (thunk: a1(a2))
+        &workspace[0x7C8],     // ctx[1] = vm_stk (workspace top)
+        __builtin_return_address(0)  // ctx[2] = LR (XPACLRI'd)
+    };
+    return sub_168324(
+        &bytecode_119050,      // X0 = Medusa 字节码
+        packed_args,           // X1
+        TABLE_A,               // X2 = SO+0x37A6D0
+        TABLE_B,               // X3 = SO+0x37A730
+        ctx                    // X4
+    );
+}
+```
+
+**关键发现:**
+- ctx[2] = LR (返回地址), **不是 0**!
+- callback = `sub_6D882A3CE4` = 简单 thunk: `return a1(a2)`
+- workspace 在栈上**未初始化** → r22/r25 等寄存器值来自栈残留
+- vtable 地址: 0x6d8839E240, entry[2] = 此函数
+
+### Medusa VM 逐条追踪结果 (指令 0-151, 更新)
+
+设置 r22=r25=callback 使 SPLIT 走 BLR 路径 (stub 返回 0), 追踪推进到指令 151:
+
+#### Phase 4 [75-135]: handle 数据读取 + 4次 SPLIT BLR 调用
+```
+[77] r16 = packed_args[1] = output_buf
+[78] r1  = packed_args[0] = struct_ptr
+[80] SEXT r1 (sign extend)
+[83] OP20: 条件跳转 (struct=0 → 跳到 99, 跳过 84-98)
+[84] r4 = TABLE_A + r12 (ASLR-adjusted pointer)
+[87] r3 = *(r23+off) — 从 handle 读数据
+[94] OR r0 = r25 | r22  (准备 SPLIT 条件)
+[95] ★ SPLIT BLR #1: call reg[4](reg[5])  → stub 返回 0
+[102] r1 = *(r23+off)  — 更多 handle 数据
+[111] OR r4 = r4 | r19; OR r0 = r25 | r22
+[113] ★ SPLIT BLR #2: call reg[4](reg[5])
+[117] OR r4 = r4 | r18; OR r0 = r25 | r22
+[119] ★ SPLIT BLR #3: call reg[4](reg[5])
+[126] r2 = *(r23+offset) — handle 数据
+[132] OR r4 = r4 | r17; OR r0 = r25 | r22
+[135] ★ SPLIT BLR #4: call reg[4](reg[5])
+```
+
+4 次 SPLIT BLR 调用模式相同:
+- 先 `OR r4 = r4 | rX` 构建函数指针
+- 再 `OR r0 = r25 | r22` 设置 SPLIT 条件
+- 执行 SPLIT → BLR reg[4](reg[5])
+- reg[4] = handle vtable 函数指针, reg[5] = 参数 (stack addr)
+
+#### Phase 5 [136-151]: 常量构建 + 位操作
+```
+[136] MOVI_HI r1 = 0xc8b0000
+[137-142] SHL+ADDPTR 链: 构建 64-bit 常量到 r1
+[143-147] SHL+ADDPTR 链: 构建 64-bit 常量到 r2
+[148-150] STORE r1,r2,r3 到栈
+[151] SHLW r17 = r0 << 16
+[152] BEQ → ★ 卡在 CFF dispatch (合成数据导致计算结果错误)
+```
+
 ### 下一步
 
-1. **IDA 分析 SPLIT handler (SO+0x16A8E4)**: BLR 目标地址如何从寄存器计算
-2. **IDA 分析 SO+0x16AA4C 附近**: BLR 调用上下文，参数传递方式
-3. **识别被调用函数**: handle vtable 中的函数指针对应哪些 SO 函数
-4. **在 emulator 中 stub 这些函数**: 让 VM 能跑完所有 256 条指令
+1. **获取真实 handle 数据**: 需要运行时 dump reg[4] 在每个 SPLIT 调用点的值，确认被调用函数
+2. **静态逆向 SPLIT 调用的函数**: OR r4 = r4 | rX 模式说明函数指针来自 handle vtable + OR 组合
+3. **stub 实现被调用函数**: 在 emulator 中模拟这些函数的行为
+4. **Phase 6-7 解码**: 常量构建 (OP52+OP48) 可能是 AES 或 hash 的常量表
 
 ## 当前实现状态 (2026-04-02)
 

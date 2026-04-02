@@ -2962,16 +2962,27 @@ mod tests {
         }
 
         let ctx = sp - 0x200;
-        dy.mem_write(ctx, &cb_stub.to_le_bytes()).unwrap();
-        dy.mem_write(ctx + 8, &(sp - 0x400).to_le_bytes()).unwrap();
-        dy.mem_write(ctx + 16, &0u64.to_le_bytes()).unwrap();
+        let vm_stk = sp - 0x400;
+        // IDA shows real caller (sub_6D882A3C5C): callback = sub_6D882A3CE4
+        // For tracing, use a stub that just returns 0 (since we don't have real handle vtable fns)
+        let callback = cb_stub; // callback_fn for SPLIT condition check
+        dy.mem_write(ctx, &callback.to_le_bytes()).unwrap(); // ctx[0] = callback_fn
+        dy.mem_write(ctx + 8, &vm_stk.to_le_bytes()).unwrap(); // ctx[1] = vm_stk
+        // ctx[2] = LR (return address). Real caller stores XPACLRI'd LR here.
+        // SPLIT checks: if reg[25]==ctx[2] → VM EXIT. Use halt as "LR".
+        dy.mem_write(ctx + 16, &halt.to_le_bytes()).unwrap(); // ctx[2] = flags = halt sentinel
 
-        // Also patch r22/r25 source: instruction 11 does r22 = r7 | something.
-        // r7 initially = 0, but after TABLE load r7 = TA[0]. Before TABLE load,
-        // the OR at [11] picks up whatever r7 had. The callback addr ends up in r22.
-        // We need r22 to point to our stub instead of SO+0x2884AC.
-        // The simplest fix: write cb_stub address into the ctx callback slot (already done)
-        // and also into the VM's initial "callback context" at ctx[0].
+        // Pre-initialize VM register file in workspace.
+        // Dispatcher sets X28 = vm_stk - 0x118 = register file base.
+        // reg[i] = *(X28 + i*8) = *(vm_stk - 0x118 + i*8)
+        // r22 and r25 are read by bytecodes but never written before first use.
+        // In real caller, workspace is on stack → r22/r25 = previous call's values.
+        // For SPLIT to BLR: r25 must == callback_fn. Set r22=r25=callback_fn.
+        let rf_base = vm_stk - 0x118;
+        // r22 = callback_fn
+        dy.mem_write(rf_base + 22 * 8, &callback.to_le_bytes()).ok();
+        // r25 = callback_fn  (SPLIT checks r25 == callback → BLR to r4)
+        dy.mem_write(rf_base + 25 * 8, &callback.to_le_bytes()).ok();
 
         // Unmapped callback: map on demand, continue
         let miss_flag = Arc::new(AtomicBool::new(false));
@@ -3030,11 +3041,25 @@ mod tests {
         let max_arm_steps = 5_000_000u64;
         let stuck_threshold = 100_000u64; // if no bc_ptr advance in 100K steps → stuck
 
+        let so_code_end = so_base + 0x348700;
         loop {
             let pc = dy.reg_read_pc().unwrap_or(0);
             if pc == halt || pc == halt + 4 {
                 eprintln!("[trace] VM halted at arm_step={}", arm_steps);
                 break;
+            }
+            // Detect BLR to non-SO code (SPLIT called handle vtable function).
+            // Force return with X0=0 to simulate stub function.
+            if pc != 0 && (pc < so_base || pc >= so_code_end) && pc != halt && pc != cb_stub {
+                let lr = dy.reg_read(30).unwrap_or(0);
+                if lr >= so_base && lr < so_code_end {
+                    // PC left SO code, LR points back into SO → SPLIT BLR happened.
+                    // Return 0 and continue.
+                    dy.reg_write_raw(0, 0).unwrap();
+                    dy.reg_write_pc(lr).unwrap();
+                    arm_steps += 1;
+                    continue;
+                }
             }
             if miss_flag.load(Ordering::SeqCst) {
                 eprintln!(
