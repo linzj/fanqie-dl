@@ -1984,6 +1984,113 @@ mod tests {
         eprintln!("[vm] Done in {:?}", elapsed);
     }
 
+    /// Run Medusa VM for N instructions and dump register file state.
+    /// Used to extract embedded constants (like r12 base offset).
+    #[test]
+    fn test_vm_medusa_regs() {
+        use dynarmic_sys::Dynarmic;
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir)).expect("so_code.bin");
+        let so_data1 = std::fs::read(format!("{}/lib/so_data1.bin", dir)).expect("so_data1.bin");
+        let so_data2 = std::fs::read(format!("{}/lib/so_data2.bin", dir)).expect("so_data2.bin");
+
+        let so_base: u64 = 0x6d88_01b0_00;
+        let dy = Arc::new(Dynarmic::<()>::new());
+
+        // Map SO
+        dy.mem_map(so_base & !0xFFF, ((0x348700+0xFFF) & !0xFFF)+0x1000, 3).unwrap();
+        dy.mem_write(so_base, &so_code[..0x348700]).unwrap();
+        let d1 = so_base + 0x34C700;
+        dy.mem_map(d1 & !0xFFF, ((0x28F10+0xFFF+(d1&0xFFF) as usize)&!0xFFF), 3).unwrap();
+        dy.mem_write(d1, &so_data1[..0x28F10]).unwrap();
+        let d2 = so_base + 0x379610;
+        dy.mem_map(d2 & !0xFFF, ((0x6A460+0xFFF+(d2&0xFFF) as usize)&!0xFFF), 3).unwrap();
+        dy.mem_write(d2, &so_data2[..0x6A460]).unwrap();
+
+        let stack_base: u64 = 0x7000_0000;
+        dy.mem_map(stack_base, 0x10_0000, 3).unwrap();
+        let sp = stack_base + 0x10_0000 - 0x1000;
+
+        let halt: u64 = 0xDEAD_0000;
+        dy.mem_map(halt, 0x1000, 3).unwrap();
+        for off in (0..0x1000).step_by(4) { dy.mem_write(halt+off, &0xD65F03C0u32.to_le_bytes()).unwrap(); }
+        let tpidr: u64 = 0x8000_0000;
+        dy.mem_map(tpidr, 0x1000, 3).unwrap();
+        dy.mem_write(tpidr+0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+        dy.reg_write_tpidr_el0(tpidr).unwrap();
+
+        // Medusa args
+        let bytecode = so_base + 0x119050;
+        let callback = so_base + 0x2884AC;
+        let output: u64 = stack_base + 0x400;
+        dy.mem_write(output, &[0u8; 1024]).unwrap();
+        let pa = sp - 0x100;
+        dy.mem_write(pa, &output.to_le_bytes()).unwrap();
+        dy.mem_write(pa+8, &output.to_le_bytes()).unwrap();
+        dy.mem_write(pa+16, &0u64.to_le_bytes()).unwrap();
+        let ctx = sp - 0x200;
+        dy.mem_write(ctx, &callback.to_le_bytes()).unwrap();
+        dy.mem_write(ctx+8, &(sp-0x400).to_le_bytes()).unwrap();
+        dy.mem_write(ctx+16, &0u64.to_le_bytes()).unwrap();
+
+        // Stop on unmapped
+        let miss = Arc::new(AtomicBool::new(false));
+        let miss_a = Arc::new(Mutex::new(0u64));
+        {
+            let m=miss.clone(); let ma=miss_a.clone();
+            dy.set_unmapped_mem_callback(move |d: &Dynarmic<()>, addr: u64, _, _| -> bool {
+                let c = addr & 0x00FF_FFFF_FFFF_FFFF;
+                eprintln!("[medusa] UNMAPPED 0x{:x}", c);
+                m.store(true, Ordering::SeqCst);
+                *ma.lock().unwrap() = c;
+                d.emu_stop().ok();
+                false
+            });
+        }
+        dy.set_svc_callback(|_: &Dynarmic<()>, n: u32, _, _| { eprintln!("[medusa] SVC {:#x}", n); });
+
+        dy.reg_write_raw(0, bytecode).unwrap();
+        dy.reg_write_raw(1, pa).unwrap();
+        dy.reg_write_raw(2, so_base + 0x37A6D0).unwrap();
+        dy.reg_write_raw(3, so_base + 0x37A730).unwrap();
+        dy.reg_write_raw(4, ctx).unwrap();
+        dy.reg_write_sp(sp).unwrap();
+        dy.reg_write_lr(halt).unwrap();
+
+        let entry = so_base + 0x168324;
+        dy.reg_write_pc(entry).unwrap();
+
+        // Step until we hit unmapped memory (table pointer dereference)
+        let mut steps = 0u64;
+        loop {
+            let pc = dy.reg_read_pc().unwrap_or(0);
+            if pc == halt || pc == halt+4 { eprintln!("[medusa] HALT at {}", steps); break; }
+            if miss.load(Ordering::SeqCst) {
+                let a = *miss_a.lock().unwrap();
+                eprintln!("[medusa] Hit unmapped at step {}, addr=0x{:x}", steps, a);
+                break;
+            }
+            if steps > 100_000 { eprintln!("[medusa] max steps"); break; }
+            dy.emu_step(pc).ok();
+            steps += 1;
+        }
+
+        // Dump VM register file
+        let x28 = dy.reg_read(28).unwrap_or(0);
+        eprintln!("[medusa] X28 (reg file base) = 0x{:x}", x28);
+        if x28 > 0 {
+            for i in 0..32 {
+                let mut buf = [0u8; 8];
+                if dy.mem_read(x28 + i*8, &mut buf).is_ok() {
+                    let val = u64::from_le_bytes(buf);
+                    if val != 0 { eprintln!("[medusa] r{} = 0x{:016x}", i, val); }
+                }
+            }
+        }
+    }
+
     /// Probe Medusa VM: run with unmapped handle data to discover all external reads.
     /// Maps a page on-demand at each unmapped access (filled with zeros), logs the address.
     /// This reveals exactly which data entries the Medusa VM reads.
