@@ -1087,3 +1087,134 @@ so_data1.bin   — data segment 1 (164KB)
 so_data2.bin   — data segment 2 (425KB)
 vm_meta.txt    — VM 元数据 (地址偏移等)
 ```
+
+## VM 指令集完整逆向 (2026-04-02)
+
+详细文档见 `docs/vm_architecture.md`。
+
+### 指令集概要
+
+| 类型 | 指令 | 操作 |
+|------|------|------|
+| 加载 | OP24 | `r[d] = *(u64)(r[s] + imm16)` |
+| 存储 | OP26 | `*(u64)(r[b] + imm16) = r[v]` |
+| 32位存储 | OP22 | `*(u32)(r[b] + imm16) = r[v]` |
+| 32位加载 | OP59 | `r[d] = sext32(*(i32)(r[s] + imm16))` |
+| 指针偏移 | OP15 | `r[d] = r[s] + imm16` |
+| 高16位立即数 | OP52 | `r[d] = sext32(imm16 << 16)` |
+| 低16位OR | OP48 | `r[d] \|= imm16` |
+| 符号扩展 | OP1 | `r[d] = sext16(r[s])` |
+| 条件跳转 | OP45 | `if r[a]==r[b]: PC += N*4` |
+| 位域提取 | OP4.11 | `r[d] = (r[s] >> shift) & ((1<<w)-1)` |
+
+#### OP17 子指令集 (ALU，47个子handler)
+
+| sub-op | 操作 | Medusa中出现 |
+|--------|------|-------------|
+| 14 | `r[d] = r[a] + r[b]` (ADD) | 10次 |
+| 44 | `r[d] = r[a] \| r[b]` (OR) | 6次 |
+| 51 | `r[d] = sext32(r[a] + r[b])` (ADDW) | 7次 |
+| 50 | SPLIT: 分割值到两个寄存器 | 4次 |
+| 29 | `r[d] = (r[a] & mask) ^ r[b]` (XOR) | 4次 |
+| 23 | `r[d] = r[a] << imm` (SHL) | 4次 |
+| 16 | `r[d] = r[a] - r[b]` (SUB) | 1次 |
+| 3 | `r[d] = sext32(r[a] << imm)` (SHLW) | 1次 |
+| 7 | `r[d] = sext32(r[a] >> imm)` (SHRW) | 1次 |
+| 54 | `r[d] = r[a] & r[b]` (AND) | 1次 |
+| 10 | `r[d] = r[a] & r[b] & mask` (AND2) | 2次 |
+| 46 | `r[d] = sext32(r[a] - r[b])` (SUBW) | 1次 |
+| 13 | NOP | 2次 |
+
+### 4个VM字节码
+
+| 偏移 | 大小 | 用途 | 调用者 |
+|------|------|------|--------|
+| SO+0x118F50 | 64 dwords | **Helios part1/part2** | sub_2A31CC |
+| SO+0x119050 | 256 dwords | **Medusa 明文组装** | sub_2A3C5C |
+| SO+0x0A46A0 | ? | 未知功能 | sub_2848F0 |
+| SO+0x0F1FB0 | ? | 未知功能 | sub_29C36C |
+
+### Medusa VM 反汇编 (256 条指令) 数据流
+
+```
+Phase 1 [0-12]:    初始化栈帧 + 保存 r16-r31
+Phase 2 [13-67]:   从 TABLE_A/B 加载 30 个 handle 数据指针到寄存器/栈
+Phase 3 [68-74]:   指针 + r12 基址偏移 (r12 = ASLR 重定位 delta)
+Phase 4 [75-135]:  读取 packed_args + handle 字段, OR/SPLIT 处理
+Phase 5 [136-186]: 位操作 + 数据变换 (SHL/ADDW/SUBW/UBFX)
+Phase 6 [187-226]: 18×MOVI_HI + 19×ORI_LO = 构建常量表 (bytecode 嵌入)
+Phase 7 [235-255]: XOR + AND + ADDW + SHRW = 最终 hash/checksum
+```
+
+### Handle 数据结构 (三级指针)
+
+```
+TABLE_A/B (SO data section)
+  └─ 指针 ──→ Cluster H (handle 对象, 460B) ──→ 第三级堆对象
+  └─ 指针 ──→ Cluster B (config 对象, 300+B) ──→ 第三级堆对象 (device_id, uuid, keys...)
+```
+
+- r12 = `0xffffffffff5011e8` (ASLR 重定位偏移，bytecode 嵌入常量)
+- Cluster H: handle 内部 0x40 字节条目数组 (entries 1/5/6/7)
+- Cluster B: C++ config 对象，8字节对齐指针成员
+- 第三级: 实际数据 (device_id string, session UUID, crypto keys)
+- **纯静态无法获取第三级数据**——依赖运行时堆内存
+
+## 当前实现状态 (2026-04-02)
+
+### X-Helios ✅ 完成
+
+```
+sign() → vm_compute_helios() → 4 blocks × 37K steps = 89ms
+输出: base64(R(4) + part1(16) + part2(16)) = 48 chars
+```
+
+### X-Medusa 🔶 格式正确，内容猜测
+
+```
+sign() → AES-128-ECB encrypt + SHA-1 + header 构造
+输出: base64(header(24) + body(936)) = 1280 chars
+问题: 明文是猜测的（MD5 hash 拼凑），服务器不接受
+```
+
+### 测试结果
+
+```
+请求到达服务器 ✅ (有 x-tt-logid, x-tt-trace-id 等响应 header)
+HTTP 200 但 body 为空 ❌ (签名验证不通过 — 服务器静默拒绝)
+新设备注册成功 ✅ (device_id=1751989655468474)
+```
+
+### 阻塞点
+
+Medusa 明文由 Medusa VM 从 handle 数据（三级指针 → 运行时堆内存）组装。
+无法纯静态获取。需要一次运行时捕获：
+
+```bash
+# 方案1: Frida hook native 入口 (y2.a 被调用时 handle 已初始化)
+frida -f com.dragon.read -l scripts/dump_vm_data.js
+
+# 方案2: 如果 Frida 被检测，用 /proc/pid/mem 直接读
+adb shell "cat /proc/PID/mem" | extract_regions.py
+```
+
+### 代码结构
+
+```
+src/signer/emulator.rs:
+  vm_compute_helios()  — Helios VM runner (dynarmic JIT, 4 blocks)
+  sign()               — 生成 X-Helios + X-Medusa headers
+  test_vm_helios()     — Helios VM 单元测试
+  test_vm_medusa_regs() — Medusa VM 寄存器 dump
+  test_download_chapter() — 实际下载测试
+
+src/signer/mod.rs:
+  sign_request()       — 签名入口 (调用 emulator::sign)
+
+src/api/client.rs:
+  get()                — GET 请求 (自动签名)
+  register_encryption_key() — registerkey POST (自动签名)
+
+docs/vm_architecture.md — 完整 VM 架构文档
+scripts/dump_vm_data.js — Frida 一次性 dump handle 数据
+```
