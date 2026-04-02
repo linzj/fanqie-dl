@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 lib/
 .DS_Store
+libs/

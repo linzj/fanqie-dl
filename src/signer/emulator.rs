@@ -1983,4 +1983,183 @@ mod tests {
 
         eprintln!("[vm] Done in {:?}", elapsed);
     }
+
+    /// Probe Medusa VM: run with unmapped handle data to discover all external reads.
+    /// Maps a page on-demand at each unmapped access (filled with zeros), logs the address.
+    /// This reveals exactly which data entries the Medusa VM reads.
+    #[test]
+    fn test_vm_medusa_probe() {
+        use dynarmic_sys::Dynarmic;
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let so_code = std::fs::read(format!("{}/lib/so_code.bin", dir)).expect("so_code.bin");
+        let so_data1 = std::fs::read(format!("{}/lib/so_data1.bin", dir)).expect("so_data1.bin");
+        let so_data2 = std::fs::read(format!("{}/lib/so_data2.bin", dir)).expect("so_data2.bin");
+
+        let so_base: u64 = 0x6d88_01b0_00;
+        let dy = Arc::new(Dynarmic::<()>::new());
+
+        // Map SO code + data (same as Helios test)
+        dy.mem_map(so_base & !0xFFF, ((0x348700 + 0xFFF) & !0xFFF) + 0x1000, 3).unwrap();
+        dy.mem_write(so_base, &so_code[..0x348700]).unwrap();
+        let d1 = so_base + 0x34C700;
+        dy.mem_map(d1 & !0xFFF, ((0x28F10 + 0xFFF + (d1 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+        dy.mem_write(d1, &so_data1[..0x28F10]).unwrap();
+        let d2 = so_base + 0x379610;
+        dy.mem_map(d2 & !0xFFF, ((0x6A460 + 0xFFF + (d2 & 0xFFF) as usize) & !0xFFF), 3).unwrap();
+        dy.mem_write(d2, &so_data2[..0x6A460]).unwrap();
+
+        let stack_base: u64 = 0x7000_0000;
+        dy.mem_map(stack_base, 0x10_0000, 3).unwrap();
+        let sp = stack_base + 0x10_0000 - 0x1000;
+
+        let halt_addr: u64 = 0xDEAD_0000;
+        dy.mem_map(halt_addr, 0x1000, 3).unwrap();
+        for off in (0..0x1000).step_by(4) {
+            dy.mem_write(halt_addr + off, &0xD65F03C0u32.to_le_bytes()).unwrap();
+        }
+        let tpidr: u64 = 0x8000_0000;
+        dy.mem_map(tpidr, 0x1000, 3).unwrap();
+        dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes()).unwrap();
+        dy.reg_write_tpidr_el0(tpidr).unwrap();
+
+        // Medusa VM args: sub_2A3C5C(a1=output_struct, a2=flags_byte, a3=??)
+        // Inside: sub_168324(bytecode_0x119050, packed=[a3, a1, a2_byte], off_37A6D0, off_37A730, cb)
+        // So:
+        //   X0 = bytecode (SO+0x119050)
+        //   X1 = packed_args
+        //   X2 = off_37A6D0 address (SO+0x37A6D0)
+        //   X3 = off_37A730 address (SO+0x37A730)
+        //   X4 = callback context
+
+        let bytecode = so_base + 0x119050;
+        let callback = so_base + 0x2884AC; // dummy callback, same as Helios
+
+        // Packed args: [some_struct, output_ptr, flags]
+        let output_buf: u64 = stack_base + 0x400;
+        dy.mem_write(output_buf, &[0u8; 1024]).unwrap();
+        let packed_args = sp - 0x100;
+        dy.mem_write(packed_args,      &output_buf.to_le_bytes()).unwrap(); // a3 (struct?)
+        dy.mem_write(packed_args + 8,  &output_buf.to_le_bytes()).unwrap(); // a1 (output)
+        dy.mem_write(packed_args + 16, &0u64.to_le_bytes()).unwrap();       // a2 (flags=0)
+
+        let ctx = sp - 0x200;
+        let vm_stk = sp - 0x400;
+        dy.mem_write(ctx,      &callback.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 8,  &vm_stk.to_le_bytes()).unwrap();
+        dy.mem_write(ctx + 16, &0u64.to_le_bytes()).unwrap();
+
+        // Track unmapped accesses — stop immediately on first external access
+        let miss_flag = Arc::new(AtomicBool::new(false));
+        let miss_info = Arc::new(Mutex::new((0u64, 0u64))); // (addr, pc)
+        {
+            let mf = miss_flag.clone();
+            let mi = miss_info.clone();
+            dy.set_unmapped_mem_callback(move |d: &Dynarmic<()>, addr: u64, _: usize, pc: u64| -> bool {
+                let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
+                mf.store(true, Ordering::SeqCst);
+                *mi.lock().unwrap() = (clean, pc);
+                d.emu_stop().ok();
+                false
+            });
+        }
+        dy.set_svc_callback(|_: &Dynarmic<()>, n: u32, _: u64, _: u64| {
+            eprintln!("[probe] SVC #{:#x}", n);
+        });
+
+        // Set registers
+        dy.reg_write_raw(0, bytecode).unwrap();
+        dy.reg_write_raw(1, packed_args).unwrap();
+        dy.reg_write_raw(2, so_base + 0x37A6D0).unwrap(); // off_37A6D0
+        dy.reg_write_raw(3, so_base + 0x37A730).unwrap(); // off_37A730
+        dy.reg_write_raw(4, ctx).unwrap();
+        dy.reg_write_sp(sp).unwrap();
+        dy.reg_write_lr(halt_addr).unwrap();
+
+        let entry = so_base + 0x168324;
+        eprintln!("[probe] Running Medusa VM probe (stop on first unmapped)...");
+
+        // Iteratively run: on each unmapped access, log it, provide zero page, retry
+        let mut external_reads: Vec<(u64, u64)> = Vec::new(); // (addr, pc)
+        let mut total_steps = 0u64;
+
+        for round in 0..50 {
+            // Reset state for first round only
+            if round == 0 {
+                dy.reg_write_raw(0, bytecode).unwrap();
+                dy.reg_write_raw(1, packed_args).unwrap();
+                dy.reg_write_raw(2, so_base + 0x37A6D0).unwrap();
+                dy.reg_write_raw(3, so_base + 0x37A730).unwrap();
+                dy.reg_write_raw(4, ctx).unwrap();
+                dy.reg_write_sp(sp).unwrap();
+                dy.reg_write_lr(halt_addr).unwrap();
+                dy.reg_write_pc(entry).unwrap();
+            }
+
+            miss_flag.store(false, Ordering::SeqCst);
+            let max_steps = 200_000u64;
+            let mut steps = 0u64;
+            let mut halted = false;
+
+            loop {
+                let pc = dy.reg_read_pc().unwrap_or(0);
+                if pc == halt_addr || pc == halt_addr + 4 { halted = true; break; }
+                if miss_flag.load(Ordering::SeqCst) { break; }
+                if steps >= max_steps { break; }
+                if let Err(_) = dy.emu_step(pc) { break; }
+                steps += 1;
+            }
+            total_steps += steps;
+
+            if halted {
+                eprintln!("[probe] VM halted after {} total steps, {} rounds", total_steps, round + 1);
+                break;
+            }
+
+            if miss_flag.load(Ordering::SeqCst) {
+                let (addr, pc) = *miss_info.lock().unwrap();
+                external_reads.push((addr, pc));
+                eprintln!("[probe] R{}: unmapped 0x{:x} at PC=SO+0x{:x} (step {})",
+                    round, addr, pc.wrapping_sub(so_base), total_steps);
+
+                // Map the page with distinguishable pattern (not zero)
+                let page = addr & !0xFFF;
+                dy.mem_map(page, 0x1000, 3).ok();
+                // Fill with a pattern: page_idx repeated
+                let marker = ((external_reads.len() & 0xFF) as u8).wrapping_add(0x10);
+                dy.mem_write(page, &vec![marker; 0x1000]).ok();
+                continue;
+            }
+
+            eprintln!("[probe] Max steps at round {}", round);
+            break;
+        }
+
+        eprintln!("\n[probe] {} external memory accesses:", external_reads.len());
+        // Classify
+        let table_a: Vec<u64> = vec![
+            0x6d8892e690, 0x6d8892e6b0, 0x6d8892e650,
+            0x6d885db208, 0x6d885db350, 0x6d8892e658,
+            0x6d885db20c, 0x6d885db34c, 0x6d8892e660,
+            0x6d885db210, 0x6d885db348, 0x6d8892e688,
+        ];
+        let table_b: Vec<u64> = vec![
+            0x6d885db220, 0x6d885db330, 0x6d8892e6ac,
+            0x6d885db240, 0x6d885db310, 0x6d8892e6bc,
+            0x6d885db25c, 0x6d885db304, 0x6d8892e5c8,
+            0x6d8892e5d0, 0x6d885db1c4, 0x6d885db390,
+        ];
+        for (addr, pc) in &external_reads {
+            let idx_a = table_a.iter().position(|t| *addr >= *t && *addr < *t + 64);
+            let idx_b = table_b.iter().position(|t| *addr >= *t && *addr < *t + 64);
+            if let Some(i) = idx_a {
+                eprintln!("  0x{:x} = TABLE_A[{}]+{} (PC=SO+0x{:x})", addr, i, addr - table_a[i], pc.wrapping_sub(so_base));
+            } else if let Some(i) = idx_b {
+                eprintln!("  0x{:x} = TABLE_B[{}]+{} (PC=SO+0x{:x})", addr, i, addr - table_b[i], pc.wrapping_sub(so_base));
+            } else {
+                eprintln!("  0x{:x} = UNKNOWN (PC=SO+0x{:x})", addr, pc.wrapping_sub(so_base));
+            }
+        }
+    }
 }
