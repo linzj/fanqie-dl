@@ -37,9 +37,11 @@ Interceptor.attach(base.add(0x168324), {
         var bc=(a[0].sub(base).toInt32()>>>0);
         console.log('\nVM'+vmN+' bc=0x'+bc.toString(16)+' a2='+a[2]+' a3='+a[3]);
         dp('PK',a[1],48);
+        for(var i=0;i<6;i++){try{var p=a[1].add(i*8).readPointer();dp('PK'+i,p,256);}catch(e){console.log('PK'+i+'=ERR:'+e);}}
         if(!a[2].isNull()){for(var i=0;i<12;i++){try{dp('A'+i,a[2].add(i*8).readPointer(),512);}catch(e){}}}
         if(!a[3].isNull()){for(var i=0;i<12;i++){try{dp('B'+i,a[3].add(i*8).readPointer(),512);}catch(e){}}}
         dp('CB',a[4],48);
+        for(var i=0;i<6;i++){try{var p=a[4].add(i*8).readPointer();dp('CB'+i,p,256);}catch(e){console.log('CB'+i+'=ERR:'+e);}}
     },
     onLeave: function(r) {
         if (Process.getCurrentThreadId()===ourTid) console.log('VR'+vmN+'='+r);
