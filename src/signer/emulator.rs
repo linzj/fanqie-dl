@@ -1978,6 +1978,7 @@ pub fn sign(url_query: &str) -> HashMap<String, String> {
     let helios_b64 = base64::engine::general_purpose::STANDARD.encode(&helios_raw);
     headers.insert("X-Helios".to_string(), helios_b64);
 
+    headers.insert("X-Khronos".to_string(), ts.to_string());
     eprintln!("[sign] X-Helios generated ({} bytes raw)", helios_raw.len());
 
     // === X-Medusa construction ===
@@ -2099,20 +2100,21 @@ mod tests {
             let client = reqwest::Client::builder()
                 .user_agent("com.dragon.read/71332 (Linux; U; Android 15; zh_CN; sdk_gphone64_arm64; Build/AP3A.241105.008;tt-ok/3.12.13.20)")
                 .timeout(std::time::Duration::from_secs(15))
+                .gzip(true)
                 .build().unwrap();
 
-            let did = "1751989655468474";
-            let iid = "1751989655701946";
+            let did = "3722313718058683";
+            let iid = "3722313718058683";
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
 
-            let qs = format!("ac=wifi&aid=1967&app_name=novelapp&version_code=71332&version_name=7.1.3.32&device_platform=android&os=android&ssmix=a&device_type=sdk_gphone64_arm64&device_brand=google&os_api=35&os_version=15&device_id={}&iid={}&_rticket={}", did, iid, ts);
+            let qs = format!("aid=1967&device_id={}&_rticket={}", did, ts);
 
             let sigs = super::sign(&qs);
             eprintln!("[test] Helios: {} chars", sigs.get("X-Helios").map(|s| s.len()).unwrap_or(0));
             eprintln!("[test] Medusa: {} chars", sigs.get("X-Medusa").map(|s| s.len()).unwrap_or(0));
 
-            // Test 1: book detail (simpler endpoint)
-            let url = format!("https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/detail/v1/?{}&book_id=7143038691944959011", qs);
+            // Test 1: search endpoint (no auth needed)
+            let url = format!("https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/search/page/v1/?{}&query=%E6%96%97%E7%BD%97&offset=0&count=10", qs);
             let mut req = client.get(&url)
                 .header("Accept", "application/json")
                 .header("sdk-version", "2");
@@ -2122,7 +2124,6 @@ mod tests {
                 Ok(resp) => {
                     let status = resp.status();
                     let hdrs: Vec<_> = resp.headers().iter()
-                        .filter(|(k,_)| k.as_str().starts_with("x-"))
                         .map(|(k,v)| format!("{}={}", k, v.to_str().unwrap_or("?")))
                         .collect();
                     let body = resp.text().await.unwrap_or_default();
@@ -2968,8 +2969,8 @@ mod tests {
         let callback = cb_stub; // callback_fn for SPLIT condition check
         dy.mem_write(ctx, &callback.to_le_bytes()).unwrap(); // ctx[0] = callback_fn
         dy.mem_write(ctx + 8, &vm_stk.to_le_bytes()).unwrap(); // ctx[1] = vm_stk
-        // ctx[2] = LR (return address). Real caller stores XPACLRI'd LR here.
-        // SPLIT checks: if reg[25]==ctx[2] → VM EXIT. Use halt as "LR".
+                                                               // ctx[2] = LR (return address). Real caller stores XPACLRI'd LR here.
+                                                               // SPLIT checks: if reg[25]==ctx[2] → VM EXIT. Use halt as "LR".
         dy.mem_write(ctx + 16, &halt.to_le_bytes()).unwrap(); // ctx[2] = flags = halt sentinel
 
         // Pre-initialize VM register file in workspace.
@@ -3240,5 +3241,1437 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Run Medusa VM with FULL process dump — real addresses, real data.
+    /// Loads all regions from full_dump/ directory.
+    /// Requires: full_dump/so_meta.txt, full_dump/manifest.txt, full_dump/regions/*.bin
+    #[test]
+    fn test_vm_medusa_full() {
+        use dynarmic_sys::Dynarmic;
+        use std::collections::BTreeMap;
+        use std::io::{Read as _, Seek, SeekFrom};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex,
+        };
+
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let dump_dir = format!("{}/full_dump", dir);
+
+        // ---- Parse so_meta.txt ----
+        let meta = std::fs::read_to_string(format!("{}/so_meta.txt", dump_dir))
+            .expect("full_dump/so_meta.txt");
+        let mut so_base: u64 = 0;
+        let mut tpidr_main: u64 = 0;
+        for line in meta.lines() {
+            if let Some(v) = line.strip_prefix("so_base=") {
+                so_base = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            }
+            if let Some(v) = line.strip_prefix("tpidr_main=") {
+                tpidr_main = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            }
+        }
+        assert!(so_base != 0, "so_base not found in so_meta.txt");
+        eprintln!(
+            "[full] so_base = 0x{:x}, tpidr = 0x{:x}",
+            so_base, tpidr_main
+        );
+
+        // ---- Parse manifest.txt into region index ----
+        // BTreeMap keyed by start address → (end, filename)
+        // Used for lazy page loading in unmapped callback.
+        struct RegionInfo {
+            end: u64,
+            filename: String,
+        }
+        let manifest =
+            std::fs::read_to_string(format!("{}/manifest.txt", dump_dir)).expect("manifest.txt");
+        let mut region_map: BTreeMap<u64, RegionInfo> = BTreeMap::new();
+        for line in manifest.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 5 {
+                continue;
+            }
+            let start = u64::from_str_radix(parts[0], 16).unwrap_or(0);
+            let end = u64::from_str_radix(parts[1], 16).unwrap_or(0);
+            let filename = parts[4].to_string();
+            if start > 0 && end > start {
+                region_map.insert(start, RegionInfo { end, filename });
+            }
+        }
+        eprintln!("[full] Parsed {} dump regions", region_map.len());
+
+        let dy = Arc::new(Dynarmic::<()>::new());
+
+        // ---- Pre-load SO regions (code + rodata + data + bss) ----
+        // These are accessed immediately and intensively — load upfront.
+        let so_end = so_base + 0x400000; // generous upper bound
+        let mut preloaded = 0usize;
+        let regions_dir = format!("{}/regions", dump_dir);
+        for (&start, info) in region_map.range(so_base..so_end) {
+            let size = (info.end - start) as usize;
+            let fpath = format!("{}/{}", regions_dir, info.filename);
+            match std::fs::read(&fpath) {
+                Ok(data) => {
+                    if dy.mem_map(start, size, 3).is_ok() {
+                        dy.mem_write(start, &data[..data.len().min(size)]).ok();
+                        preloaded += 1;
+                    }
+                }
+                Err(e) => eprintln!("[full] skip {}: {}", info.filename, e),
+            }
+        }
+        // Also load .bss (immediately after SO rw-p)
+        let bss_start = so_base + 0x3D2000; // approximate
+        let bss_end = so_base + 0x3E4000;
+        for (&start, info) in region_map.range(bss_start..bss_end) {
+            let size = (info.end - start) as usize;
+            let fpath = format!("{}/{}", regions_dir, info.filename);
+            if let Ok(data) = std::fs::read(&fpath) {
+                if dy.mem_map(start, size, 3).is_ok() {
+                    dy.mem_write(start, &data[..data.len().min(size)]).ok();
+                    preloaded += 1;
+                }
+            }
+        }
+        eprintln!("[full] Pre-loaded {} SO/BSS regions", preloaded);
+
+        // ---- Stack (our own, not from dump) ----
+        let stack_size: u64 = 0x10_0000; // 1MB
+        let stack_base: u64 = 0x3000_0000;
+        dy.mem_map(stack_base, stack_size as usize, 3).unwrap();
+        let sp = stack_base + stack_size - 0x1000;
+
+        // ---- Halt page (RET sled) ----
+        let halt: u64 = 0xDEAD_0000;
+        dy.mem_map(halt, 0x1000, 3).unwrap();
+        for off in (0..0x1000u64).step_by(4) {
+            dy.mem_write(halt + off, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+        }
+
+        // ---- TPIDR / TLS ----
+        // Use real TPIDR value from dump; load TLS pages if available.
+        let tpidr_page = tpidr_main & !0xFFF;
+        if let Some((&rstart, info)) = region_map
+            .range(..=tpidr_page)
+            .next_back()
+            .filter(|(_, info)| tpidr_page < info.end)
+        {
+            let size = (info.end - rstart) as usize;
+            let fpath = format!("{}/{}", regions_dir, info.filename);
+            if let Ok(data) = std::fs::read(&fpath) {
+                dy.mem_map(rstart, size, 3).ok();
+                dy.mem_write(rstart, &data[..data.len().min(size)]).ok();
+                eprintln!("[full] Loaded TPIDR region 0x{:x}-0x{:x}", rstart, info.end);
+            }
+        } else {
+            // Fallback: allocate synthetic TPIDR page
+            dy.mem_map(tpidr_page, 0x2000, 3).ok();
+            dy.mem_write(tpidr_main + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
+                .ok();
+        }
+        dy.reg_write_tpidr_el0(tpidr_main).unwrap();
+
+        // ---- Callback stub ----
+        let cb_stub: u64 = 0x9000_0000;
+        dy.mem_map(cb_stub, 0x1000, 3).unwrap();
+        dy.mem_write(cb_stub, &0xD2800000u32.to_le_bytes()).unwrap(); // MOV X0, #0
+        dy.mem_write(cb_stub + 4, &0xD65F03C0u32.to_le_bytes())
+            .unwrap(); // RET
+        for off in (8..0x100u64).step_by(4) {
+            dy.mem_write(cb_stub + off, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+        }
+
+        // ---- Packed args (output buffer) ----
+        let output_buf: u64 = stack_base + 0x400;
+        dy.mem_write(output_buf, &[0u8; 2048]).unwrap();
+        let pa = sp - 0x100;
+        dy.mem_write(pa, &output_buf.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 8, &output_buf.to_le_bytes()).unwrap();
+        dy.mem_write(pa + 16, &0u64.to_le_bytes()).unwrap();
+
+        // ---- VM context (matches real Medusa wrapper calling convention) ----
+        let ctx = sp - 0x200;
+        let vm_stk = sp - 0x400;
+        let callback = cb_stub;
+        dy.mem_write(ctx, &callback.to_le_bytes()).unwrap(); // ctx[0] = callback_fn
+        dy.mem_write(ctx + 8, &vm_stk.to_le_bytes()).unwrap(); // ctx[1] = vm_stk
+        dy.mem_write(ctx + 16, &halt.to_le_bytes()).unwrap(); // ctx[2] = LR sentinel
+
+        // Pre-init r22/r25 in register file (uninitialized stack residue in real code)
+        let rf_base = vm_stk - 0x118;
+        dy.mem_write(rf_base + 22 * 8, &callback.to_le_bytes()).ok();
+        dy.mem_write(rf_base + 25 * 8, &callback.to_le_bytes()).ok();
+
+        // ---- Lazy page loading via unmapped callback ----
+        let region_map_arc = Arc::new(region_map);
+        let regions_dir_arc = Arc::new(regions_dir);
+        let miss_flag = Arc::new(AtomicBool::new(false));
+        let miss_addr = Arc::new(AtomicU64::new(0));
+        let lazy_loads = Arc::new(AtomicU64::new(0));
+        {
+            let rm = region_map_arc.clone();
+            let rd = regions_dir_arc.clone();
+            let mf = miss_flag.clone();
+            let ma = miss_addr.clone();
+            let ll = lazy_loads.clone();
+            dy.set_unmapped_mem_callback(
+                move |d: &Dynarmic<()>, addr: u64, _sz: usize, _pc: u64| -> bool {
+                    let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
+                    let page = clean & !0xFFF;
+
+                    // Look up in dump regions (BTreeMap: find largest key <= page)
+                    if let Some((&rstart, info)) = rm.range(..=page).next_back() {
+                        if page < info.end {
+                            // This page is in a dump region — load the whole region
+                            let size = (info.end - rstart) as usize;
+                            let fpath = format!("{}/{}", rd, info.filename);
+                            if let Ok(data) = std::fs::read(&fpath) {
+                                if d.mem_map(rstart, size, 3).is_ok() {
+                                    d.mem_write(rstart, &data[..data.len().min(size)]).ok();
+                                    ll.fetch_add(1, Ordering::Relaxed);
+                                    return true; // retry the access
+                                }
+                            }
+                        }
+                    }
+
+                    // Not in dump — map a zero page so execution can continue
+                    if d.mem_map(page, 0x1000, 3).is_ok() {
+                        d.mem_write(page, &vec![0u8; 0x1000]).ok();
+                        return true;
+                    }
+
+                    // Can't map — fatal
+                    mf.store(true, Ordering::SeqCst);
+                    ma.store(clean, Ordering::SeqCst);
+                    d.emu_stop().ok();
+                    false
+                },
+            );
+        }
+        dy.set_svc_callback(|_: &Dynarmic<()>, _: u32, _: u64, _: u64| {});
+
+        // ---- Set initial registers (Medusa VM entry) ----
+        let bytecode_base = so_base + 0x119050;
+        dy.reg_write_raw(0, bytecode_base).unwrap();
+        dy.reg_write_raw(1, pa).unwrap();
+        dy.reg_write_raw(2, so_base + 0x37A6D0).unwrap(); // TABLE_A
+        dy.reg_write_raw(3, so_base + 0x37A730).unwrap(); // TABLE_B
+        dy.reg_write_raw(4, ctx).unwrap();
+        dy.reg_write_sp(sp).unwrap();
+        dy.reg_write_lr(halt).unwrap();
+        dy.reg_write_pc(so_base + 0x168324).unwrap(); // VM dispatcher
+
+        eprintln!("[full] Starting Medusa VM trace...");
+        eprintln!("[full] bytecode_base = 0x{:x}", bytecode_base);
+
+        // Read bytecodes for opcode display
+        let mut bytecodes = [0u32; 256];
+        let bc_offset = 0x119050usize;
+        for i in 0..256 {
+            let addr = so_base + (bc_offset + i * 4) as u64;
+            let mut buf = [0u8; 4];
+            if dy.mem_read(addr, &mut buf).is_ok() {
+                bytecodes[i] = u32::from_le_bytes(buf);
+            }
+        }
+
+        // ---- Main trace loop ----
+        let mut prev_regs = [0u64; 32];
+        let mut prev_bc_ptr: u64 = 0;
+        let mut vm_insn_count = 0u32;
+        let mut arm_steps = 0u64;
+        let mut steps_since_advance = 0u64;
+        let max_vm_insns = 260u32;
+        let max_arm_steps = 10_000_000u64;
+        let stuck_threshold = 200_000u64;
+
+        let so_code_start = so_base;
+        let so_code_end = so_base + 0x349000; // r-xp end
+
+        loop {
+            let pc = dy.reg_read_pc().unwrap_or(0);
+            if pc == halt || pc == halt + 4 {
+                eprintln!("[full] VM halted at arm_step={}", arm_steps);
+                break;
+            }
+            // Detect BLR to non-SO code: force return X0=0.
+            if pc != 0 && (pc < so_code_start || pc >= so_code_end) && pc != halt && pc != cb_stub {
+                let lr = dy.reg_read(30).unwrap_or(0);
+                if lr >= so_code_start && lr < so_code_end {
+                    dy.reg_write_raw(0, 0).unwrap();
+                    dy.reg_write_pc(lr).unwrap();
+                    arm_steps += 1;
+                    continue;
+                }
+            }
+            if miss_flag.load(Ordering::SeqCst) {
+                eprintln!(
+                    "[full] Fatal unmapped at 0x{:x}",
+                    miss_addr.load(Ordering::SeqCst)
+                );
+                break;
+            }
+            if arm_steps >= max_arm_steps || vm_insn_count >= max_vm_insns {
+                eprintln!(
+                    "[full] Limit: {} arm steps, {} vm insns",
+                    arm_steps, vm_insn_count
+                );
+                break;
+            }
+
+            dy.emu_step(pc).ok();
+            arm_steps += 1;
+
+            // Track bytecode pointer via X19 → [X19]
+            let x19 = dy.reg_read(19).unwrap_or(0);
+            if x19 == 0 {
+                continue;
+            }
+            let mut bc_buf = [0u8; 8];
+            if dy.mem_read(x19, &mut bc_buf).is_err() {
+                continue;
+            }
+            let bc_ptr = u64::from_le_bytes(bc_buf);
+
+            steps_since_advance += 1;
+            if steps_since_advance > stuck_threshold {
+                let insn_idx = if prev_bc_ptr >= bytecode_base {
+                    ((prev_bc_ptr - bytecode_base) / 4) as usize
+                } else {
+                    999
+                };
+                let stuck_pc = dy.reg_read_pc().unwrap_or(0);
+                eprintln!(
+                    "[full] STUCK at vm_insn {} after {}K arm steps, PC=0x{:x} (SO+0x{:x})",
+                    insn_idx,
+                    stuck_threshold / 1000,
+                    stuck_pc,
+                    stuck_pc.wrapping_sub(so_base)
+                );
+                for i in 0..8usize {
+                    let v = dy.reg_read(i).unwrap_or(0);
+                    eprint!(" X{}=0x{:x}", i, v);
+                }
+                eprintln!();
+                break;
+            }
+
+            if bc_ptr != prev_bc_ptr && bc_ptr >= bytecode_base && bc_ptr < bytecode_base + 1024 {
+                steps_since_advance = 0;
+                let insn_idx = ((bc_ptr - bytecode_base) / 4) as usize;
+
+                // Read current register file
+                let x28 = dy.reg_read(28).unwrap_or(0);
+                let mut cur_regs = [0u64; 32];
+                if x28 > 0 {
+                    for i in 0..32 {
+                        let mut buf = [0u8; 8];
+                        if dy.mem_read(x28 + (i as u64) * 8, &mut buf).is_ok() {
+                            cur_regs[i] = u64::from_le_bytes(buf);
+                        }
+                    }
+                }
+
+                if vm_insn_count > 0 {
+                    let prev_idx = if insn_idx > 0 { insn_idx - 1 } else { 0 };
+                    let prev_raw = if prev_idx < 256 {
+                        bytecodes[prev_idx]
+                    } else {
+                        0
+                    };
+                    let opc = prev_raw & 0x3F;
+                    let opc_name = match opc {
+                        24 => "LOAD64",
+                        26 => "STORE64",
+                        22 => "STORE32",
+                        59 => "LOAD32S",
+                        15 => "ADDPTR",
+                        52 => "MOVI_HI",
+                        48 => "ORI_LO",
+                        1 => "SEXT",
+                        45 => "BEQ",
+                        17 => {
+                            let sub = (prev_raw >> 6) & 0x3F;
+                            match sub {
+                                14 => "ADD",
+                                16 => "SUB",
+                                44 => "OR",
+                                54 => "AND",
+                                29 => "XOR_M",
+                                10 => "AND2",
+                                51 => "ADDW",
+                                46 => "SUBW",
+                                23 => "SHL",
+                                3 => "SHLW",
+                                7 => "SHRW",
+                                50 => "SPLIT",
+                                13 => "NOP",
+                                _ => "ALU?",
+                            }
+                        }
+                        4 => "OP4",
+                        20 => "OP20",
+                        40 => "OP40",
+                        16 => "OP16",
+                        53 => "OP53",
+                        _ => "???",
+                    };
+
+                    let mut changes = Vec::new();
+                    for i in 0..32 {
+                        if cur_regs[i] != prev_regs[i] {
+                            changes
+                                .push(format!("r{}:0x{:x}→0x{:x}", i, prev_regs[i], cur_regs[i]));
+                        }
+                    }
+
+                    if !changes.is_empty() || opc == 26 || opc == 22 || opc == 17 {
+                        eprintln!(
+                            "[{:3}] {:7} 0x{:08x} | {}",
+                            prev_idx,
+                            opc_name,
+                            prev_raw,
+                            if changes.is_empty() {
+                                "(no reg change)".to_string()
+                            } else {
+                                changes.join(", ")
+                            }
+                        );
+                    }
+                }
+
+                prev_regs = cur_regs;
+                prev_bc_ptr = bc_ptr;
+                vm_insn_count += 1;
+            }
+        }
+
+        eprintln!(
+            "\n[full] Total: {} VM instructions, {} ARM64 steps, {} lazy-loaded regions",
+            vm_insn_count,
+            arm_steps,
+            lazy_loads.load(Ordering::Relaxed)
+        );
+
+        // Final register dump
+        let x28 = dy.reg_read(28).unwrap_or(0);
+        eprintln!("\n[full] Final VM register file (X28=0x{:x}):", x28);
+        if x28 > 0 {
+            for i in 0..32 {
+                let mut buf = [0u8; 8];
+                if dy.mem_read(x28 + (i as u64) * 8, &mut buf).is_ok() {
+                    let val = u64::from_le_bytes(buf);
+                    if val != 0 {
+                        eprintln!("  r{:2} = 0x{:016x}", i, val);
+                    }
+                }
+            }
+        }
+
+        // Dump output buffer
+        let mut out = [0u8; 64];
+        dy.mem_read(output_buf, &mut out).ok();
+        eprintln!("\n[full] Output buffer:");
+        for chunk in out.chunks(16) {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+            eprintln!("  {}", hex.join(" "));
+        }
+    }
+
+    /// Run the FULL signing function (SO+0x26e684) with real handle data.
+    /// Loads handle_regions.bin (from parse_handle_dump.py) + SO code from full_dump.
+    /// This executes the complete 10-VM nested call chain.
+    #[test]
+    fn test_full_sign() {
+        use dynarmic_sys::Dynarmic;
+        use std::collections::BTreeMap;
+        use std::io::{Read as _, Seek, SeekFrom};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+
+        let dir = env!("CARGO_MANIFEST_DIR");
+
+        // ---- Addresses from so_meta (will be overridden below) ----
+        let mut handle_addr = 0u64;
+        let mut so_base = 0u64;
+        let mut tpidr = 0u64;
+
+        // ---- Load ALL regions from full_dump manifest ----
+        let dump_dir = format!("{}/full_dump", dir);
+        let regions_dir = format!("{}/regions", dump_dir);
+
+        // Also read so_meta for the authoritative so_base (override handle's)
+        let meta = std::fs::read_to_string(format!("{}/so_meta.txt", dump_dir)).expect("so_meta");
+        for line in meta.lines() {
+            if let Some(v) = line.strip_prefix("so_base=") {
+                so_base = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            }
+            if let Some(v) = line.strip_prefix("handle_addr=") {
+                handle_addr = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            }
+            if let Some(v) = line.strip_prefix("tpidr_sign=") {
+                tpidr = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            }
+        }
+        eprintln!(
+            "[sign] so_meta: so_base=0x{:x}, handle=0x{:x}, tpidr=0x{:x}",
+            so_base, handle_addr, tpidr
+        );
+
+        let dy = Arc::new(Dynarmic::<()>::new());
+
+        // Parse manifest and pre-load SO regions + small regions
+        let manifest =
+            std::fs::read_to_string(format!("{}/manifest.txt", dump_dir)).expect("manifest");
+        let mut loaded_regions = 0usize;
+        let mut loaded_bytes = 0usize;
+        for line in manifest.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 5 {
+                continue;
+            }
+            let start = u64::from_str_radix(parts[0], 16).unwrap_or(0);
+            let end = u64::from_str_radix(parts[1], 16).unwrap_or(0);
+            let perms = parts[2];
+            let filename = parts[4];
+            let size = (end - start) as usize;
+
+            // Skip huge regions (> 16MB) and unreadable
+            if size > 16 * 1024 * 1024 || perms == "---p" || size == 0 {
+                continue;
+            }
+
+            let fpath = format!("{}/{}", regions_dir, filename);
+            if let Ok(data) = std::fs::read(&fpath) {
+                if dy.mem_map(start, size, 3).is_ok() {
+                    let wlen = data.len().min(size);
+                    dy.mem_write(start, &data[..wlen]).ok();
+                    loaded_regions += 1;
+                    loaded_bytes += wlen;
+                }
+            }
+        }
+        eprintln!(
+            "[sign] Loaded {} regions ({} MB) from full_dump",
+            loaded_regions,
+            loaded_bytes / 1024 / 1024
+        );
+
+        // Handle data is already loaded from full_dump manifest regions.
+
+        // ---- Patch LSE atomics in non-SO code (libc etc.) ----
+        // dynarmic doesn't support ARMv8.1 LSE: CAS, LDADD, LDSET, SWP, etc.
+        // Scan all loaded r-xp regions OUTSIDE SO and replace LSE with SVC #0x500.
+        // The SVC callback will emulate them.
+        {
+            let so_end = so_base + 0x400000;
+            let mut lse_patched = 0usize;
+            let manifest2 = std::fs::read_to_string(format!("{}/manifest.txt", dump_dir)).unwrap();
+            for line in manifest2.lines() {
+                if line.starts_with('#') || line.trim().is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 5 {
+                    continue;
+                }
+                let start = u64::from_str_radix(parts[0], 16).unwrap_or(0);
+                let end = u64::from_str_radix(parts[1], 16).unwrap_or(0);
+                let perms = parts[2];
+                let size = (end - start) as usize;
+
+                // Only patch executable, non-SO, reasonably sized regions
+                if !perms.contains('x') || size == 0 || size > 4 * 1024 * 1024 {
+                    continue;
+                }
+                let fpath2 = format!("{}/{}", regions_dir, parts[4]);
+                let buf = match std::fs::read(&fpath2) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let svc_500 = 0xD4000001u32 | ((0x500u32 & 0xFFFF) << 5);
+                for off in (0..buf.len()).step_by(4) {
+                    if off + 4 > buf.len() {
+                        break;
+                    }
+                    let insn = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                    if (insn & 0x3F207C00) == 0x08207C00 || (insn & 0x3F200C00) == 0x38200000 {
+                        dy.mem_write(start + off as u64, &svc_500.to_le_bytes())
+                            .ok();
+                        lse_patched += 1;
+                    }
+                }
+            }
+            eprintln!("[sign] Patched {} LSE atomic instructions", lse_patched);
+        }
+
+        // ---- Stack ----
+        let stack_base: u64 = 0x3000_0000;
+        let stack_size = 0x80_0000usize; // 8MB
+        dy.mem_map(stack_base, stack_size, 3).unwrap();
+        let sp = stack_base + stack_size as u64 - 0x1000;
+
+        // ---- Halt page ----
+        let halt: u64 = 0xDEAD_0000;
+        dy.mem_map(halt, 0x1000, 3).unwrap();
+        for o in (0..0x1000u64).step_by(4) {
+            dy.mem_write(halt + o, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+        }
+
+        // ---- TPIDR ----
+        let tpidr_page = tpidr & !0xFFF;
+        dy.mem_map(tpidr_page, 0x2000, 3).ok();
+        // Write stack canary at tpidr+0x28
+        dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
+            .ok();
+        dy.reg_write_tpidr_el0(tpidr).unwrap();
+
+        // ---- JNI object region ----
+        dy.mem_map(0x2000_0000, 0x10000, 3).unwrap();
+
+        // ---- Fake JNIEnv (minimal) ----
+        let jni_base: u64 = 0x4000_0000;
+        dy.mem_map(jni_base, 0x10000, 3).unwrap();
+        // JNIEnv* -> function table pointer
+        let func_table = jni_base + 0x100;
+        dy.mem_write(jni_base, &func_table.to_le_bytes()).unwrap();
+        // Each JNI function: SVC #(0x600+i); RET
+        let stub_base = jni_base + 0x1000;
+        for i in 0..232u32 {
+            let svc_insn = 0xD4000001u32 | (((0x600 + i) & 0xFFFF) << 5);
+            let off = (i as u64) * 8;
+            dy.mem_write(stub_base + off, &svc_insn.to_le_bytes())
+                .unwrap();
+            dy.mem_write(stub_base + off + 4, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+            // Write pointer in function table
+            dy.mem_write(
+                func_table + (i as u64) * 8,
+                &(stub_base + off).to_le_bytes(),
+            )
+            .unwrap();
+        }
+
+        // ---- URL string (JNI string object) ----
+        let url = b"https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/detail/v1/?aid=1967&book_id=7373660003258862617\0";
+        let url_buf: u64 = stack_base + 0x200;
+        dy.mem_write(url_buf, url).unwrap();
+        // For simplicity, use the URL buffer address as the jstring handle
+        // The signing function will call GetStringUTFChars on it
+
+        // ---- Unmapped callback: map zero pages on demand ----
+        let miss_flag = Arc::new(AtomicBool::new(false));
+        let miss_addr = Arc::new(AtomicU64::new(0));
+        let miss_pc = Arc::new(AtomicU64::new(0));
+        {
+            let mf = miss_flag.clone();
+            let ma = miss_addr.clone();
+            let mp = miss_pc.clone();
+            let unmapped_count = Arc::new(AtomicU64::new(0));
+            let uc = unmapped_count.clone();
+            let sb = so_base;
+            dy.set_unmapped_mem_callback(
+                move |d: &Dynarmic<()>, addr: u64, _sz: usize, pc: u64| -> bool {
+                    let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
+                    let page = clean & !0xFFF;
+                    let cnt = uc.fetch_add(1, Ordering::Relaxed);
+                    if cnt < 20 || cnt % 100 == 0 {
+                        eprintln!(
+                            "[mem] unmapped #{} addr=0x{:x} PC=SO+0x{:x}",
+                            cnt,
+                            clean,
+                            pc.wrapping_sub(sb)
+                        );
+                    }
+                    if d.mem_map(page, 0x1000, 3).is_ok() {
+                        return true;
+                    }
+                    mf.store(true, Ordering::SeqCst);
+                    ma.store(clean, Ordering::SeqCst);
+                    mp.store(pc, Ordering::SeqCst);
+                    d.emu_stop().ok();
+                    false
+                },
+            );
+        }
+
+        // ---- SVC callback (JNI + syscalls + logging) ----
+        let so_base_copy = so_base;
+        let mmap_next = Arc::new(AtomicU64::new(0x5000_0000));
+        let mmap_next_c = mmap_next.clone();
+        dy.set_svc_callback(move |d: &Dynarmic<()>, svc_num: u32, pc: u64, _sp: u64| {
+            let so_off = pc.wrapping_sub(so_base_copy);
+            if svc_num == 0 {
+                // Linux syscall
+                let nr = d.reg_read(8).unwrap_or(0);
+                match nr {
+                    98 => {
+                        // futex
+                        d.reg_write_raw(0, -110i64 as u64).ok();
+                    }
+                    113 | 114 => {
+                        // clock_gettime
+                        let buf = d.reg_read(1).unwrap_or(0);
+                        d.mem_write(buf, &1775180171u64.to_le_bytes()).ok();
+                        d.mem_write(buf + 8, &0u64.to_le_bytes()).ok();
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    222 => {
+                        // mmap
+                        let size = d.reg_read(1).unwrap_or(0x1000) as usize;
+                        let aligned = (size + 0xFFF) & !0xFFF;
+                        let addr = mmap_next_c.fetch_add(aligned as u64, Ordering::SeqCst);
+                        d.mem_map(addr, aligned, 3).ok();
+                        d.reg_write_raw(0, addr).ok();
+                        eprintln!(
+                            "[svc] mmap size=0x{:x} → 0x{:x} (SO+0x{:x})",
+                            size, addr, so_off
+                        );
+                    }
+                    226 => {
+                        d.reg_write_raw(0, 0).ok(); // mprotect
+                    }
+                    56 => {
+                        // openat → -1
+                        d.reg_write_raw(0, -1i64 as u64).ok();
+                    }
+                    63 => {
+                        // read → 0
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    64 => {
+                        // write → count
+                        let count = d.reg_read(2).unwrap_or(0);
+                        d.reg_write_raw(0, count).ok();
+                    }
+                    _ => {
+                        eprintln!("[svc] syscall nr={} at SO+0x{:x}", nr, so_off);
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                }
+            } else if svc_num >= 0x600 {
+                let jni_idx = svc_num - 0x600;
+                let a0 = d.reg_read(0).unwrap_or(0); // env
+                let a1 = d.reg_read(1).unwrap_or(0);
+                let a2 = d.reg_read(2).unwrap_or(0);
+                let a3 = d.reg_read(3).unwrap_or(0);
+                let a4 = d.reg_read(4).unwrap_or(0);
+
+                // JNI function indices (from JNI spec):
+                // 6=FindClass, 31=GetMethodID, 33=GetStaticMethodID
+                // 34=CallObjectMethod, 35=CallObjectMethodV, 36=CallObjectMethodA
+                // 167=NewStringUTF, 169=GetStringUTFChars, 170=ReleaseStringUTFChars
+                // 168=GetStringUTFLength, 171=GetArrayLength
+                // 172=NewObjectArray, 173=GetObjectArrayElement
+                // 174=DeleteLocalRef, 176=NewByteArray
+                // 200=GetByteArrayRegion, 201=SetByteArrayRegion
+                // 228=GetObjectClass, 154=ExceptionCheck, 175=EnsureLocalCapacity
+
+                // JNI handles: use addresses in a reserved region so SO code
+                // can dereference them without crashing.
+                // Reserve 0x2000_0000 region for JNI object stubs.
+                const JNI_OBJ_BASE: u64 = 0x2000_0000;
+                const URL_STR_HANDLE: u64 = JNI_OBJ_BASE + 0x100;
+                const UTF8_STR_HANDLE: u64 = JNI_OBJ_BASE + 0x200;
+                const CLASS_HANDLE: u64 = JNI_OBJ_BASE + 0x300;
+                const METHOD_HANDLE: u64 = JNI_OBJ_BASE + 0x400;
+                const BYTE_ARRAY_HANDLE: u64 = JNI_OBJ_BASE + 0x500;
+                let url_buf_addr: u64 = 0x30000200;
+
+                match jni_idx {
+                    167 => {
+                        // NewStringUTF(env, char*) → jstring
+                        let mut buf = [0u8; 128];
+                        d.mem_read(a1 & 0x00FFFFFFFFFFFFFF, &mut buf).ok();
+                        let s = std::str::from_utf8(&buf)
+                            .unwrap_or("")
+                            .trim_end_matches('\0');
+                        eprintln!(
+                            "[jni] NewStringUTF({:?}) → 0x{:x}",
+                            &s[..s.len().min(40)],
+                            UTF8_STR_HANDLE
+                        );
+                        d.reg_write_raw(0, UTF8_STR_HANDLE).ok();
+                    }
+                    169 => {
+                        // GetStringUTFChars(env, jstring, isCopy*) → char*
+                        // If the jstring is our URL handle, return URL buffer
+                        if a1 == url_buf_addr || a1 == URL_STR_HANDLE {
+                            eprintln!("[jni] GetStringUTFChars(URL) → 0x{:x}", url_buf_addr);
+                            d.reg_write_raw(0, url_buf_addr).ok();
+                        } else if a1 == UTF8_STR_HANDLE {
+                            // "utf-8" string — allocate and return
+                            let utf8_buf: u64 = 0x30001000;
+                            d.mem_write(utf8_buf, b"utf-8\0").ok();
+                            d.reg_write_raw(0, utf8_buf).ok();
+                        } else {
+                            d.reg_write_raw(0, url_buf_addr).ok();
+                        }
+                    }
+                    168 => {
+                        // GetStringUTFLength
+                        d.reg_write_raw(0, 120).ok(); // approximate URL length
+                    }
+                    170 => {
+                        // ReleaseStringUTFChars — no-op
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    6 => {
+                        // FindClass
+                        eprintln!("[jni] FindClass → 0x{:x}", CLASS_HANDLE);
+                        d.reg_write_raw(0, CLASS_HANDLE).ok();
+                    }
+                    31 | 33 => {
+                        // GetMethodID / GetStaticMethodID
+                        let mut nbuf = [0u8; 64];
+                        d.mem_read(a2 & 0x00FFFFFFFFFFFFFF, &mut nbuf).ok();
+                        let name = std::str::from_utf8(&nbuf)
+                            .unwrap_or("")
+                            .split('\0')
+                            .next()
+                            .unwrap_or("");
+                        eprintln!("[jni] GetMethodID({:?}) → 0x{:x}", name, METHOD_HANDLE);
+                        d.reg_write_raw(0, METHOD_HANDLE).ok();
+                    }
+                    228 => {
+                        // GetObjectClass
+                        d.reg_write_raw(0, CLASS_HANDLE).ok();
+                    }
+                    34 | 35 | 36 | 49 | 50 | 51 | 67 | 68 | 69 => {
+                        // CallObjectMethod/V/A, CallStaticObjectMethod/V/A
+                        // If called on a String with getBytes → return byte array
+                        // The URL bytes need to be accessible
+                        let url_bytes_addr: u64 = 0x30002000;
+                        // Read URL from url_buf_addr
+                        let mut url_data = [0u8; 256];
+                        d.mem_read(url_buf_addr, &mut url_data).ok();
+                        let url_len = url_data.iter().position(|&b| b == 0).unwrap_or(256);
+                        // Write URL bytes at url_bytes_addr (byte array content)
+                        d.mem_write(url_bytes_addr, &url_data[..url_len]).ok();
+                        // Store length at a known location
+                        d.mem_write(url_bytes_addr - 8, &(url_len as u64).to_le_bytes())
+                            .ok();
+                        eprintln!(
+                            "[jni] CallObjectMethod → ByteArray(len={}) at 0x{:x}",
+                            url_len, BYTE_ARRAY_HANDLE
+                        );
+                        d.reg_write_raw(0, BYTE_ARRAY_HANDLE).ok();
+                    }
+                    171 => {
+                        // GetArrayLength
+                        if a1 == BYTE_ARRAY_HANDLE {
+                            let url_bytes_addr: u64 = 0x30002000;
+                            let mut lbuf = [0u8; 8];
+                            d.mem_read(url_bytes_addr - 8, &mut lbuf).ok();
+                            let len = u64::from_le_bytes(lbuf);
+                            d.reg_write_raw(0, len).ok();
+                        } else {
+                            d.reg_write_raw(0, 0).ok();
+                        }
+                    }
+                    200 => {
+                        // GetByteArrayRegion(env, array, start, len, buf)
+                        if a1 == BYTE_ARRAY_HANDLE {
+                            let start = a2 as usize;
+                            let len = a3 as usize;
+                            let dst = a4;
+                            let url_bytes_addr: u64 = 0x30002000;
+                            let mut src_buf = vec![0u8; len];
+                            d.mem_read(url_bytes_addr + start as u64, &mut src_buf).ok();
+                            d.mem_write(dst & 0x00FFFFFFFFFFFFFF, &src_buf).ok();
+                            eprintln!(
+                                "[jni] GetByteArrayRegion({}, {}) → wrote to 0x{:x}",
+                                start, len, dst
+                            );
+                        }
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    154 => {
+                        // ExceptionCheck → false
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    172 | 175 | 176 | 174 => {
+                        // EnsureLocalCapacity, DeleteLocalRef, NewByteArray, NewObjectArray
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    _ => {
+                        eprintln!(
+                            "[jni] #{} a1=0x{:x} a2=0x{:x} (SO+0x{:x})",
+                            jni_idx, a1, a2, so_off
+                        );
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                }
+            } else if svc_num == 0x500 {
+                // LSE atomic emulation (LDADD/LDSET/LDCLR/SWP/CAS)
+                // Simplification: these are mostly refcount ops.
+                // LDADDH W0, W0, [X1]: atomically add W0 to [X1], return old value in W0.
+                // For signing purposes, just do a non-atomic version:
+                let x0 = d.reg_read(0).unwrap_or(0) as u32;
+                let x1 = d.reg_read(1).unwrap_or(0);
+                if x1 > 0x1000 {
+                    let mut buf = [0u8; 4];
+                    d.mem_read(x1 & 0x00FFFFFFFFFFFFFF, &mut buf).ok();
+                    let old = u32::from_le_bytes(buf);
+                    let new_val = old.wrapping_add(x0);
+                    d.mem_write(x1 & 0x00FFFFFFFFFFFFFF, &new_val.to_le_bytes())
+                        .ok();
+                    d.reg_write_raw(0, old as u64).ok();
+                } else {
+                    d.reg_write_raw(0, 0).ok();
+                }
+            } else {
+                eprintln!("[svc] SVC #{:#x} at SO+0x{:x}", svc_num, so_off);
+            }
+        });
+
+        // No VM dispatcher patching — rely on SVC/JNI logging for progress.
+
+        // ---- Set up registers for JNI call ----
+        // SO+0x26e684: y2.a(JNIEnv* env, jobject thiz, int tag, int type, long handle, jstring url, jobject extra)
+        // ARM64 JNI calling convention:
+        // X0 = JNIEnv*, X1 = thiz (jobject), X2 = tag, X3 = type,
+        // X4 = handle, X5 = url (jstring), X6 = extra (jobject)
+        dy.reg_write_raw(0, jni_base).unwrap(); // JNIEnv*
+        dy.reg_write_raw(1, 0).unwrap(); // thiz (not used)
+        dy.reg_write_raw(2, 0x3000001).unwrap(); // tag = signing
+        dy.reg_write_raw(3, 0).unwrap(); // type = 0
+        dy.reg_write_raw(4, handle_addr).unwrap(); // handle
+        dy.reg_write_raw(5, url_buf).unwrap(); // url string
+        dy.reg_write_raw(6, 0).unwrap(); // extra = null
+        dy.reg_write_sp(sp).unwrap();
+        dy.reg_write_lr(halt).unwrap();
+        dy.reg_write_pc(so_base + 0x26e684).unwrap();
+
+        eprintln!("[sign] Starting full signing at SO+0x26e684...");
+        eprintln!("[sign] handle=0x{:x}, url_buf=0x{:x}", handle_addr, url_buf);
+
+        // ---- Run with step loop (see progress) ----
+        eprintln!("[sign] Running step loop (max 20M steps)...");
+        let t0 = std::time::Instant::now();
+        let max_steps = 20_000_000u64;
+        let mut steps = 0u64;
+
+        loop {
+            let pc = dy.reg_read_pc().unwrap_or(0);
+            if pc == halt || pc == halt + 4 {
+                eprintln!("[sign] HALT reached at step {}", steps);
+                break;
+            }
+            if miss_flag.load(Ordering::SeqCst) {
+                let ma = miss_addr.load(Ordering::SeqCst);
+                let mp = miss_pc.load(Ordering::SeqCst);
+                eprintln!(
+                    "[sign] STOP unmapped addr=0x{:x} PC=SO+0x{:x} step={}",
+                    ma,
+                    mp.wrapping_sub(so_base),
+                    steps
+                );
+                break;
+            }
+            if steps >= max_steps {
+                eprintln!("[sign] LIMIT {}M steps", steps / 1_000_000);
+                eprintln!(
+                    "  PC=SO+0x{:x} LR=0x{:x}",
+                    pc.wrapping_sub(so_base),
+                    dy.reg_read(30).unwrap_or(0)
+                );
+                break;
+            }
+            dy.emu_step(pc).ok();
+            steps += 1;
+            // Progress every 2M steps
+            if steps % 2_000_000 == 0 {
+                let cur = dy.reg_read_pc().unwrap_or(0);
+                eprintln!(
+                    "[sign] {}M steps, PC=SO+0x{:x}, elapsed={:?}",
+                    steps / 1_000_000,
+                    cur.wrapping_sub(so_base),
+                    t0.elapsed()
+                );
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        let final_pc = dy.reg_read_pc().unwrap_or(0);
+        eprintln!(
+            "[sign] Done: {} steps in {:?}, final PC=SO+0x{:x}",
+            steps,
+            elapsed,
+            final_pc.wrapping_sub(so_base),
+        );
+
+        // ---- Read return value ----
+        let ret = dy.reg_read(0).unwrap_or(0);
+        eprintln!("[sign] Return X0 = 0x{:x}", ret);
+
+        // Try to read result string if it's a pointer
+        if ret > 0x1000 && ret < 0x800000000000 {
+            let mut buf = [0u8; 256];
+            if dy.mem_read(ret, &mut buf).is_ok() {
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(256);
+                if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+                    eprintln!("[sign] Result string: {}", s);
+                }
+            }
+        }
+
+        eprintln!("[sign] Done.");
+    }
+
+    /// Replay individual VM calls using parameters captured by Frida.
+    /// Calls VM dispatcher SO+0x168324 directly, bypassing JNI/CFF/threads.
+    #[test]
+    fn test_vm_replay() {
+        use dynarmic_sys::Dynarmic;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let dump_dir = format!("{}/full_dump", dir);
+        let regions_dir = format!("{}/regions", dump_dir);
+
+        // Read so_meta
+        let meta = std::fs::read_to_string(format!("{}/so_meta.txt", dump_dir)).unwrap();
+        let mut so_base = 0u64;
+        let mut tpidr = 0u64;
+        for line in meta.lines() {
+            if let Some(v) = line.strip_prefix("so_base=") {
+                so_base = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            }
+            if let Some(v) = line.strip_prefix("tpidr_sign=") {
+                tpidr = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            }
+        }
+        eprintln!("[replay] so_base=0x{:x}, tpidr=0x{:x}", so_base, tpidr);
+
+        let dy = Arc::new(Dynarmic::<()>::new());
+
+        // Build region index for lazy loading
+        use std::collections::BTreeMap;
+        struct RegInfo {
+            end: u64,
+            file: String,
+        }
+        let manifest = std::fs::read_to_string(format!("{}/manifest.txt", dump_dir)).unwrap();
+        let mut region_idx: BTreeMap<u64, RegInfo> = BTreeMap::new();
+        let mut preloaded = 0usize;
+        let mut lse_patched = 0usize;
+        let svc_500 = 0xD4000001u32 | ((0x500u32 & 0xFFFF) << 5);
+
+        for line in manifest.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 5 {
+                continue;
+            }
+            let start = u64::from_str_radix(parts[0], 16).unwrap_or(0);
+            let end = u64::from_str_radix(parts[1], 16).unwrap_or(0);
+            let perms = parts[2];
+            let size = (end - start) as usize;
+            if perms == "---p" || size == 0 || size > 64 * 1024 * 1024 {
+                continue;
+            }
+            region_idx.insert(
+                start,
+                RegInfo {
+                    end,
+                    file: parts[4].to_string(),
+                },
+            );
+
+            // Pre-load SO regions + small regions (< 512KB)
+            let is_so = start >= so_base && start < so_base + 0x400000;
+            if is_so || size <= 512 * 1024 {
+                let fpath = format!("{}/{}", regions_dir, parts[4]);
+                if let Ok(data) = std::fs::read(&fpath) {
+                    if dy.mem_map(start, size, 3).is_ok() {
+                        dy.mem_write(start, &data[..data.len().min(size)]).ok();
+                        preloaded += 1;
+                        // LSE patch for executable regions
+                        if perms.contains('x') {
+                            for off in (0..data.len()).step_by(4) {
+                                if off + 4 > data.len() {
+                                    break;
+                                }
+                                let insn =
+                                    u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                                if (insn & 0x3F207C00) == 0x08207C00
+                                    || (insn & 0x3F200C00) == 0x38200000
+                                {
+                                    dy.mem_write(start + off as u64, &svc_500.to_le_bytes())
+                                        .ok();
+                                    lse_patched += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let region_idx = Arc::new(region_idx);
+        let rd = Arc::new(regions_dir.clone());
+        eprintln!(
+            "[replay] {} regions indexed, {} pre-loaded, {} LSE patched",
+            region_idx.len(),
+            preloaded,
+            lse_patched
+        );
+
+        // Stack + halt + TPIDR
+        let stack_base: u64 = 0x3000_0000;
+        dy.mem_map(stack_base, 0x80_0000, 3).unwrap();
+        let sp = stack_base + 0x80_0000 - 0x1000;
+
+        let halt: u64 = 0xDEAD_0000;
+        dy.mem_map(halt, 0x1000, 3).unwrap();
+        for o in (0..0x1000u64).step_by(4) {
+            dy.mem_write(halt + o, &0xD65F03C0u32.to_le_bytes())
+                .unwrap();
+        }
+
+        let tpidr_page = tpidr & !0xFFF;
+        dy.mem_map(tpidr_page, 0x2000, 3).ok();
+        dy.mem_write(tpidr + 0x28, &0xCAFEBABEDEADBEEFu64.to_le_bytes())
+            .ok();
+        dy.reg_write_tpidr_el0(tpidr).unwrap();
+
+        // SVC callback: LSE emulation + syscalls
+        let sb = so_base;
+        dy.set_svc_callback(move |d: &Dynarmic<()>, svc_num: u32, pc: u64, _sp: u64| {
+            if svc_num == 0 {
+                let nr = d.reg_read(8).unwrap_or(0);
+                match nr {
+                    98 => {
+                        d.reg_write_raw(0, -110i64 as u64).ok();
+                    } // futex
+                    113 | 114 => {
+                        let buf = d.reg_read(1).unwrap_or(0);
+                        d.mem_write(buf, &1775185398u64.to_le_bytes()).ok();
+                        d.mem_write(buf + 8, &0u64.to_le_bytes()).ok();
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    222 => {
+                        d.reg_write_raw(0, 0x5000_0000u64).ok(); // mmap stub
+                    }
+                    226 | 56 | 167 | 198 => {
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                    _ => {
+                        d.reg_write_raw(0, 0).ok();
+                    }
+                }
+            } else if svc_num == 0x500 {
+                // LSE atomic emulation (simplified: LDADD as add-to-memory)
+                let x0 = d.reg_read(0).unwrap_or(0) as u32;
+                let x1 = d.reg_read(1).unwrap_or(0);
+                if x1 > 0x1000 {
+                    let addr = x1 & 0x00FFFFFFFFFFFFFF;
+                    let mut buf = [0u8; 8];
+                    d.mem_read(addr, &mut buf).ok();
+                    let old = u64::from_le_bytes(buf);
+                    let new_val = old.wrapping_add(x0 as u64);
+                    d.mem_write(addr, &new_val.to_le_bytes()).ok();
+                    d.reg_write_raw(0, old).ok();
+                }
+            }
+        });
+
+        // Unmapped callback
+        let miss = Arc::new(AtomicBool::new(false));
+        let miss_a = Arc::new(AtomicU64::new(0));
+        let miss_p = Arc::new(AtomicU64::new(0));
+        {
+            let m = miss.clone();
+            let ma = miss_a.clone();
+            let mp = miss_p.clone();
+            let ri = region_idx.clone();
+            let rd2 = rd.clone();
+            let svc500 = svc_500;
+            dy.set_unmapped_mem_callback(
+                move |d: &Dynarmic<()>, addr: u64, _sz: usize, pc: u64| -> bool {
+                    let clean = addr & 0x00FFFFFFFFFFFFFF;
+                    let page = clean & !0xFFF;
+                    // Try lazy-load from dump region
+                    if let Some((&rstart, info)) = ri.range(..=page).next_back() {
+                        if page < info.end {
+                            let size = (info.end - rstart) as usize;
+                            let fpath = format!("{}/{}", rd2, info.file);
+                            if let Ok(data) = std::fs::read(&fpath) {
+                                if d.mem_map(rstart, size, 3).is_ok() {
+                                    d.mem_write(rstart, &data[..data.len().min(size)]).ok();
+                                    // LSE patch if executable
+                                    for off in (0..data.len()).step_by(4) {
+                                        if off + 4 > data.len() {
+                                            break;
+                                        }
+                                        let insn = u32::from_le_bytes(
+                                            data[off..off + 4].try_into().unwrap(),
+                                        );
+                                        if (insn & 0x3F207C00) == 0x08207C00
+                                            || (insn & 0x3F200C00) == 0x38200000
+                                        {
+                                            d.mem_write(rstart + off as u64, &svc500.to_le_bytes())
+                                                .ok();
+                                        }
+                                    }
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    // Not in dump — map zero page
+                    if d.mem_map(page, 0x1000, 3).is_ok() {
+                        return true;
+                    }
+                    m.store(true, Ordering::SeqCst);
+                    ma.store(clean, Ordering::SeqCst);
+                    mp.store(pc, Ordering::SeqCst);
+                    d.emu_stop().ok();
+                    false
+                },
+            );
+        }
+
+        // VM calls from frida_dump.txt (same process, same addresses)
+        struct VmCall {
+            name: &'static str,
+            bc_off: u64,
+            pk_addr: u64, // X1 = packed_args
+            ta_addr: u64, // X2 = TABLE_A
+            tb_addr: u64, // X3 = TABLE_B
+            cb_addr: u64, // X4 = ctx
+        }
+        let vm_calls = [
+            // VM1+VM2 skipped: heavy SPLIT calls overflow dynarmic page table
+            VmCall {
+                name: "VM3",
+                bc_off: 0x118f50,
+                pk_addr: 0x7445616bb8,
+                ta_addr: 0x0,
+                tb_addr: 0x0,
+                cb_addr: 0x7445616bd0,
+            },
+            VmCall {
+                name: "VM4",
+                bc_off: 0x118f50,
+                pk_addr: 0x7445616bb8,
+                ta_addr: 0x0,
+                tb_addr: 0x0,
+                cb_addr: 0x7445616bd0,
+            },
+            VmCall {
+                name: "VM5",
+                bc_off: 0x102bb0,
+                pk_addr: 0x7445616098,
+                ta_addr: 0x7361572df0,
+                tb_addr: 0x73615733d0,
+                cb_addr: 0x74456160a0,
+            },
+            VmCall {
+                name: "VM6",
+                bc_off: 0xa71d0,
+                pk_addr: 0x7445614fe0,
+                ta_addr: 0x73615716b0,
+                tb_addr: 0x7361571970,
+                cb_addr: 0x7445615000,
+            },
+            VmCall {
+                name: "VM7",
+                bc_off: 0x8a040,
+                pk_addr: 0x7445614958,
+                ta_addr: 0x7361563170,
+                tb_addr: 0x7361563210,
+                cb_addr: 0x7445614960,
+            },
+            VmCall {
+                name: "VM8",
+                bc_off: 0x8a4f0,
+                pk_addr: 0x7445614a88,
+                ta_addr: 0x7361563250,
+                tb_addr: 0x7361563290,
+                cb_addr: 0x7445614a90,
+            },
+            VmCall {
+                name: "VM9",
+                bc_off: 0x8a040,
+                pk_addr: 0x7445615a08,
+                ta_addr: 0x7361563170,
+                tb_addr: 0x7361563210,
+                cb_addr: 0x7445615a10,
+            },
+            VmCall {
+                name: "VM10",
+                bc_off: 0x9a6f0,
+                pk_addr: 0x7445615640,
+                ta_addr: 0x736156fab0,
+                tb_addr: 0x736156fad0,
+                cb_addr: 0x7445615660,
+            },
+        ];
+
+        let vm_dispatcher = so_base + 0x168324;
+
+        for (i, vc) in vm_calls.iter().enumerate() {
+            eprintln!("\n[replay] === {} (bc=SO+0x{:x}) ===", vc.name, vc.bc_off);
+
+            // Set registers: X0=bytecode, X1=packed_args, X2=TABLE_A, X3=TABLE_B, X4=ctx
+            dy.reg_write_raw(0, so_base + vc.bc_off).unwrap();
+            dy.reg_write_raw(1, vc.pk_addr).unwrap();
+            dy.reg_write_raw(2, vc.ta_addr).unwrap();
+            dy.reg_write_raw(3, vc.tb_addr).unwrap();
+            dy.reg_write_raw(4, vc.cb_addr).unwrap();
+            dy.reg_write_sp(sp).unwrap();
+            dy.reg_write_lr(halt).unwrap();
+            dy.reg_write_pc(vm_dispatcher).unwrap();
+
+            miss.store(false, Ordering::SeqCst);
+
+            // Write PK and CB data from frida_dump into emulator memory.
+            // These were on the signing thread's stack — not in the dump.
+            let pk_hex = match vc.name {
+                "VM1" => "f893614574000000e893614574000000d8936145740000003801000074000000601ec472760000007c98496173000000",
+                "VM2" => "1886614574000000acc4496173000000607a6145740000004cea376173000000306fed82770000004093f68277000000",
+                "VM3" | "VM4" => "886f6145740000002080bea276000000907a4cb376000000acc4496173000000b06e614574000000acbd496173000000",
+                "VM5" => "1886614574000000acc4496173000000607a6145740000004cea376173000000247bd62a720000002061614574000000",
+                "VM6" => "b877614574000000406c6145740000000c00000073000000cc198f6900000000145449617300000058ae614574000000",
+                "VM7" => "0700000000000000e49049617300000020ae61457400000058d449617300000038d7282a720000000300000000000000",
+                "VM8" => "0000000000000000e490496173000000206e61457400000058d4496173000000bcf0ed82770000000000000000000000",
+                "VM9" => "403cd1d8ed4d5f4be490496173000000586e6145740000004cc6496173000000af4fb6ebc2dcaa07bf8731cfff3811e0",
+                "VM10" => "88ae614574000000788e614574000000688e614574000000288484b376000000387649617300000020ae614574000000",
+                _ => "",
+            };
+            let cb_hex = match vc.name {
+                "VM1" => "7c9849617300000020936145740000007c244961730000000200000000000000c800000000000000f0b7bc0e75000000",
+                "VM2" => "acc4496173000000607a6145740000004cea37617300000030f2ed82770000004093f68277000000bcf0ed8277000000",
+                "VM3" | "VM4" => "acc4496173000000b06e614574000000acbd496173000000e86d614574000000806a61457400000030403f8b77000000",
+                "VM5" => "acc4496173000000607a6145740000004cea37617300000024fb282a720000002061614574000000346354282a720000",
+                "VM6" => "145449617300000058ae614574000000c8c549617300000000000000000000000000000000000000f0b7bc0e75000000",
+                "VM7" | "VM8" => "e49049617300000020ae61457400000058d449617300000038d7282a720000000300000000000000bcf0ed8277000000",
+                "VM9" => "e49049617300000058ae6145740000004cc6496173000000af4fb6ebc2dcaa07bf8731cfff3811e0fffc0b6dbea3305a",
+                "VM10" => "387649617300000020ae614574000000b47249617300000000000000000000000000000000000000bcf0ed8277000000",
+                _ => "",
+            };
+            if !pk_hex.is_empty() {
+                let pk_data = (0..pk_hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&pk_hex[i..i + 2], 16).unwrap())
+                    .collect::<Vec<u8>>();
+                let pk_page = vc.pk_addr & !0xFFF;
+                dy.mem_map(pk_page, 0x2000, 3).ok();
+                dy.mem_write(vc.pk_addr, &pk_data).ok();
+            }
+            if !cb_hex.is_empty() {
+                let cb_data = (0..cb_hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&cb_hex[i..i + 2], 16).unwrap())
+                    .collect::<Vec<u8>>();
+                let cb_page = vc.cb_addr & !0xFFF;
+                dy.mem_map(cb_page, 0x2000, 3).ok();
+                dy.mem_write(vc.cb_addr, &cb_data).ok();
+            }
+
+            // Read ctx[0] = callback_fn pointer and patch it to return 0.
+            // SPLIT checks reg[25]==ctx[0] → BLR to reg[4] with X0=reg[5].
+            // The callback thunk is at ctx[0]; patching it stubs ALL SPLIT BLR calls.
+            if vc.cb_addr != 0 {
+                let mut cb_buf = [0u8; 48];
+                dy.mem_read(vc.cb_addr, &mut cb_buf).ok();
+                let cb_fn = u64::from_le_bytes(cb_buf[0..8].try_into().unwrap());
+                if cb_fn > 0x1000 && cb_fn < 0x800000000000 {
+                    // Patch: MOV X0, #0; RET
+                    dy.mem_write(cb_fn, &0xD2800000u32.to_le_bytes()).ok();
+                    dy.mem_write(cb_fn + 4, &0xD65F03C0u32.to_le_bytes()).ok();
+                    eprintln!("[replay] {} patched ctx[0]=0x{:x} → stub", vc.name, cb_fn);
+                }
+                // Patch ctx[2] = halt so SPLIT EXIT returns to our halt address
+                let ctx2 = u64::from_le_bytes(cb_buf[16..24].try_into().unwrap());
+                eprintln!("[replay] {} ctx[2]=0x{:x} → halt", vc.name, ctx2);
+                dy.mem_write(vc.cb_addr + 16, &halt.to_le_bytes()).ok();
+            }
+
+            let t0 = std::time::Instant::now();
+            let max_steps = 2_000_000u64;
+            let mut steps = 0u64;
+            let mut done = false;
+            let so_code_end = so_base + 0x349000;
+            while steps < max_steps {
+                let pc = dy.reg_read_pc().unwrap_or(0);
+                if pc == halt || pc == halt + 4 {
+                    done = true;
+                    break;
+                }
+                if miss.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Quick check: if PC is outside known ranges, stub-return.
+                // Known code: SO (so_base..so_base+0x400000), libc, linker, etc.
+                // Simple: if PC not in any mapped region we loaded, return X0=0.
+                if pc > 0x1000 && pc != halt {
+                    let mut insn_buf = [0u8; 4];
+                    if dy.mem_read(pc, &mut insn_buf).is_err() || u32::from_le_bytes(insn_buf) == 0
+                    {
+                        // Zero instruction or unreadable — unmapped code
+                        let lr = dy.reg_read(30).unwrap_or(0);
+                        dy.reg_write_raw(0, 0).ok();
+                        dy.reg_write_pc(lr).ok();
+                        steps += 1;
+                        continue;
+                    }
+                }
+                dy.emu_step(pc).ok();
+                steps += 1;
+                if steps == 1000 || steps == 10000 || steps == 100000 || steps % 1_000_000 == 0 {
+                    let cur = dy.reg_read_pc().unwrap_or(0);
+                    eprintln!(
+                        "[replay] {} {}K steps PC=SO+0x{:x}",
+                        vc.name,
+                        steps / 1000,
+                        cur.wrapping_sub(so_base)
+                    );
+                }
+            }
+            let ret = dy.reg_read(0).unwrap_or(0);
+            let elapsed = t0.elapsed();
+            let final_pc = dy.reg_read_pc().unwrap_or(0);
+            if !done && steps >= max_steps {
+                eprintln!("[replay] {} TIMEOUT {}M steps", vc.name, steps / 1_000_000);
+            }
+            eprintln!(
+                "[replay] {} PC=SO+0x{:x} LR=0x{:x}",
+                vc.name,
+                final_pc.wrapping_sub(so_base),
+                dy.reg_read(30).unwrap_or(0)
+            );
+            let final_pc = dy.reg_read_pc().unwrap_or(0);
+            eprintln!(
+                "[replay] {} done: {:?}, ret=0x{:x} (SO+0x{:x}), PC=SO+0x{:x}",
+                vc.name,
+                elapsed,
+                ret,
+                ret.wrapping_sub(so_base),
+                final_pc.wrapping_sub(so_base)
+            );
+        }
+
+        eprintln!("\n[replay] All VM calls complete.");
     }
 }
