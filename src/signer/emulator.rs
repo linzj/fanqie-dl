@@ -3687,31 +3687,25 @@ mod tests {
     }
 
     /// Run the FULL signing function (SO+0x26e684) with real handle data.
-    /// Loads handle_regions.bin (from parse_handle_dump.py) + SO code from full_dump.
-    /// This executes the complete 10-VM nested call chain.
+    /// Uses emu_start (JIT speed) + lazy region loading + LSE emulation.
     #[test]
     fn test_full_sign() {
         use dynarmic_sys::Dynarmic;
         use std::collections::BTreeMap;
-        use std::io::{Read as _, Seek, SeekFrom};
         use std::sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
         };
 
         let dir = env!("CARGO_MANIFEST_DIR");
-
-        // ---- Addresses from so_meta (will be overridden below) ----
-        let mut handle_addr = 0u64;
-        let mut so_base = 0u64;
-        let mut tpidr = 0u64;
-
-        // ---- Load ALL regions from full_dump manifest ----
         let dump_dir = format!("{}/full_dump", dir);
         let regions_dir = format!("{}/regions", dump_dir);
 
-        // Also read so_meta for the authoritative so_base (override handle's)
+        // ---- Read so_meta ----
         let meta = std::fs::read_to_string(format!("{}/so_meta.txt", dump_dir)).expect("so_meta");
+        let mut so_base = 0u64;
+        let mut handle_addr = 0u64;
+        let mut tpidr = 0u64;
         for line in meta.lines() {
             if let Some(v) = line.strip_prefix("so_base=") {
                 so_base = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
@@ -3724,17 +3718,26 @@ mod tests {
             }
         }
         eprintln!(
-            "[sign] so_meta: so_base=0x{:x}, handle=0x{:x}, tpidr=0x{:x}",
+            "[sign] so_base=0x{:x}, handle=0x{:x}, tpidr=0x{:x}",
             so_base, handle_addr, tpidr
         );
 
         let dy = Arc::new(Dynarmic::<()>::new());
 
-        // Parse manifest and pre-load SO regions + small regions
+        // ---- Build region index for lazy loading ----
+        struct RegInfo {
+            end: u64,
+            perms: String,
+            file: String,
+        }
         let manifest =
             std::fs::read_to_string(format!("{}/manifest.txt", dump_dir)).expect("manifest");
-        let mut loaded_regions = 0usize;
-        let mut loaded_bytes = 0usize;
+        let mut region_idx: BTreeMap<u64, RegInfo> = BTreeMap::new();
+        let mut preloaded = 0usize;
+        let mut preloaded_bytes = 0usize;
+        let mut lse_patched = 0usize;
+        let svc_500 = 0xD4000001u32 | ((0x500u32 & 0xFFFF) << 5);
+
         for line in manifest.lines() {
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
@@ -3746,77 +3749,58 @@ mod tests {
             let start = u64::from_str_radix(parts[0], 16).unwrap_or(0);
             let end = u64::from_str_radix(parts[1], 16).unwrap_or(0);
             let perms = parts[2];
-            let filename = parts[4];
             let size = (end - start) as usize;
-
-            // Skip huge regions (> 16MB) and unreadable
-            if size > 16 * 1024 * 1024 || perms == "---p" || size == 0 {
+            if perms == "---p" || size == 0 || size > 64 * 1024 * 1024 {
                 continue;
             }
+            region_idx.insert(
+                start,
+                RegInfo {
+                    end,
+                    perms: perms.to_string(),
+                    file: parts[4].to_string(),
+                },
+            );
 
-            let fpath = format!("{}/{}", regions_dir, filename);
-            if let Ok(data) = std::fs::read(&fpath) {
-                if dy.mem_map(start, size, 3).is_ok() {
-                    let wlen = data.len().min(size);
-                    dy.mem_write(start, &data[..wlen]).ok();
-                    loaded_regions += 1;
-                    loaded_bytes += wlen;
+            // Pre-load SO regions + regions < 1MB
+            let is_so = start >= so_base && start < so_base + 0x400000;
+            if is_so || size <= 1024 * 1024 {
+                let fpath = format!("{}/{}", regions_dir, parts[4]);
+                if let Ok(data) = std::fs::read(&fpath) {
+                    if dy.mem_map(start, size, 3).is_ok() {
+                        dy.mem_write(start, &data[..data.len().min(size)]).ok();
+                        preloaded += 1;
+                        preloaded_bytes += data.len().min(size);
+                        // LSE patch executable non-SO regions
+                        if perms.contains('x') && !is_so {
+                            for off in (0..data.len()).step_by(4) {
+                                if off + 4 > data.len() {
+                                    break;
+                                }
+                                let insn =
+                                    u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                                if (insn & 0x3F207C00) == 0x08207C00
+                                    || (insn & 0x3F200C00) == 0x38200000
+                                {
+                                    dy.mem_write(start + off as u64, &svc_500.to_le_bytes())
+                                        .ok();
+                                    lse_patched += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+        let region_idx = Arc::new(region_idx);
+        let rd = Arc::new(regions_dir.clone());
         eprintln!(
-            "[sign] Loaded {} regions ({} MB) from full_dump",
-            loaded_regions,
-            loaded_bytes / 1024 / 1024
+            "[sign] {} regions indexed, {} pre-loaded ({} MB), {} LSE patched",
+            region_idx.len(),
+            preloaded,
+            preloaded_bytes / 1024 / 1024,
+            lse_patched
         );
-
-        // Handle data is already loaded from full_dump manifest regions.
-
-        // ---- Patch LSE atomics in non-SO code (libc etc.) ----
-        // dynarmic doesn't support ARMv8.1 LSE: CAS, LDADD, LDSET, SWP, etc.
-        // Scan all loaded r-xp regions OUTSIDE SO and replace LSE with SVC #0x500.
-        // The SVC callback will emulate them.
-        {
-            let so_end = so_base + 0x400000;
-            let mut lse_patched = 0usize;
-            let manifest2 = std::fs::read_to_string(format!("{}/manifest.txt", dump_dir)).unwrap();
-            for line in manifest2.lines() {
-                if line.starts_with('#') || line.trim().is_empty() {
-                    continue;
-                }
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 5 {
-                    continue;
-                }
-                let start = u64::from_str_radix(parts[0], 16).unwrap_or(0);
-                let end = u64::from_str_radix(parts[1], 16).unwrap_or(0);
-                let perms = parts[2];
-                let size = (end - start) as usize;
-
-                // Only patch executable, non-SO, reasonably sized regions
-                if !perms.contains('x') || size == 0 || size > 4 * 1024 * 1024 {
-                    continue;
-                }
-                let fpath2 = format!("{}/{}", regions_dir, parts[4]);
-                let buf = match std::fs::read(&fpath2) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                let svc_500 = 0xD4000001u32 | ((0x500u32 & 0xFFFF) << 5);
-                for off in (0..buf.len()).step_by(4) {
-                    if off + 4 > buf.len() {
-                        break;
-                    }
-                    let insn = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                    if (insn & 0x3F207C00) == 0x08207C00 || (insn & 0x3F200C00) == 0x38200000 {
-                        dy.mem_write(start + off as u64, &svc_500.to_le_bytes())
-                            .ok();
-                        lse_patched += 1;
-                    }
-                }
-            }
-            eprintln!("[sign] Patched {} LSE atomic instructions", lse_patched);
-        }
 
         // ---- Stack ----
         let stack_base: u64 = 0x3000_0000;
@@ -3824,32 +3808,41 @@ mod tests {
         dy.mem_map(stack_base, stack_size, 3).unwrap();
         let sp = stack_base + stack_size as u64 - 0x1000;
 
-        // ---- Halt page ----
+        // ---- Halt page: SVC #0xFFFF + RET (not just RET!) ----
         let halt: u64 = 0xDEAD_0000;
         dy.mem_map(halt, 0x1000, 3).unwrap();
-        for o in (0..0x1000u64).step_by(4) {
-            dy.mem_write(halt + o, &0xD65F03C0u32.to_le_bytes())
+        let svc_ffff = 0xD4000001u32 | ((0xFFFFu32 & 0xFFFF) << 5);
+        for o in (0..0x1000u64).step_by(8) {
+            dy.mem_write(halt + o, &svc_ffff.to_le_bytes()).unwrap();
+            dy.mem_write(halt + o + 4, &0xD65F03C0u32.to_le_bytes())
                 .unwrap();
         }
 
-        // ---- TPIDR ----
+        // ---- TPIDR (load from dump, not just canary) ----
+        // The TPIDR region is in the dump — lazy loading will handle it.
+        // But we need to ensure it's loaded now for the canary check.
         let tpidr_page = tpidr & !0xFFF;
-        dy.mem_map(tpidr_page, 0x2000, 3).ok();
-        // Write stack canary at tpidr+0x28
-        dy.mem_write(tpidr + 0x28, &0xCAFE_BABE_DEAD_BEEFu64.to_le_bytes())
-            .ok();
+        if let Some((&rstart, info)) = region_idx.range(..=tpidr_page).next_back() {
+            if tpidr_page < info.end {
+                let size = (info.end - rstart) as usize;
+                let fpath = format!("{}/{}", regions_dir, info.file);
+                if let Ok(data) = std::fs::read(&fpath) {
+                    dy.mem_map(rstart, size, 3).ok();
+                    dy.mem_write(rstart, &data[..data.len().min(size)]).ok();
+                    eprintln!("[sign] TPIDR region loaded: 0x{:x}-0x{:x}", rstart, info.end);
+                }
+            }
+        }
         dy.reg_write_tpidr_el0(tpidr).unwrap();
 
         // ---- JNI object region ----
         dy.mem_map(0x2000_0000, 0x10000, 3).unwrap();
 
-        // ---- Fake JNIEnv (minimal) ----
+        // ---- Fake JNIEnv ----
         let jni_base: u64 = 0x4000_0000;
         dy.mem_map(jni_base, 0x10000, 3).unwrap();
-        // JNIEnv* -> function table pointer
         let func_table = jni_base + 0x100;
         dy.mem_write(jni_base, &func_table.to_le_bytes()).unwrap();
-        // Each JNI function: SVC #(0x600+i); RET
         let stub_base = jni_base + 0x1000;
         for i in 0..232u32 {
             let svc_insn = 0xD4000001u32 | (((0x600 + i) & 0xFFFF) << 5);
@@ -3858,7 +3851,6 @@ mod tests {
                 .unwrap();
             dy.mem_write(stub_base + off + 4, &0xD65F03C0u32.to_le_bytes())
                 .unwrap();
-            // Write pointer in function table
             dy.mem_write(
                 func_table + (i as u64) * 8,
                 &(stub_base + off).to_le_bytes(),
@@ -3866,14 +3858,12 @@ mod tests {
             .unwrap();
         }
 
-        // ---- URL string (JNI string object) ----
+        // ---- URL string ----
         let url = b"https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/detail/v1/?aid=1967&book_id=7373660003258862617\0";
         let url_buf: u64 = stack_base + 0x200;
         dy.mem_write(url_buf, url).unwrap();
-        // For simplicity, use the URL buffer address as the jstring handle
-        // The signing function will call GetStringUTFChars on it
 
-        // ---- Unmapped callback: map zero pages on demand ----
+        // ---- Unmapped callback: lazy-load from dump ----
         let miss_flag = Arc::new(AtomicBool::new(false));
         let miss_addr = Arc::new(AtomicU64::new(0));
         let miss_pc = Arc::new(AtomicU64::new(0));
@@ -3883,21 +3873,72 @@ mod tests {
             let mp = miss_pc.clone();
             let unmapped_count = Arc::new(AtomicU64::new(0));
             let uc = unmapped_count.clone();
+            let ri = region_idx.clone();
+            let rd2 = rd.clone();
+            let svc500 = svc_500;
             let sb = so_base;
             dy.set_unmapped_mem_callback(
                 move |d: &Dynarmic<()>, addr: u64, _sz: usize, pc: u64| -> bool {
                     let clean = addr & 0x00FF_FFFF_FFFF_FFFF;
                     let page = clean & !0xFFF;
                     let cnt = uc.fetch_add(1, Ordering::Relaxed);
-                    if cnt < 20 || cnt % 100 == 0 {
-                        eprintln!(
-                            "[mem] unmapped #{} addr=0x{:x} PC=SO+0x{:x}",
-                            cnt,
-                            clean,
-                            pc.wrapping_sub(sb)
-                        );
+
+                    // Try lazy-load PAGE from dump region file
+                    if let Some((&rstart, info)) = ri.range(..=page).next_back() {
+                        if page < info.end {
+                            let page_off = (page - rstart) as u64;
+                            let fpath = format!("{}/{}", rd2, info.file);
+                            // Debug: log all pages in the handle range
+                            if page >= 0x76b2bf7000 && page < 0x76b3437000 {
+                                eprintln!(
+                                    "[mem] HANDLE-REGION page 0x{:x} off=0x{:x}",
+                                    page, page_off
+                                );
+                            }
+                            if let Ok(mut file) = std::fs::File::open(&fpath) {
+                                use std::io::{Read as _, Seek, SeekFrom};
+                                let mut page_data = vec![0u8; 0x1000];
+                                if file.seek(SeekFrom::Start(page_off)).is_ok() {
+                                    let _ = file.read(&mut page_data);
+                                }
+                                if d.mem_map(page, 0x1000, 3).is_ok() {
+                                    d.mem_write(page, &page_data).ok();
+                                    // LSE patch executable non-SO pages
+                                    if info.perms.contains('x')
+                                        && !(page >= sb && page < sb + 0x400000)
+                                    {
+                                        for off in (0..0x1000usize).step_by(4) {
+                                            let insn = u32::from_le_bytes(
+                                                page_data[off..off + 4].try_into().unwrap(),
+                                            );
+                                            if (insn & 0x3F207C00) == 0x08207C00
+                                                || (insn & 0x3F200C00) == 0x38200000
+                                            {
+                                                d.mem_write(
+                                                    page + off as u64,
+                                                    &svc500.to_le_bytes(),
+                                                )
+                                                .ok();
+                                            }
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[mem] #{} page 0x{:x} from {:?}+0x{:x}",
+                                        cnt, page, &info.file[..info.file.len().min(20)], page_off
+                                    );
+                                    return true;
+                                }
+                            }
+                        }
                     }
+                    // Not in dump — map zero page
                     if d.mem_map(page, 0x1000, 3).is_ok() {
+                        if cnt < 50 || cnt % 200 == 0 {
+                            eprintln!(
+                                "[mem] #{} zero-page 0x{:x}",
+                                cnt, page
+                            );
+                        }
                         return true;
                     }
                     mf.store(true, Ordering::SeqCst);
@@ -3909,25 +3950,46 @@ mod tests {
             );
         }
 
-        // ---- SVC callback (JNI + syscalls + logging) ----
-        let so_base_copy = so_base;
+        // ---- SVC callback ----
+        // IMPORTANT: callback params are (d, svc_num, _until, pc) — NOT (d, svc_num, pc, sp)!
+        let halt_svc_flag = Arc::new(AtomicBool::new(false));
+        let halt_svc = halt_svc_flag.clone();
+        let svc_count = Arc::new(AtomicU64::new(0));
+        let svc_cnt = svc_count.clone();
+        let sb = so_base;
         let mmap_next = Arc::new(AtomicU64::new(0x5000_0000));
         let mmap_next_c = mmap_next.clone();
-        dy.set_svc_callback(move |d: &Dynarmic<()>, svc_num: u32, pc: u64, _sp: u64| {
-            let so_off = pc.wrapping_sub(so_base_copy);
+        dy.set_svc_callback(move |d: &Dynarmic<()>, svc_num: u32, _until: u64, pc: u64| {
+            let so_off = pc.wrapping_sub(sb);
+            let cnt = svc_cnt.fetch_add(1, Ordering::Relaxed);
+
+            if svc_num == 0xFFFF {
+                // Halt page reached — signing function returned!
+                eprintln!("[sign] HALT SVC at PC=0x{:x} (svc #{})", pc, cnt);
+                halt_svc.store(true, Ordering::SeqCst);
+                d.emu_stop().ok();
+                return;
+            }
+
             if svc_num == 0 {
                 // Linux syscall
                 let nr = d.reg_read(8).unwrap_or(0);
                 match nr {
                     98 => {
-                        // futex
+                        // futex — return -ETIMEDOUT, write 0 to futex addr
+                        let uaddr = d.reg_read(0).unwrap_or(0);
+                        if uaddr > 0x1000 {
+                            d.mem_write(uaddr & 0x00FFFFFFFFFFFFFF, &0u32.to_le_bytes())
+                                .ok();
+                        }
                         d.reg_write_raw(0, -110i64 as u64).ok();
                     }
                     113 | 114 => {
                         // clock_gettime
                         let buf = d.reg_read(1).unwrap_or(0);
-                        d.mem_write(buf, &1775180171u64.to_le_bytes()).ok();
-                        d.mem_write(buf + 8, &0u64.to_le_bytes()).ok();
+                        let clean = buf & 0x00FFFFFFFFFFFFFF;
+                        d.mem_write(clean, &1775197266u64.to_le_bytes()).ok();
+                        d.mem_write(clean + 8, &0u64.to_le_bytes()).ok();
                         d.reg_write_raw(0, 0).ok();
                     }
                     222 => {
@@ -3937,53 +3999,60 @@ mod tests {
                         let addr = mmap_next_c.fetch_add(aligned as u64, Ordering::SeqCst);
                         d.mem_map(addr, aligned, 3).ok();
                         d.reg_write_raw(0, addr).ok();
-                        eprintln!(
-                            "[svc] mmap size=0x{:x} → 0x{:x} (SO+0x{:x})",
-                            size, addr, so_off
-                        );
+                        if cnt < 100 || cnt % 500 == 0 {
+                            eprintln!(
+                                "[svc] #{} mmap 0x{:x} → 0x{:x} (SO+0x{:x})",
+                                cnt, size, addr, so_off
+                            );
+                        }
                     }
-                    226 => {
-                        d.reg_write_raw(0, 0).ok(); // mprotect
-                    }
-                    56 => {
-                        // openat → -1
-                        d.reg_write_raw(0, -1i64 as u64).ok();
-                    }
-                    63 => {
-                        // read → 0
+                    226 | 167 | 198 => {
+                        // mprotect, prctl, socket
                         d.reg_write_raw(0, 0).ok();
                     }
+                    56 => {
+                        d.reg_write_raw(0, -1i64 as u64).ok();
+                    } // openat
+                    57 => {
+                        d.reg_write_raw(0, 0).ok();
+                    } // close
+                    63 => {
+                        d.reg_write_raw(0, 0).ok();
+                    } // read
                     64 => {
-                        // write → count
                         let count = d.reg_read(2).unwrap_or(0);
                         d.reg_write_raw(0, count).ok();
-                    }
+                    } // write
+                    66 => {
+                        let count = d.reg_read(2).unwrap_or(0);
+                        d.reg_write_raw(0, count).ok();
+                    } // writev
+                    78 | 79 => {
+                        d.reg_write_raw(0, -1i64 as u64).ok();
+                    } // readlinkat, fstatat
+                    96 => {
+                        d.reg_write_raw(0, 29916).ok();
+                    } // set_tid_address
+                    178 => {
+                        d.reg_write_raw(0, 29916).ok();
+                    } // gettid
+                    172 => {
+                        d.reg_write_raw(0, 4243).ok();
+                    } // getpid
                     _ => {
-                        eprintln!("[svc] syscall nr={} at SO+0x{:x}", nr, so_off);
+                        if cnt < 100 || cnt % 500 == 0 {
+                            eprintln!("[svc] #{} syscall nr={} (SO+0x{:x})", cnt, nr, so_off);
+                        }
                         d.reg_write_raw(0, 0).ok();
                     }
                 }
             } else if svc_num >= 0x600 {
-                let jni_idx = svc_num - 0x600;
-                let a0 = d.reg_read(0).unwrap_or(0); // env
+                let jni_idx = (svc_num - 0x600) as usize;
                 let a1 = d.reg_read(1).unwrap_or(0);
                 let a2 = d.reg_read(2).unwrap_or(0);
                 let a3 = d.reg_read(3).unwrap_or(0);
                 let a4 = d.reg_read(4).unwrap_or(0);
 
-                // JNI function indices (from JNI spec):
-                // 6=FindClass, 31=GetMethodID, 33=GetStaticMethodID
-                // 34=CallObjectMethod, 35=CallObjectMethodV, 36=CallObjectMethodA
-                // 167=NewStringUTF, 169=GetStringUTFChars, 170=ReleaseStringUTFChars
-                // 168=GetStringUTFLength, 171=GetArrayLength
-                // 172=NewObjectArray, 173=GetObjectArrayElement
-                // 174=DeleteLocalRef, 176=NewByteArray
-                // 200=GetByteArrayRegion, 201=SetByteArrayRegion
-                // 228=GetObjectClass, 154=ExceptionCheck, 175=EnsureLocalCapacity
-
-                // JNI handles: use addresses in a reserved region so SO code
-                // can dereference them without crashing.
-                // Reserve 0x2000_0000 region for JNI object stubs.
                 const JNI_OBJ_BASE: u64 = 0x2000_0000;
                 const URL_STR_HANDLE: u64 = JNI_OBJ_BASE + 0x100;
                 const UTF8_STR_HANDLE: u64 = JNI_OBJ_BASE + 0x200;
@@ -3992,29 +4061,33 @@ mod tests {
                 const BYTE_ARRAY_HANDLE: u64 = JNI_OBJ_BASE + 0x500;
                 let url_buf_addr: u64 = 0x30000200;
 
+                eprintln!(
+                    "[jni] #{} {} (idx={}) a1=0x{:x} SO+0x{:x}",
+                    cnt,
+                    super::jni_name(jni_idx),
+                    jni_idx,
+                    a1,
+                    so_off
+                );
+
                 match jni_idx {
                     167 => {
-                        // NewStringUTF(env, char*) → jstring
+                        // NewStringUTF
                         let mut buf = [0u8; 128];
                         d.mem_read(a1 & 0x00FFFFFFFFFFFFFF, &mut buf).ok();
                         let s = std::str::from_utf8(&buf)
                             .unwrap_or("")
-                            .trim_end_matches('\0');
-                        eprintln!(
-                            "[jni] NewStringUTF({:?}) → 0x{:x}",
-                            &s[..s.len().min(40)],
-                            UTF8_STR_HANDLE
-                        );
+                            .split('\0')
+                            .next()
+                            .unwrap_or("");
+                        eprintln!("  → NewStringUTF({:?})", &s[..s.len().min(40)]);
                         d.reg_write_raw(0, UTF8_STR_HANDLE).ok();
                     }
                     169 => {
-                        // GetStringUTFChars(env, jstring, isCopy*) → char*
-                        // If the jstring is our URL handle, return URL buffer
+                        // GetStringUTFChars
                         if a1 == url_buf_addr || a1 == URL_STR_HANDLE {
-                            eprintln!("[jni] GetStringUTFChars(URL) → 0x{:x}", url_buf_addr);
                             d.reg_write_raw(0, url_buf_addr).ok();
                         } else if a1 == UTF8_STR_HANDLE {
-                            // "utf-8" string — allocate and return
                             let utf8_buf: u64 = 0x30001000;
                             d.mem_write(utf8_buf, b"utf-8\0").ok();
                             d.reg_write_raw(0, utf8_buf).ok();
@@ -4024,19 +4097,17 @@ mod tests {
                     }
                     168 => {
                         // GetStringUTFLength
-                        d.reg_write_raw(0, 120).ok(); // approximate URL length
+                        let url_len = url.len().saturating_sub(1); // exclude null
+                        d.reg_write_raw(0, url_len as u64).ok();
                     }
-                    170 => {
-                        // ReleaseStringUTFChars — no-op
+                    170 | 192 => {
                         d.reg_write_raw(0, 0).ok();
-                    }
+                    } // ReleaseStringUTFChars, ReleaseByteArrayElements
                     6 => {
-                        // FindClass
-                        eprintln!("[jni] FindClass → 0x{:x}", CLASS_HANDLE);
                         d.reg_write_raw(0, CLASS_HANDLE).ok();
-                    }
-                    31 | 33 => {
-                        // GetMethodID / GetStaticMethodID
+                    } // FindClass
+                    31 | 33 | 94 | 113 | 144 => {
+                        // GetMethodID / GetStaticMethodID / GetFieldID / GetStaticFieldID
                         let mut nbuf = [0u8; 64];
                         d.mem_read(a2 & 0x00FFFFFFFFFFFFFF, &mut nbuf).ok();
                         let name = std::str::from_utf8(&nbuf)
@@ -4044,33 +4115,42 @@ mod tests {
                             .split('\0')
                             .next()
                             .unwrap_or("");
-                        eprintln!("[jni] GetMethodID({:?}) → 0x{:x}", name, METHOD_HANDLE);
+                        eprintln!("  → GetMethodID({:?})", name);
                         d.reg_write_raw(0, METHOD_HANDLE).ok();
                     }
-                    228 => {
-                        // GetObjectClass
-                        d.reg_write_raw(0, CLASS_HANDLE).ok();
+                    228 | 15 => {
+                        // ExceptionCheck, ExceptionOccurred
+                        d.reg_write_raw(0, 0).ok();
                     }
-                    34 | 35 | 36 | 49 | 50 | 51 | 67 | 68 | 69 => {
-                        // CallObjectMethod/V/A, CallStaticObjectMethod/V/A
-                        // If called on a String with getBytes → return byte array
-                        // The URL bytes need to be accessible
+                    31 => {
+                        d.reg_write_raw(0, CLASS_HANDLE).ok();
+                    } // GetObjectClass
+                    34 | 35 | 36 | 114 => {
+                        // CallObjectMethod/V/A, CallStaticObjectMethod
                         let url_bytes_addr: u64 = 0x30002000;
-                        // Read URL from url_buf_addr
                         let mut url_data = [0u8; 256];
                         d.mem_read(url_buf_addr, &mut url_data).ok();
                         let url_len = url_data.iter().position(|&b| b == 0).unwrap_or(256);
-                        // Write URL bytes at url_bytes_addr (byte array content)
                         d.mem_write(url_bytes_addr, &url_data[..url_len]).ok();
-                        // Store length at a known location
                         d.mem_write(url_bytes_addr - 8, &(url_len as u64).to_le_bytes())
                             .ok();
-                        eprintln!(
-                            "[jni] CallObjectMethod → ByteArray(len={}) at 0x{:x}",
-                            url_len, BYTE_ARRAY_HANDLE
-                        );
+                        eprintln!("  → ByteArray(len={})", url_len);
                         d.reg_write_raw(0, BYTE_ARRAY_HANDLE).ok();
                     }
+                    49 | 120 => {
+                        d.reg_write_raw(0, 0).ok();
+                    } // CallIntMethod, CallStaticIntMethod
+                    61 | 141 => {} // CallVoidMethod, CallStaticVoidMethod
+                    37 => {
+                        d.reg_write_raw(0, 0).ok();
+                    } // CallBooleanMethod
+                    95 | 145 => {
+                        d.reg_write_raw(0, 0).ok();
+                    } // GetObjectField, GetStaticObjectField
+                    100 | 101 => {
+                        d.reg_write_raw(0, 0).ok();
+                    } // GetIntField, GetLongField
+                    104 | 109 | 110 => {} // SetObjectField, SetIntField, SetLongField
                     171 => {
                         // GetArrayLength
                         if a1 == BYTE_ARRAY_HANDLE {
@@ -4083,124 +4163,227 @@ mod tests {
                             d.reg_write_raw(0, 0).ok();
                         }
                     }
+                    184 => {
+                        // GetByteArrayElements
+                        let url_bytes_addr: u64 = 0x30002000;
+                        d.reg_write_raw(0, url_bytes_addr).ok();
+                    }
                     200 => {
                         // GetByteArrayRegion(env, array, start, len, buf)
                         if a1 == BYTE_ARRAY_HANDLE {
                             let start = a2 as usize;
                             let len = a3 as usize;
-                            let dst = a4;
+                            let dst = a4 & 0x00FFFFFFFFFFFFFF;
                             let url_bytes_addr: u64 = 0x30002000;
-                            let mut src_buf = vec![0u8; len];
+                            let mut src_buf = vec![0u8; len.min(4096)];
                             d.mem_read(url_bytes_addr + start as u64, &mut src_buf).ok();
-                            d.mem_write(dst & 0x00FFFFFFFFFFFFFF, &src_buf).ok();
-                            eprintln!(
-                                "[jni] GetByteArrayRegion({}, {}) → wrote to 0x{:x}",
-                                start, len, dst
-                            );
+                            d.mem_write(dst, &src_buf).ok();
+                            eprintln!("  → GetByteArrayRegion({}, {}) → 0x{:x}", start, len, dst);
                         }
                         d.reg_write_raw(0, 0).ok();
                     }
-                    154 => {
-                        // ExceptionCheck → false
+                    211 => {
                         d.reg_write_raw(0, 0).ok();
-                    }
-                    172 | 175 | 176 | 174 => {
-                        // EnsureLocalCapacity, DeleteLocalRef, NewByteArray, NewObjectArray
+                    } // SetByteArrayRegion
+                    21 => {
+                        d.reg_write_raw(0, a1).ok();
+                    } // NewGlobalRef → return same
+                    22 | 23 | 26 => {
                         d.reg_write_raw(0, 0).ok();
+                    } // DeleteGlobalRef, DeleteLocalRef, EnsureLocalCapacity
+                    172 => {
+                        d.reg_write_raw(0, JNI_OBJ_BASE + 0x600).ok();
+                    } // NewObjectArray
+                    173 => {
+                        d.reg_write_raw(0, 0).ok();
+                    } // GetObjectArrayElement
+                    174 => {} // SetObjectArrayElement
+                    176 => {
+                        // NewByteArray(size)
+                        d.reg_write_raw(0, BYTE_ARRAY_HANDLE).ok();
                     }
                     _ => {
-                        eprintln!(
-                            "[jni] #{} a1=0x{:x} a2=0x{:x} (SO+0x{:x})",
-                            jni_idx, a1, a2, so_off
-                        );
+                        eprintln!("  → UNHANDLED JNI #{}", jni_idx);
                         d.reg_write_raw(0, 0).ok();
                     }
                 }
             } else if svc_num == 0x500 {
-                // LSE atomic emulation (LDADD/LDSET/LDCLR/SWP/CAS)
-                // Simplification: these are mostly refcount ops.
-                // LDADDH W0, W0, [X1]: atomically add W0 to [X1], return old value in W0.
-                // For signing purposes, just do a non-atomic version:
-                let x0 = d.reg_read(0).unwrap_or(0) as u32;
+                // LSE atomic emulation (patched non-SO code)
+                // Read the ORIGINAL instruction to determine exact operation.
+                // Simplified: treat as LDADD (most common for refcount).
+                let x0 = d.reg_read(0).unwrap_or(0);
                 let x1 = d.reg_read(1).unwrap_or(0);
-                if x1 > 0x1000 {
-                    let mut buf = [0u8; 4];
-                    d.mem_read(x1 & 0x00FFFFFFFFFFFFFF, &mut buf).ok();
-                    let old = u32::from_le_bytes(buf);
+                let addr = x1 & 0x00FFFFFFFFFFFFFF;
+                if addr > 0x1000 {
+                    let mut buf = [0u8; 8];
+                    d.mem_read(addr, &mut buf).ok();
+                    let old = u64::from_le_bytes(buf);
                     let new_val = old.wrapping_add(x0);
-                    d.mem_write(x1 & 0x00FFFFFFFFFFFFFF, &new_val.to_le_bytes())
-                        .ok();
-                    d.reg_write_raw(0, old as u64).ok();
+                    d.mem_write(addr, &new_val.to_le_bytes()).ok();
+                    d.reg_write_raw(0, old).ok();
                 } else {
                     d.reg_write_raw(0, 0).ok();
                 }
+            } else if svc_num == 0xFFFE {
+                // Null function call trap — return 0
+                let lr = d.reg_read(30).unwrap_or(0);
+                eprintln!(
+                    "[svc] #{} NULL call! LR=0x{:x} (SO+0x{:x})",
+                    cnt,
+                    lr,
+                    lr.wrapping_sub(sb)
+                );
+                d.reg_write_raw(0, 0).ok();
+                // Don't return to address 0 — advance to the RET after SVC
             } else {
-                eprintln!("[svc] SVC #{:#x} at SO+0x{:x}", svc_num, so_off);
+                eprintln!("[svc] #{} SVC #{:#x} at SO+0x{:x}", cnt, svc_num, so_off);
             }
         });
 
-        // No VM dispatcher patching — rely on SVC/JNI logging for progress.
-
         // ---- Set up registers for JNI call ----
-        // SO+0x26e684: y2.a(JNIEnv* env, jobject thiz, int tag, int type, long handle, jstring url, jobject extra)
-        // ARM64 JNI calling convention:
-        // X0 = JNIEnv*, X1 = thiz (jobject), X2 = tag, X3 = type,
-        // X4 = handle, X5 = url (jstring), X6 = extra (jobject)
+        // SO+0x26e684: y2.a(JNIEnv*, jobject, int tag, int type, long handle, jstring url, jobject extra)
         dy.reg_write_raw(0, jni_base).unwrap(); // JNIEnv*
-        dy.reg_write_raw(1, 0).unwrap(); // thiz (not used)
+        dy.reg_write_raw(1, 0).unwrap(); // thiz
         dy.reg_write_raw(2, 0x3000001).unwrap(); // tag = signing
         dy.reg_write_raw(3, 0).unwrap(); // type = 0
         dy.reg_write_raw(4, handle_addr).unwrap(); // handle
-        dy.reg_write_raw(5, url_buf).unwrap(); // url string
+        dy.reg_write_raw(5, url_buf).unwrap(); // url (jstring)
         dy.reg_write_raw(6, 0).unwrap(); // extra = null
         dy.reg_write_sp(sp).unwrap();
         dy.reg_write_lr(halt).unwrap();
         dy.reg_write_pc(so_base + 0x26e684).unwrap();
 
-        eprintln!("[sign] Starting full signing at SO+0x26e684...");
-        eprintln!("[sign] handle=0x{:x}, url_buf=0x{:x}", handle_addr, url_buf);
+        // ---- Patch capability flags at SO+0x3D1578 ----
+        // The signing function checks bit 0x200 of this global.
+        // In the dump it's 0x2 (not initialized). Force-set all capability bits.
+        {
+            let flags_addr = so_base + 0x3D1578;
+            let flags_val: u64 = 0xFFFF_FFFF; // all caps enabled
+            dy.mem_write(flags_addr, &flags_val.to_le_bytes()).ok();
+            eprintln!("[sign] Patched capability flags at SO+0x3D1578 = 0x{:x}", flags_val);
+        }
 
-        // ---- Run with step loop (see progress) ----
-        eprintln!("[sign] Running step loop (max 20M steps)...");
+        eprintln!(
+            "[sign] Starting SO+0x26e684: handle=0x{:x}, url_buf=0x{:x}",
+            handle_addr, url_buf
+        );
+
         let t0 = std::time::Instant::now();
-        let max_steps = 20_000_000u64;
-        let mut steps = 0u64;
+
+
+        // ---- Main execution loop: emu_start (JIT speed) ----
+        let mut runs = 0u64;
+        let max_runs = 500_000u64; // safety limit
 
         loop {
             let pc = dy.reg_read_pc().unwrap_or(0);
-            if pc == halt || pc == halt + 4 {
-                eprintln!("[sign] HALT reached at step {}", steps);
+
+            // Check termination
+            if halt_svc_flag.load(Ordering::SeqCst) {
+                eprintln!("[sign] Function returned! (run #{}, {:?})", runs, t0.elapsed());
                 break;
             }
             if miss_flag.load(Ordering::SeqCst) {
                 let ma = miss_addr.load(Ordering::SeqCst);
                 let mp = miss_pc.load(Ordering::SeqCst);
                 eprintln!(
-                    "[sign] STOP unmapped addr=0x{:x} PC=SO+0x{:x} step={}",
+                    "[sign] FATAL unmapped addr=0x{:x} PC=SO+0x{:x} (run #{})",
                     ma,
                     mp.wrapping_sub(so_base),
-                    steps
+                    runs
                 );
                 break;
             }
-            if steps >= max_steps {
-                eprintln!("[sign] LIMIT {}M steps", steps / 1_000_000);
+            if runs >= max_runs {
                 eprintln!(
-                    "  PC=SO+0x{:x} LR=0x{:x}",
+                    "[sign] LIMIT {}K runs, PC=SO+0x{:x}, {:?}",
+                    runs / 1000,
                     pc.wrapping_sub(so_base),
-                    dy.reg_read(30).unwrap_or(0)
+                    t0.elapsed()
                 );
                 break;
             }
-            dy.emu_step(pc).ok();
-            steps += 1;
-            // Progress every 2M steps
-            if steps % 2_000_000 == 0 {
+
+            // Check for LSE instruction at current PC (SO code — can't patch)
+            if pc >= so_base && pc < so_base + 0x400000 {
+                let mut insn_buf = [0u8; 4];
+                if dy.mem_read(pc, &mut insn_buf).is_ok() {
+                    let insn = u32::from_le_bytes(insn_buf);
+                    if (insn & 0x3F207C00) == 0x08207C00
+                        || (insn & 0x3F200C00) == 0x38200000
+                    {
+                        // LSE in SO — emulate manually
+                        let size = ((insn >> 30) & 3) as usize; // 0=B,1=H,2=W,3=X
+                        let rt = (insn & 0x1F) as usize;
+                        let rn = ((insn >> 5) & 0x1F) as usize;
+                        let rs = ((insn >> 16) & 0x1F) as usize;
+                        let addr =
+                            dy.reg_read(rn).unwrap_or(0) & 0x00FFFFFFFFFFFFFF;
+                        let byte_len = 1usize << size; // 1,2,4,8
+
+                        if (insn & 0x3F207C00) == 0x08207C00 {
+                            // CAS: if [Rn]==Rs then [Rn]=Rt; Rs=old
+                            let mut mem_buf = [0u8; 8];
+                            dy.mem_read(addr, &mut mem_buf[..byte_len]).ok();
+                            let current = u64::from_le_bytes(mem_buf);
+                            let expected = dy.reg_read(rs).unwrap_or(0)
+                                & ((1u128 << (byte_len * 8)) - 1) as u64;
+                            let desired = dy.reg_read(rt).unwrap_or(0)
+                                & ((1u128 << (byte_len * 8)) - 1) as u64;
+                            if current == expected {
+                                dy.mem_write(addr, &desired.to_le_bytes()[..byte_len])
+                                    .ok();
+                            }
+                            if rs != 31 {
+                                dy.reg_write_raw(rs, current).ok();
+                            }
+                        } else {
+                            // LDADD/LDCLR/LDEOR/LDSET/SWP
+                            let o3 = (insn >> 15) & 1;
+                            let opc = (insn >> 12) & 7;
+                            let mut mem_buf = [0u8; 8];
+                            dy.mem_read(addr, &mut mem_buf[..byte_len]).ok();
+                            let old = u64::from_le_bytes(mem_buf);
+                            let src = dy.reg_read(rs).unwrap_or(0)
+                                & ((1u128 << (byte_len * 8)) - 1) as u64;
+                            let new_val = if o3 == 1 {
+                                src // SWP
+                            } else {
+                                match opc {
+                                    0 => old.wrapping_add(src), // LDADD
+                                    1 => old & !src,            // LDCLR
+                                    2 => old ^ src,             // LDEOR
+                                    3 => old | src,             // LDSET
+                                    _ => old,
+                                }
+                            };
+                            dy.mem_write(addr, &new_val.to_le_bytes()[..byte_len])
+                                .ok();
+                            if rt != 31 {
+                                dy.reg_write_raw(rt, old).ok();
+                            }
+                        }
+                        dy.reg_write_pc(pc + 4).ok();
+                        dy.invalidate_cache(pc, 4);
+                        runs += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Run JIT until halt/exception
+            dy.emu_start(pc, halt).ok();
+            runs += 1;
+
+            // Progress logging
+            if runs == 1 || runs == 10 || runs == 100 || runs % 1000 == 0 {
                 let cur = dy.reg_read_pc().unwrap_or(0);
+                let svcs = svc_count.load(Ordering::Relaxed);
                 eprintln!(
-                    "[sign] {}M steps, PC=SO+0x{:x}, elapsed={:?}",
-                    steps / 1_000_000,
+                    "[sign] run #{}, PC=SO+0x{:x}, SVCs={}, {:?}",
+                    runs,
                     cur.wrapping_sub(so_base),
+                    svcs,
                     t0.elapsed()
                 );
             }
@@ -4208,29 +4391,31 @@ mod tests {
 
         let elapsed = t0.elapsed();
         let final_pc = dy.reg_read_pc().unwrap_or(0);
+        let total_svcs = svc_count.load(Ordering::Relaxed);
         eprintln!(
-            "[sign] Done: {} steps in {:?}, final PC=SO+0x{:x}",
-            steps,
+            "[sign] Done: {} runs, {} SVCs in {:?}, PC=SO+0x{:x}",
+            runs,
+            total_svcs,
             elapsed,
             final_pc.wrapping_sub(so_base),
         );
 
         // ---- Read return value ----
         let ret = dy.reg_read(0).unwrap_or(0);
-        eprintln!("[sign] Return X0 = 0x{:x}", ret);
-
-        // Try to read result string if it's a pointer
+        eprintln!("[sign] X0 = 0x{:x}", ret);
         if ret > 0x1000 && ret < 0x800000000000 {
-            let mut buf = [0u8; 256];
-            if dy.mem_read(ret, &mut buf).is_ok() {
-                let end = buf.iter().position(|&b| b == 0).unwrap_or(256);
-                if let Ok(s) = std::str::from_utf8(&buf[..end]) {
-                    eprintln!("[sign] Result string: {}", s);
+            let mut buf = [0u8; 512];
+            if dy.mem_read(ret & 0x00FFFFFFFFFFFFFF, &mut buf).is_ok() {
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(512);
+                if end > 0 {
+                    if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+                        eprintln!("[sign] Result: {}", s);
+                    } else {
+                        eprintln!("[sign] Result (hex): {}", hex::encode(&buf[..end.min(64)]));
+                    }
                 }
             }
         }
-
-        eprintln!("[sign] Done.");
     }
 
     /// Replay individual VM calls using parameters captured by Frida.
@@ -4335,6 +4520,28 @@ mod tests {
             preloaded,
             lse_patched
         );
+
+        // Load VM stack/PK/CB data from frida_dump (signing thread stack snapshots)
+        {
+            let vmd_path = format!("{}/vm_stack_data.bin", dump_dir);
+            if let Ok(vmd) = std::fs::read(&vmd_path) {
+                if &vmd[..4] == b"VMDT" {
+                    let np = u32::from_le_bytes(vmd[4..8].try_into().unwrap()) as usize;
+                    let mut off = 8;
+                    let mut loaded_vmd = 0;
+                    for _ in 0..np {
+                        let addr = u64::from_le_bytes(vmd[off..off+8].try_into().unwrap());
+                        off += 8;
+                        let data = &vmd[off..off+0x1000];
+                        off += 0x1000;
+                        dy.mem_map(addr, 0x1000, 3).ok();
+                        dy.mem_write(addr, data).ok();
+                        loaded_vmd += 1;
+                    }
+                    eprintln!("[replay] Loaded {} VM stack data pages from frida_dump", loaded_vmd);
+                }
+            }
+        }
 
         // Stack + halt + TPIDR
         let stack_base: u64 = 0x3000_0000;
@@ -4589,22 +4796,14 @@ mod tests {
                 dy.mem_write(vc.cb_addr, &cb_data).ok();
             }
 
-            // Read ctx[0] = callback_fn pointer and patch it to return 0.
-            // SPLIT checks reg[25]==ctx[0] → BLR to reg[4] with X0=reg[5].
-            // The callback thunk is at ctx[0]; patching it stubs ALL SPLIT BLR calls.
+            // Don't patch ctx[0]/ctx[2] — use real values from stack data.
+            // Only patch ctx[2] to halt so VM EXIT returns to us.
             if vc.cb_addr != 0 {
                 let mut cb_buf = [0u8; 48];
                 dy.mem_read(vc.cb_addr, &mut cb_buf).ok();
-                let cb_fn = u64::from_le_bytes(cb_buf[0..8].try_into().unwrap());
-                if cb_fn > 0x1000 && cb_fn < 0x800000000000 {
-                    // Patch: MOV X0, #0; RET
-                    dy.mem_write(cb_fn, &0xD2800000u32.to_le_bytes()).ok();
-                    dy.mem_write(cb_fn + 4, &0xD65F03C0u32.to_le_bytes()).ok();
-                    eprintln!("[replay] {} patched ctx[0]=0x{:x} → stub", vc.name, cb_fn);
-                }
-                // Patch ctx[2] = halt so SPLIT EXIT returns to our halt address
+                let ctx0 = u64::from_le_bytes(cb_buf[0..8].try_into().unwrap());
                 let ctx2 = u64::from_le_bytes(cb_buf[16..24].try_into().unwrap());
-                eprintln!("[replay] {} ctx[2]=0x{:x} → halt", vc.name, ctx2);
+                eprintln!("[replay] {} ctx[0]=0x{:x} ctx[2]=0x{:x} → halt", vc.name, ctx0, ctx2);
                 dy.mem_write(vc.cb_addr + 16, &halt.to_le_bytes()).ok();
             }
 

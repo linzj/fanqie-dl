@@ -91,6 +91,10 @@ public:
         vaddr = strip_tag(vaddr);
         u16 *dest = (u16 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) return dest[0];
+        if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 2, 0, unmapped_mem_user_data)) {
+            dest = (u16 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
+            if (dest) return dest[0];
+        }
         return 0;
     }
     u32 MemoryRead32(u64 vaddr) override {
@@ -107,6 +111,10 @@ public:
         vaddr = strip_tag(vaddr);
         u64 *dest = (u64 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) return dest[0];
+        if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 8, 0, unmapped_mem_user_data)) {
+            dest = (u64 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
+            if (dest) return dest[0];
+        }
         return 0;
     }
     Dynarmic::A64::Vector MemoryRead128(u64 vaddr) override {
@@ -118,21 +126,37 @@ public:
         vaddr = strip_tag(vaddr);
         u8 *dest = (u8 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
+        if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 1, value, unmapped_mem_user_data)) {
+            dest = (u8 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
+            if(dest) dest[0] = value;
+        }
     }
     void MemoryWrite16(u64 vaddr, u16 value) override {
         vaddr = strip_tag(vaddr);
         u16 *dest = (u16 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
+        if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 2, value, unmapped_mem_user_data)) {
+            dest = (u16 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
+            if(dest) dest[0] = value;
+        }
     }
     void MemoryWrite32(u64 vaddr, u32 value) override {
         vaddr = strip_tag(vaddr);
         u32 *dest = (u32 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
+        if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 4, value, unmapped_mem_user_data)) {
+            dest = (u32 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
+            if(dest) dest[0] = value;
+        }
     }
     void MemoryWrite64(u64 vaddr, u64 value) override {
         vaddr = strip_tag(vaddr);
         u64 *dest = (u64 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
         if(dest) { dest[0] = value; return; }
+        if (unmapped_mem_callback && unmapped_mem_callback(vaddr, 8, 0, unmapped_mem_user_data)) {
+            dest = (u64 *) get_memory(memory, vaddr, num_page_table_entries, page_table);
+            if(dest) dest[0] = value;
+        }
     }
     void MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) override {
         vaddr = strip_tag(vaddr);
