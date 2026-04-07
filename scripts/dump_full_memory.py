@@ -9,200 +9,349 @@ dump_full_memory.py — 全量 dump 进程内存（所有可读区域）
 
 输出:
   lib/full_dump/maps.txt          — 原始 /proc/pid/maps
-  lib/full_dump/regions/           — 每个区域一个 .bin 文件
-  lib/full_dump/manifest.txt       — 索引文件（供 emulator 加载）
+  lib/full_dump/regions/<addr>.bin — 每个区域一个文件
+  lib/full_dump/manifest.txt       — 索引（增量写入，crash 也安全）
+  lib/full_dump/so_meta.txt        — so_base, tpidr_main
+  lib/full_dump/failed.txt         — 读失败的区域列表
 
-加载方式:
-  读 manifest.txt，每行格式: start_hex end_hex perms filename
-  按顺序 mem_map + mem_write 即可重建地址空间
+特性：
+  - 使用 `adb exec-out su 0 sh -c "dd ..."` 直接拉二进制（无 base64 开销）
+  - 增量写 manifest：每 dump 完一个区域立刻 append+flush，crash 不会丢
+  - Resume：跳过已存在且大小匹配的 .bin 文件
+  - 完整 TPIDR 检测：从主线程的 [anon:stack_and_tls:PID] rw 区计算
+  - Ctrl-C 安全：捕获 KeyboardInterrupt 写最终总结
+
+加载方式（emulator）:
+  解析 manifest.txt，每行格式: start_hex end_hex perms file_offset filename name
 """
 
+import base64
+import os
+import signal
 import subprocess
 import sys
-import os
-import base64
 import time
 
 # === Config ===
-MAX_REGION_SIZE = 256 * 1024 * 1024  # 跳过 >256MB 的区域
-CHUNK_SIZE = 1024 * 1024             # 1MB 分块读取
-ADB_TIMEOUT = 60                     # 单次 adb 超时秒数
+MAX_REGION_SIZE = 256 * 1024 * 1024     # 跳过 >256MB 的区域
+CHUNK_SIZE      = 4 * 1024 * 1024       # 4MB 分块（exec-out 二进制安全，可以更大）
+ADB_TIMEOUT     = 30                    # 单次 adb dd 超时秒数
 
-def run_adb(cmd, timeout=ADB_TIMEOUT):
-    """Run adb shell command, return stdout bytes."""
-    r = subprocess.run(
-        ["adb", "shell", cmd],
-        capture_output=True, timeout=timeout
-    )
-    return r.stdout
+# Globals so signal handler can flush
+MANIFEST_FH   = None
+FAILED_FH     = None
+DUMPED_OK     = 0
+DUMPED_FAIL   = 0
+DUMPED_RESUME = 0
+START_TIME    = 0.0
+
+
+def log(msg, *, err=False):
+    """Print with flush, to stdout or stderr."""
+    fh = sys.stderr if err else sys.stdout
+    print(msg, file=fh, flush=True)
+
+
+def run_text(args, timeout=ADB_TIMEOUT):
+    """Run adb (or other) command, return stdout as text. None on failure."""
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=timeout)
+        return r.stdout.decode("utf-8", errors="replace")
+    except Exception as e:
+        log(f"  ! run_text({args[:3]}…) failed: {e}", err=True)
+        return None
+
+
+def adb_shell_text(cmd, timeout=ADB_TIMEOUT):
+    """`adb shell` with text capture (used for maps, ps, etc.)."""
+    return run_text(["adb", "shell", cmd], timeout=timeout)
+
+
+def adb_exec_bin(cmd, timeout=ADB_TIMEOUT):
+    """`adb exec-out` with binary capture (used for /proc/pid/mem dd output).
+
+    `exec-out` is binary-safe — no PTY, no LF translation. Returns bytes or None.
+    """
+    try:
+        r = subprocess.run(
+            ["adb", "exec-out", cmd],
+            capture_output=True,
+            timeout=timeout,
+        )
+        return r.stdout
+    except subprocess.TimeoutExpired:
+        log(f"  ! TIMEOUT after {timeout}s: {cmd[:80]}…", err=True)
+        return None
+    except Exception as e:
+        log(f"  ! adb exec-out failed: {e}", err=True)
+        return None
+
 
 def get_pid():
     """Find PID of com.dragon.read."""
-    r = subprocess.run(
-        ["adb", "shell", "ps -A | grep com.dragon.read"],
-        capture_output=True, text=True, timeout=10
-    )
-    for line in r.stdout.strip().split("\n"):
+    out = adb_shell_text("ps -A | grep com.dragon.read", timeout=10)
+    if not out:
+        return None
+    for line in out.strip().split("\n"):
         parts = line.split()
         if len(parts) >= 2 and "com.dragon.read" in line:
-            return int(parts[1])
+            try:
+                return int(parts[1])
+            except ValueError:
+                continue
     return None
 
-def read_mem(pid, addr, size):
-    """Read process memory via /proc/pid/mem + base64.
-    Returns bytes or None on failure.
+
+def read_pages(pid, page_start, page_count):
+    """Read `page_count` 4KB pages starting at page index `page_start`.
+
+    Uses `adb exec-out su 0 sh -c 'dd ...'`. Returns bytes (may be < expected
+    if read failed partway). Returns None only on full timeout/error.
     """
-    page_start = addr & ~0xFFF
-    page_offset = addr - page_start
-    page_count = (page_offset + size + 4095) // 4096
-
     cmd = (
-        f"dd if=/proc/{pid}/mem bs=4096 "
-        f"skip={page_start // 4096} count={page_count} "
-        f"2>/dev/null | base64"
+        f"su 0 sh -c 'dd if=/proc/{pid}/mem bs=4096 "
+        f"skip={page_start} count={page_count} 2>/dev/null'"
     )
-    try:
-        raw = run_adb(cmd, timeout=ADB_TIMEOUT)
-        if not raw or not raw.strip():
-            return None
-        data = base64.b64decode(raw.strip())
-        result = data[page_offset:page_offset + size]
-        if len(result) == size:
-            return result
-        # Partial read — pad with zeros
-        if len(result) > 0:
-            return result + b"\x00" * (size - len(result))
-        return None
-    except Exception as e:
-        return None
+    return adb_exec_bin(cmd, timeout=ADB_TIMEOUT)
 
-def read_mem_chunked(pid, addr, size, label=""):
-    """Read large regions in chunks, with progress."""
-    result = bytearray()
-    total_chunks = (size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    ok_chunks = 0
-    fail_chunks = 0
 
-    for i in range(total_chunks):
-        off = i * CHUNK_SIZE
-        chunk_size = min(CHUNK_SIZE, size - off)
-        chunk_addr = addr + off
+def dump_region(pid, start, size, filepath):
+    """Dump `size` bytes starting at `start` into `filepath`.
 
-        data = read_mem(pid, chunk_addr, chunk_size)
-        if data:
-            result.extend(data)
-            ok_chunks += 1
-        else:
-            result.extend(b"\x00" * chunk_size)
-            fail_chunks += 1
+    Strategy:
+      - Pages within [start, start+size): page_start = start>>12, page_count = ceil(size/4096)
+      - Read in chunks of CHUNK_SIZE bytes (== CHUNK_SIZE/4096 pages)
+      - On chunk failure, fill with zeros and continue (don't abort whole region)
+    Returns (ok_chunks, fail_chunks, bytes_written).
+    """
+    assert (start & 0xFFF) == 0, f"region start 0x{start:x} not page-aligned"
+    assert (size & 0xFFF) == 0,  f"region size 0x{size:x} not page-aligned"
 
-        # Progress for large regions
-        if total_chunks > 5 and (i + 1) % 5 == 0:
-            pct = (i + 1) * 100 // total_chunks
-            print(f"    {label} {pct}% ({i+1}/{total_chunks} chunks, {fail_chunks} failed)")
+    pages_per_chunk = CHUNK_SIZE // 4096
+    total_pages = size // 4096
+    page_base = start // 4096
 
-    return bytes(result), ok_chunks, fail_chunks
+    ok = 0
+    fail = 0
+    written = 0
+    tmp = filepath + ".tmp"
+
+    with open(tmp, "wb") as f:
+        for chunk_idx in range((total_pages + pages_per_chunk - 1) // pages_per_chunk):
+            pages_off = chunk_idx * pages_per_chunk
+            pages_n = min(pages_per_chunk, total_pages - pages_off)
+            data = read_pages(pid, page_base + pages_off, pages_n)
+            expected = pages_n * 4096
+            if data is None or len(data) == 0:
+                f.write(b"\x00" * expected)
+                fail += 1
+                written += expected
+                continue
+            if len(data) < expected:
+                # partial — pad with zeros (one or more pages were unreadable)
+                f.write(data)
+                f.write(b"\x00" * (expected - len(data)))
+                # treat as partial success
+                ok += 1
+                written += expected
+            else:
+                f.write(data[:expected])
+                ok += 1
+                written += expected
+
+    os.replace(tmp, filepath)
+    return ok, fail, written
+
+
+def parse_maps(maps_raw):
+    """Parse /proc/pid/maps into a list of region dicts."""
+    regions = []
+    for line in maps_raw.strip().split("\n"):
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            start_s, end_s = parts[0].split("-")
+            start = int(start_s, 16)
+            end = int(end_s, 16)
+        except ValueError:
+            continue
+        perms = parts[1]
+        offset = parts[2] if len(parts) > 2 else "0"
+        name = " ".join(parts[5:]) if len(parts) >= 6 else ""
+        regions.append({
+            "start": start,
+            "end": end,
+            "size": end - start,
+            "perms": perms,
+            "offset": offset,
+            "name": name,
+            "line": line.strip(),
+        })
+    return regions
+
+
+def filter_readable(regions):
+    """Filter out regions that aren't worth dumping."""
+    out = []
+    skipped = {"noperm": 0, "large": 0, "vvar": 0}
+    for r in regions:
+        perms = r["perms"]
+        name = r["name"]
+        if "r" not in perms or perms in ("---p", "---s"):
+            skipped["noperm"] += 1
+            continue
+        if name == "[vvar]":
+            skipped["vvar"] += 1
+            continue
+        if r["size"] > MAX_REGION_SIZE:
+            log(f"  SKIP (>{MAX_REGION_SIZE//(1024*1024)}MB): {r['line']}")
+            skipped["large"] += 1
+            continue
+        out.append(r)
+    return out, skipped
+
+
+def find_so_base(regions, name_substr):
+    for r in regions:
+        if name_substr in r["name"] and "x" in r["perms"]:
+            return r["start"]
+    return None
+
+
+def find_tpidr(regions, pid):
+    """Compute TPIDR_EL0 = main_thread_stack_and_tls_rw.end - 0x3580.
+
+    Main thread TID == PID on Linux.
+    """
+    target = f"stack_and_tls:{pid}"
+    for r in regions:
+        if target in r["name"] and "rw" in r["perms"]:
+            return r["end"] - 0x3580
+    return 0
+
+
+def filename_for(start, end, perms):
+    """Format used by emulator and matches existing on-disk files."""
+    return f"{start:x}_{end:x}_{perms}.bin"
+
+
+def write_signal_handler(signum, frame):
+    """SIGINT/SIGTERM: flush manifest and exit."""
+    log(f"\n[!] received signal {signum}, flushing and exiting", err=True)
+    if MANIFEST_FH:
+        try:
+            MANIFEST_FH.flush()
+            MANIFEST_FH.close()
+        except Exception:
+            pass
+    if FAILED_FH:
+        try:
+            FAILED_FH.flush()
+            FAILED_FH.close()
+        except Exception:
+            pass
+    elapsed = time.time() - START_TIME
+    log(f"[!] dumped {DUMPED_OK} ok, {DUMPED_FAIL} fail, {DUMPED_RESUME} resumed in {elapsed:.1f}s")
+    sys.exit(130)
+
 
 def main():
+    global MANIFEST_FH, FAILED_FH, DUMPED_OK, DUMPED_FAIL, DUMPED_RESUME, START_TIME
+
     # Get PID
     if len(sys.argv) > 1:
         pid = int(sys.argv[1])
     else:
         pid = get_pid()
         if not pid:
-            print("ERROR: com.dragon.read not found. Pass PID manually.")
+            log("ERROR: com.dragon.read not found. Pass PID manually.", err=True)
             sys.exit(1)
 
-    print(f"[*] PID: {pid}")
+    log(f"[*] PID: {pid}")
 
-    # Read maps
-    maps_raw = run_adb(f"cat /proc/{pid}/maps", timeout=10).decode("utf-8", errors="replace")
-    if not maps_raw.strip():
-        print("ERROR: Cannot read /proc/pid/maps")
+    # Read maps via adb shell (text mode is fine)
+    maps_raw = adb_shell_text(f"su 0 cat /proc/{pid}/maps", timeout=15)
+    if not maps_raw or not maps_raw.strip():
+        log("ERROR: Cannot read /proc/pid/maps", err=True)
         sys.exit(1)
 
     # Output directory
-    outdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib", "full_dump")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    outdir = os.path.join(repo_root, "lib", "full_dump")
     regdir = os.path.join(outdir, "regions")
     os.makedirs(regdir, exist_ok=True)
 
-    # Save maps
     maps_path = os.path.join(outdir, "maps.txt")
     with open(maps_path, "w") as f:
         f.write(maps_raw)
-    print(f"[*] Saved maps to {maps_path}")
+    log(f"[*] Saved maps to {maps_path}")
 
-    # Parse maps
-    regions = []
-    for line in maps_raw.strip().split("\n"):
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        addr_range = parts[0]
-        perms = parts[1]
-        offset = parts[2] if len(parts) > 2 else "0"
-        name = " ".join(parts[5:]) if len(parts) >= 6 else ""
+    regions = parse_maps(maps_raw)
+    log(f"[*] Total regions in maps: {len(regions)}")
 
-        start_s, end_s = addr_range.split("-")
-        start = int(start_s, 16)
-        end = int(end_s, 16)
-        size = end - start
-
-        regions.append({
-            "start": start,
-            "end": end,
-            "size": size,
-            "perms": perms,
-            "offset": offset,
-            "name": name,
-            "line": line.strip(),
-        })
-
-    print(f"[*] Total regions: {len(regions)}")
-
-    # Filter: only regions with at least 'r' permission
-    # Skip ---p (no permission), and regions that are too large
-    readable = []
-    skipped_noperm = 0
-    skipped_large = 0
-    skipped_special = 0
-
-    for r in regions:
-        perms = r["perms"]
-        name = r["name"]
-
-        # Skip no-permission regions
-        if perms == "---p" or perms == "---s":
-            skipped_noperm += 1
-            continue
-
-        # Must have read permission to dump
-        if "r" not in perms:
-            skipped_noperm += 1
-            continue
-
-        # Skip [vvar] — kernel virtual, can't read via /proc/pid/mem
-        if name == "[vvar]":
-            skipped_special += 1
-            continue
-
-        # Skip extremely large regions
-        if r["size"] > MAX_REGION_SIZE:
-            print(f"  SKIP (too large): {r['line']} ({r['size'] // (1024*1024)}MB)")
-            skipped_large += 1
-            continue
-
-        readable.append(r)
-
+    readable, skipped = filter_readable(regions)
     total_size = sum(r["size"] for r in readable)
-    print(f"[*] Readable regions: {len(readable)} ({total_size // (1024*1024)}MB)")
-    print(f"    Skipped: {skipped_noperm} no-perm, {skipped_large} too-large, {skipped_special} special")
+    log(f"[*] Readable regions: {len(readable)} ({total_size//(1024*1024)} MB)")
+    log(f"    Skipped: {skipped['noperm']} no-perm, "
+        f"{skipped['large']} too-large, {skipped['vvar']} vvar")
 
-    # Dump each region
-    manifest_lines = []
-    total_ok = 0
-    total_fail = 0
-    t0 = time.time()
+    # so_base + TPIDR
+    so_base = find_so_base(regions, "libmetasec_ml")
+    tpidr = find_tpidr(regions, pid)
+    log(f"[*] so_base    = 0x{so_base:x}" if so_base else "[!] libmetasec_ml.so NOT FOUND")
+    log(f"[*] tpidr_main = 0x{tpidr:x}" if tpidr else f"[!] stack_and_tls:{pid} NOT FOUND")
+
+    # Write so_meta.txt up front (so even partial dump is usable)
+    meta_path = os.path.join(outdir, "so_meta.txt")
+    with open(meta_path, "w") as f:
+        if so_base:
+            f.write(f"so_base=0x{so_base:x}\n")
+        if tpidr:
+            f.write(f"tpidr_main=0x{tpidr:x}\n")
+        f.write(f"pid={pid}\n")
+    log(f"[*] Saved so_meta to {meta_path}")
+
+    # Open manifest + failed in append mode for incremental writes.
+    # We rewrite the header on each run; existing entries from prior runs are
+    # preserved at the bottom (resume — duplicates are tolerable, the loader
+    # uses last-wins).
+    manifest_path = os.path.join(outdir, "manifest.txt")
+    failed_path = os.path.join(outdir, "failed.txt")
+
+    # Always overwrite header but keep existing entries by reading first.
+    existing_entries = []
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r") as f:
+            for line in f:
+                if not line.startswith("#") and line.strip():
+                    existing_entries.append(line.rstrip("\n"))
+
+    MANIFEST_FH = open(manifest_path, "w")
+    MANIFEST_FH.write(f"# PID={pid} dumped at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    MANIFEST_FH.write("# Format: start_hex end_hex perms file_offset filename name\n")
+    # Re-emit prior entries (so resumed entries stay)
+    for e in existing_entries:
+        MANIFEST_FH.write(e + "\n")
+    MANIFEST_FH.flush()
+
+    FAILED_FH = open(failed_path, "w")
+    FAILED_FH.write(f"# PID={pid} failed regions at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    FAILED_FH.flush()
+
+    # Build set of already-written manifest filenames (for resume)
+    already_in_manifest = set()
+    for e in existing_entries:
+        parts = e.split()
+        if len(parts) >= 5:
+            already_in_manifest.add(parts[4])
+
+    # Install signal handler
+    signal.signal(signal.SIGINT, write_signal_handler)
+    signal.signal(signal.SIGTERM, write_signal_handler)
+
+    START_TIME = time.time()
+    n = len(readable)
 
     for i, r in enumerate(readable):
         start = r["start"]
@@ -211,80 +360,63 @@ def main():
         perms = r["perms"]
         name = r["name"]
 
-        filename = f"{start:016x}_{end:016x}_{perms.replace('-', '_')}.bin"
-        filepath = os.path.join(regdir, filename)
+        fn = filename_for(start, end, perms)
+        fpath = os.path.join(regdir, fn)
+        short = os.path.basename(name) if name else "(anon)"
+        prefix = f"[{i+1}/{n}] 0x{start:x}-0x{end:x} {perms} {short} ({size//1024}KB)"
 
-        short_name = os.path.basename(name) if name else "(anon)"
-        label = f"[{i+1}/{len(readable)}] 0x{start:x}-0x{end:x} {perms} {short_name} ({size//1024}KB)"
+        # Resume: skip if file exists with correct size AND already in manifest.
+        if (os.path.exists(fpath) and os.path.getsize(fpath) == size
+                and fn in already_in_manifest):
+            DUMPED_RESUME += 1
+            if (i + 1) % 200 == 0:
+                log(f"  {prefix} -> RESUME ({DUMPED_RESUME} so far)")
+            continue
 
-        # Read memory
-        if size <= CHUNK_SIZE:
-            data = read_mem(pid, start, size)
-            if data:
-                ok, fail = 1, 0
-            else:
-                data = b"\x00" * size
-                ok, fail = 0, 1
+        # Dump it
+        ok, fail, written = dump_region(pid, start, size, fpath)
+        if fail == 0 and written == size:
+            DUMPED_OK += 1
+            status = "OK"
+        elif written == size and fail > 0:
+            DUMPED_OK += 1
+            status = f"PARTIAL({fail} chunk(s) zero-filled)"
+            FAILED_FH.write(f"{start:x}-{end:x} {perms} {name} (partial: {fail} chunks failed)\n")
+            FAILED_FH.flush()
         else:
-            data, ok, fail = read_mem_chunked(pid, start, size, label=short_name)
+            DUMPED_FAIL += 1
+            status = f"FAIL (wrote {written}/{size})"
+            FAILED_FH.write(f"{start:x}-{end:x} {perms} {name} (size mismatch)\n")
+            FAILED_FH.flush()
 
-        total_ok += ok
-        total_fail += fail
+        # Append to manifest (incremental)
+        MANIFEST_FH.write(f"{start:x} {end:x} {perms} {r['offset']} {fn} {name}\n")
+        MANIFEST_FH.flush()
+        already_in_manifest.add(fn)
 
-        # Check if all zeros
-        is_zero = (data == b"\x00" * size)
+        if (i + 1) % 50 == 0 or status != "OK":
+            log(f"  {prefix} -> {status}")
 
-        # Save
-        with open(filepath, "wb") as f:
-            f.write(data)
+    elapsed = time.time() - START_TIME
+    MANIFEST_FH.close()
+    FAILED_FH.close()
+    MANIFEST_FH = None
+    FAILED_FH = None
 
-        status = "ZERO" if is_zero else ("OK" if fail == 0 else f"PARTIAL({fail} failed)")
-        print(f"  {label} -> {status}")
+    log("")
+    log(f"[*] Done in {elapsed:.1f}s")
+    log(f"    OK     : {DUMPED_OK}")
+    log(f"    FAIL   : {DUMPED_FAIL}")
+    log(f"    RESUME : {DUMPED_RESUME}")
+    log(f"    Output : {outdir}")
 
-        # Manifest entry
-        manifest_lines.append(
-            f"{start:016x} {end:016x} {perms} {r['offset']} {filename} {name}"
-        )
+    # Cross-check: every readable region should have a manifest entry
+    if DUMPED_OK + DUMPED_FAIL + DUMPED_RESUME != len(readable):
+        log(f"[!] WARN: dumped count ({DUMPED_OK+DUMPED_FAIL+DUMPED_RESUME}) "
+            f"!= readable count ({len(readable)})", err=True)
+    else:
+        log("[*] All readable regions accounted for.")
 
-    elapsed = time.time() - t0
-
-    # Save manifest
-    manifest_path = os.path.join(outdir, "manifest.txt")
-    with open(manifest_path, "w") as f:
-        f.write(f"# PID={pid} dumped at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"# Format: start_hex end_hex perms file_offset filename path\n")
-        f.write(f"# Total: {len(readable)} regions, {total_size} bytes\n")
-        for line in manifest_lines:
-            f.write(line + "\n")
-
-    print(f"\n[*] Done in {elapsed:.1f}s")
-    print(f"    Chunks: {total_ok} ok, {total_fail} failed")
-    print(f"    Output: {outdir}")
-    print(f"    Total size: {total_size // (1024*1024)}MB")
-
-    # Summary of key regions
-    print("\n[*] Key regions:")
-    so_base = None
-    for r in readable:
-        name = r["name"]
-        if "libmetasec_ml" in name and "x" in r["perms"]:
-            if so_base is None:
-                so_base = r["start"]
-                print(f"    SO base: 0x{so_base:x}")
-        if "stack_and_tls" in name and "rw" in r["perms"]:
-            tpidr = r["end"] - 0x3580
-            print(f"    TPIDR_EL0: 0x{tpidr:x} (from {name})")
-
-    # Find heap regions
-    heap_total = sum(r["size"] for r in readable if r["name"] == "[heap]" or (r["name"] == "" and "rw" in r["perms"]))
-    print(f"    Heap/anon rw: {heap_total // 1024}KB")
-
-    if so_base:
-        meta_path = os.path.join(outdir, "so_meta.txt")
-        with open(meta_path, "w") as f:
-            f.write(f"so_base=0x{so_base:x}\n")
-            f.write(f"pid={pid}\n")
-        print(f"    Saved SO metadata to {meta_path}")
 
 if __name__ == "__main__":
     main()

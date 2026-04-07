@@ -1813,7 +1813,8 @@ fn vm_compute_helios(h1_hex: &[u8; 32], ts_str: &[u8]) -> [u8; 32] {
     let so_data1 = std::fs::read(format!("{}/lib/so_data1.bin", dir)).expect("so_data1.bin");
     let so_data2 = std::fs::read(format!("{}/lib/so_data2.bin", dir)).expect("so_data2.bin");
 
-    let so_base: u64 = 0x6d88_01b0_00;
+    // Base must match the process where data segments were dumped (relocations are absolute)
+    let so_base: u64 = 0x775c_2050_00;
     let dy = Arc::new(Dynarmic::<()>::new());
 
     // Map SO
@@ -2182,8 +2183,8 @@ mod tests {
         let so_data2 =
             std::fs::read(format!("{}/lib/so_data2.bin", dir)).expect("Missing lib/so_data2.bin");
 
-        // Runtime base address (from IDA)
-        let so_base: u64 = 0x6d88_01b0_00;
+        // Runtime base address — must match the process where data segments were dumped
+        let so_base: u64 = 0x775c_2050_00;
         let code_size = 0x348700usize;
         let data1_off: u64 = 0x34C700;
         let data1_size = 0x28F10usize;
@@ -3257,7 +3258,7 @@ mod tests {
         };
 
         let dir = env!("CARGO_MANIFEST_DIR");
-        let dump_dir = format!("{}/full_dump", dir);
+        let dump_dir = format!("{}/lib/full_dump", dir);
 
         // ---- Parse so_meta.txt ----
         let meta = std::fs::read_to_string(format!("{}/so_meta.txt", dump_dir))
@@ -3698,7 +3699,7 @@ mod tests {
         };
 
         let dir = env!("CARGO_MANIFEST_DIR");
-        let dump_dir = format!("{}/full_dump", dir);
+        let dump_dir = format!("{}/lib/full_dump", dir);
         let regions_dir = format!("{}/regions", dump_dir);
 
         // ---- Read so_meta ----
@@ -4429,7 +4430,7 @@ mod tests {
         };
 
         let dir = env!("CARGO_MANIFEST_DIR");
-        let dump_dir = format!("{}/full_dump", dir);
+        let dump_dir = format!("{}/lib/full_dump", dir);
         let regions_dir = format!("{}/regions", dump_dir);
 
         // Read so_meta
