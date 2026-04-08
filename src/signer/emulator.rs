@@ -3711,10 +3711,10 @@ mod tests {
             if let Some(v) = line.strip_prefix("so_base=") {
                 so_base = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
             }
-            if let Some(v) = line.strip_prefix("handle_addr=") {
+            if let Some(v) = line.strip_prefix("handle_addr=").or_else(|| line.strip_prefix("handle=")) {
                 handle_addr = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
             }
-            if let Some(v) = line.strip_prefix("tpidr_sign=") {
+            if let Some(v) = line.strip_prefix("tpidr_sign=").or_else(|| line.strip_prefix("tpidr_main=")) {
                 tpidr = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
             }
         }
@@ -4062,14 +4062,37 @@ mod tests {
                 const BYTE_ARRAY_HANDLE: u64 = JNI_OBJ_BASE + 0x500;
                 let url_buf_addr: u64 = 0x30000200;
 
+                let lr = d.reg_read(30).unwrap_or(0);
+                let lr_clean = lr & 0x00FFFFFFFFFFFFFF;
+                let lr_off = lr_clean.wrapping_sub(sb);
+                let real_pc = d.reg_read_pc().unwrap_or(0);
                 eprintln!(
-                    "[jni] #{} {} (idx={}) a1=0x{:x} SO+0x{:x}",
+                    "[jni] #{} {} (idx={}) a1=0x{:x} a2=0x{:x} a3=0x{:x} PC=0x{:x} LR=SO+0x{:x}",
                     cnt,
                     super::jni_name(jni_idx),
                     jni_idx,
                     a1,
-                    so_off
+                    a2,
+                    a3,
+                    real_pc,
+                    lr_off
                 );
+                // For the first JNI call in the sign path (LR=SO+0x2a8864),
+                // dump callee-saved registers to understand the caller's state.
+                if lr_off == 0x2a8864 || lr_off == 0x2a8ea8 {
+                    let x0 = d.reg_read(0).unwrap_or(0);
+                    let x19 = d.reg_read(19).unwrap_or(0);
+                    let x20 = d.reg_read(20).unwrap_or(0);
+                    let x21 = d.reg_read(21).unwrap_or(0);
+                    let x22 = d.reg_read(22).unwrap_or(0);
+                    let x23 = d.reg_read(23).unwrap_or(0);
+                    let x26 = d.reg_read(26).unwrap_or(0);
+                    let sp_v = d.reg_read_sp().unwrap_or(0);
+                    eprintln!(
+                        "  regs: x0=0x{:x} x19=0x{:x} x20=0x{:x} x21=0x{:x} x22=0x{:x} x23=0x{:x} x26=0x{:x} sp=0x{:x}",
+                        x0, x19, x20, x21, x22, x23, x26, sp_v
+                    );
+                }
 
                 match jni_idx {
                     167 => {
@@ -4241,19 +4264,6 @@ mod tests {
             }
         });
 
-        // ---- Set up registers for JNI call ----
-        // SO+0x26e684: y2.a(JNIEnv*, jobject, int tag, int type, long handle, jstring url, jobject extra)
-        dy.reg_write_raw(0, jni_base).unwrap(); // JNIEnv*
-        dy.reg_write_raw(1, 0).unwrap(); // thiz
-        dy.reg_write_raw(2, 0x3000001).unwrap(); // tag = signing
-        dy.reg_write_raw(3, 0).unwrap(); // type = 0
-        dy.reg_write_raw(4, handle_addr).unwrap(); // handle
-        dy.reg_write_raw(5, url_buf).unwrap(); // url (jstring)
-        dy.reg_write_raw(6, 0).unwrap(); // extra = null
-        dy.reg_write_sp(sp).unwrap();
-        dy.reg_write_lr(halt).unwrap();
-        dy.reg_write_pc(so_base + 0x26e684).unwrap();
-
         // ---- Patch capability flags at SO+0x3D1578 ----
         // The signing function checks bit 0x200 of this global.
         // In the dump it's 0x2 (not initialized). Force-set all capability bits.
@@ -4264,146 +4274,219 @@ mod tests {
             eprintln!("[sign] Patched capability flags at SO+0x3D1578 = 0x{:x}", flags_val);
         }
 
-        eprintln!(
-            "[sign] Starting SO+0x26e684: handle=0x{:x}, url_buf=0x{:x}",
-            handle_addr, url_buf
-        );
+        // ---- Fake "extra" HashMap object for sign call ----
+        // The real Java-side calls y2.a with a HashMap passed as `extra`, and
+        // the sign path appears to use that slot for output/iteration. Provide
+        // a non-null fake handle so the CFF dispatcher doesn't bail out.
+        const FAKE_EXTRA: u64 = 0x2000_0700;
 
-        let t0 = std::time::Instant::now();
+        // ---- Run one invocation of y2.a (reused for init + sign calls) ----
+        // Per frida_dump.txt, the real app invokes y2.a three times in order:
+        //   y2.a(tag=0x1000001, h=0)   — init #1
+        //   y2.a(tag=0x1000001, h=0)   — init #2
+        //   y2.a(tag=0x3000001, h=handle)  — actual sign
+        // The two init calls presumably populate global/thread-local state that
+        // the sign path reads back; without them the CFF dispatcher lands in a
+        // fallback branch that returns NULL after 3 JNI calls.
+        let run_call = |label: &str, tag: u64, handle: u64, extra: u64, trace: bool| -> u64 {
+            // Reset per-call flags
+            halt_svc_flag.store(false, Ordering::SeqCst);
+            miss_flag.store(false, Ordering::SeqCst);
+            miss_addr.store(0, Ordering::SeqCst);
+            miss_pc.store(0, Ordering::SeqCst);
 
+            // Set up registers for y2.a(JNIEnv*, thiz, tag, type, handle, url, extra)
+            dy.reg_write_raw(0, jni_base).unwrap();
+            dy.reg_write_raw(1, 0).unwrap();
+            dy.reg_write_raw(2, tag).unwrap();
+            dy.reg_write_raw(3, 0).unwrap();
+            dy.reg_write_raw(4, handle).unwrap();
+            dy.reg_write_raw(5, url_buf).unwrap();
+            dy.reg_write_raw(6, extra).unwrap();
+            dy.reg_write_sp(sp).unwrap();
+            dy.reg_write_lr(halt).unwrap();
+            dy.reg_write_pc(so_base + 0x26e684).unwrap();
 
-        // ---- Main execution loop: emu_start (JIT speed) ----
-        let mut runs = 0u64;
-        let max_runs = 500_000u64; // safety limit
+            eprintln!(
+                "[sign] [{}] Starting SO+0x26e684: tag=0x{:x}, handle=0x{:x}",
+                label, tag, handle
+            );
+            let t0 = std::time::Instant::now();
 
-        loop {
-            let pc = dy.reg_read_pc().unwrap_or(0);
+            let mut runs = 0u64;
+            let max_runs = 500_000u64;
 
-            // Check termination
-            if halt_svc_flag.load(Ordering::SeqCst) {
-                eprintln!("[sign] Function returned! (run #{}, {:?})", runs, t0.elapsed());
-                break;
-            }
-            if miss_flag.load(Ordering::SeqCst) {
-                let ma = miss_addr.load(Ordering::SeqCst);
-                let mp = miss_pc.load(Ordering::SeqCst);
-                eprintln!(
-                    "[sign] FATAL unmapped addr=0x{:x} PC=SO+0x{:x} (run #{})",
-                    ma,
-                    mp.wrapping_sub(so_base),
-                    runs
-                );
-                break;
-            }
-            if runs >= max_runs {
-                eprintln!(
-                    "[sign] LIMIT {}K runs, PC=SO+0x{:x}, {:?}",
-                    runs / 1000,
-                    pc.wrapping_sub(so_base),
-                    t0.elapsed()
-                );
-                break;
-            }
+            loop {
+                let pc = dy.reg_read_pc().unwrap_or(0);
 
-            // Check for LSE instruction at current PC (SO code — can't patch)
-            if pc >= so_base && pc < so_base + 0x400000 {
-                let mut insn_buf = [0u8; 4];
-                if dy.mem_read(pc, &mut insn_buf).is_ok() {
-                    let insn = u32::from_le_bytes(insn_buf);
-                    if (insn & 0x3F207C00) == 0x08207C00
-                        || (insn & 0x3F200C00) == 0x38200000
-                    {
-                        // LSE in SO — emulate manually
-                        let size = ((insn >> 30) & 3) as usize; // 0=B,1=H,2=W,3=X
-                        let rt = (insn & 0x1F) as usize;
-                        let rn = ((insn >> 5) & 0x1F) as usize;
-                        let rs = ((insn >> 16) & 0x1F) as usize;
-                        let addr =
-                            dy.reg_read(rn).unwrap_or(0) & 0x00FFFFFFFFFFFFFF;
-                        let byte_len = 1usize << size; // 1,2,4,8
+                if halt_svc_flag.load(Ordering::SeqCst) {
+                    eprintln!(
+                        "[sign] [{}] Function returned! (run #{}, {:?})",
+                        label,
+                        runs,
+                        t0.elapsed()
+                    );
+                    break;
+                }
+                if miss_flag.load(Ordering::SeqCst) {
+                    let ma = miss_addr.load(Ordering::SeqCst);
+                    let mp = miss_pc.load(Ordering::SeqCst);
+                    eprintln!(
+                        "[sign] [{}] FATAL unmapped addr=0x{:x} PC=SO+0x{:x} (run #{})",
+                        label,
+                        ma,
+                        mp.wrapping_sub(so_base),
+                        runs
+                    );
+                    break;
+                }
+                if runs >= max_runs {
+                    eprintln!(
+                        "[sign] [{}] LIMIT {}K runs, PC=SO+0x{:x}, {:?}",
+                        label,
+                        runs / 1000,
+                        pc.wrapping_sub(so_base),
+                        t0.elapsed()
+                    );
+                    break;
+                }
 
-                        if (insn & 0x3F207C00) == 0x08207C00 {
-                            // CAS: if [Rn]==Rs then [Rn]=Rt; Rs=old
-                            let mut mem_buf = [0u8; 8];
-                            dy.mem_read(addr, &mut mem_buf[..byte_len]).ok();
-                            let current = u64::from_le_bytes(mem_buf);
-                            let expected = dy.reg_read(rs).unwrap_or(0)
-                                & ((1u128 << (byte_len * 8)) - 1) as u64;
-                            let desired = dy.reg_read(rt).unwrap_or(0)
-                                & ((1u128 << (byte_len * 8)) - 1) as u64;
-                            if current == expected {
-                                dy.mem_write(addr, &desired.to_le_bytes()[..byte_len])
-                                    .ok();
-                            }
-                            if rs != 31 {
-                                dy.reg_write_raw(rs, current).ok();
-                            }
-                        } else {
-                            // LDADD/LDCLR/LDEOR/LDSET/SWP
-                            let o3 = (insn >> 15) & 1;
-                            let opc = (insn >> 12) & 7;
-                            let mut mem_buf = [0u8; 8];
-                            dy.mem_read(addr, &mut mem_buf[..byte_len]).ok();
-                            let old = u64::from_le_bytes(mem_buf);
-                            let src = dy.reg_read(rs).unwrap_or(0)
-                                & ((1u128 << (byte_len * 8)) - 1) as u64;
-                            let new_val = if o3 == 1 {
-                                src // SWP
-                            } else {
-                                match opc {
-                                    0 => old.wrapping_add(src), // LDADD
-                                    1 => old & !src,            // LDCLR
-                                    2 => old ^ src,             // LDEOR
-                                    3 => old | src,             // LDSET
-                                    _ => old,
+                // LSE in SO — manually emulate (can't patch SO code)
+                if pc >= so_base && pc < so_base + 0x400000 {
+                    let mut insn_buf = [0u8; 4];
+                    if dy.mem_read(pc, &mut insn_buf).is_ok() {
+                        let insn = u32::from_le_bytes(insn_buf);
+                        if (insn & 0x3F207C00) == 0x08207C00
+                            || (insn & 0x3F200C00) == 0x38200000
+                        {
+                            let size = ((insn >> 30) & 3) as usize;
+                            let rt = (insn & 0x1F) as usize;
+                            let rn = ((insn >> 5) & 0x1F) as usize;
+                            let rs = ((insn >> 16) & 0x1F) as usize;
+                            let addr =
+                                dy.reg_read(rn).unwrap_or(0) & 0x00FFFFFFFFFFFFFF;
+                            let byte_len = 1usize << size;
+
+                            if (insn & 0x3F207C00) == 0x08207C00 {
+                                let mut mem_buf = [0u8; 8];
+                                dy.mem_read(addr, &mut mem_buf[..byte_len]).ok();
+                                let current = u64::from_le_bytes(mem_buf);
+                                let expected = dy.reg_read(rs).unwrap_or(0)
+                                    & ((1u128 << (byte_len * 8)) - 1) as u64;
+                                let desired = dy.reg_read(rt).unwrap_or(0)
+                                    & ((1u128 << (byte_len * 8)) - 1) as u64;
+                                if current == expected {
+                                    dy.mem_write(addr, &desired.to_le_bytes()[..byte_len])
+                                        .ok();
                                 }
-                            };
-                            dy.mem_write(addr, &new_val.to_le_bytes()[..byte_len])
-                                .ok();
-                            if rt != 31 {
-                                dy.reg_write_raw(rt, old).ok();
+                                if rs != 31 {
+                                    dy.reg_write_raw(rs, current).ok();
+                                }
+                            } else {
+                                let o3 = (insn >> 15) & 1;
+                                let opc = (insn >> 12) & 7;
+                                let mut mem_buf = [0u8; 8];
+                                dy.mem_read(addr, &mut mem_buf[..byte_len]).ok();
+                                let old = u64::from_le_bytes(mem_buf);
+                                let src = dy.reg_read(rs).unwrap_or(0)
+                                    & ((1u128 << (byte_len * 8)) - 1) as u64;
+                                let new_val = if o3 == 1 {
+                                    src
+                                } else {
+                                    match opc {
+                                        0 => old.wrapping_add(src),
+                                        1 => old & !src,
+                                        2 => old ^ src,
+                                        3 => old | src,
+                                        _ => old,
+                                    }
+                                };
+                                dy.mem_write(addr, &new_val.to_le_bytes()[..byte_len])
+                                    .ok();
+                                if rt != 31 {
+                                    dy.reg_write_raw(rt, old).ok();
+                                }
                             }
+                            dy.reg_write_pc(pc + 4).ok();
+                            dy.invalidate_cache(pc, 4);
+                            runs += 1;
+                            continue;
                         }
-                        dy.reg_write_pc(pc + 4).ok();
-                        dy.invalidate_cache(pc, 4);
-                        runs += 1;
-                        continue;
                     }
+                }
+
+                if trace {
+                    // Single-step trace mode: log PC transitions in SO
+                    let mut last_pc_so: i64 = -1;
+                    let step_limit = 5000;
+                    let mut steps = 0;
+                    while steps < step_limit {
+                        let cur_pc = dy.reg_read_pc().unwrap_or(0);
+                        if halt_svc_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if miss_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        // Log PC only when in SO and when it jumps (not sequential)
+                        let so_off = cur_pc.wrapping_sub(so_base);
+                        if cur_pc >= so_base && cur_pc < so_base + 0x400000 {
+                            let so_off_i = so_off as i64;
+                            if last_pc_so < 0 || (so_off_i - last_pc_so).abs() > 8 {
+                                eprintln!("[trace] #{} SO+0x{:x}", steps, so_off);
+                            }
+                            last_pc_so = so_off_i;
+                        }
+                        if let Err(e) = dy.emu_step(cur_pc) {
+                            eprintln!("[trace] step err @ SO+0x{:x}: {:?}", so_off, e);
+                            break;
+                        }
+                        steps += 1;
+                    }
+                    eprintln!("[trace] stopped after {} steps", steps);
+                    runs += 1;
+                    continue;
+                }
+
+                dy.emu_start(pc, halt).ok();
+                runs += 1;
+
+                if runs == 1 || runs == 10 || runs == 100 || runs % 1000 == 0 {
+                    let cur = dy.reg_read_pc().unwrap_or(0);
+                    let svcs = svc_count.load(Ordering::Relaxed);
+                    eprintln!(
+                        "[sign] [{}] run #{}, PC=SO+0x{:x}, SVCs={}, {:?}",
+                        label,
+                        runs,
+                        cur.wrapping_sub(so_base),
+                        svcs,
+                        t0.elapsed()
+                    );
                 }
             }
 
-            // Run JIT until halt/exception
-            dy.emu_start(pc, halt).ok();
-            runs += 1;
+            let ret = dy.reg_read(0).unwrap_or(0);
+            let svcs_now = svc_count.load(Ordering::Relaxed);
+            eprintln!(
+                "[sign] [{}] Done: {} runs, total SVCs={}, {:?}, X0=0x{:x}",
+                label,
+                runs,
+                svcs_now,
+                t0.elapsed(),
+                ret,
+            );
+            ret
+        };
 
-            // Progress logging
-            if runs == 1 || runs == 10 || runs == 100 || runs % 1000 == 0 {
-                let cur = dy.reg_read_pc().unwrap_or(0);
-                let svcs = svc_count.load(Ordering::Relaxed);
-                eprintln!(
-                    "[sign] run #{}, PC=SO+0x{:x}, SVCs={}, {:?}",
-                    runs,
-                    cur.wrapping_sub(so_base),
-                    svcs,
-                    t0.elapsed()
-                );
-            }
-        }
+        // Init call #1
+        let _ = run_call("init-1", 0x1000001, 0, 0, false);
+        // Init call #2
+        let _ = run_call("init-2", 0x1000001, 0, 0, false);
+        // Actual signing call — trace mode, pass fake HashMap-like handle as extra
+        let ret = run_call("sign", 0x3000001, handle_addr, FAKE_EXTRA, true);
 
-        let elapsed = t0.elapsed();
-        let final_pc = dy.reg_read_pc().unwrap_or(0);
-        let total_svcs = svc_count.load(Ordering::Relaxed);
-        eprintln!(
-            "[sign] Done: {} runs, {} SVCs in {:?}, PC=SO+0x{:x}",
-            runs,
-            total_svcs,
-            elapsed,
-            final_pc.wrapping_sub(so_base),
-        );
-
-        // ---- Read return value ----
-        let ret = dy.reg_read(0).unwrap_or(0);
-        eprintln!("[sign] X0 = 0x{:x}", ret);
+        // ---- Report final return value ----
+        eprintln!("[sign] Final X0 = 0x{:x}", ret);
         if ret > 0x1000 && ret < 0x800000000000 {
             let mut buf = [0u8; 512];
             if dy.mem_read(ret & 0x00FFFFFFFFFFFFFF, &mut buf).is_ok() {
